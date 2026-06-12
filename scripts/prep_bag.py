@@ -45,13 +45,13 @@ validity on the P1 monotonic clock), so stamps are rebuilt exactly as
 p1_time + OFF, where OFF is the lower envelope of (arrival - p1_time)
 (arrival can only be late, never early).
 
-Run inside the ros2 distrobox. Dependencies:
+Run from a local ROS 2 Jazzy shell. Dependencies:
     pip install --user --break-system-packages mcap mcap-ros2-support pyproj numpy
 
 Usage:
     python3 scripts/prep_bag.py \
-        --input  "/path/to/run_5/filtered/all" \
-        --output "/path/to/run_5/prepped" \
+        --input  "../rosbags/putnam/may_26/run_5/filtered/all" \
+        --output "./dlio_data/run_5_prepped" \
         [--utm-zone 16] [--rtk-max-var-xy 1e-3] [--rtk-max-var-z 5e-3]
 """
 

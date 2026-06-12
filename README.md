@@ -92,18 +92,21 @@ A blind `merge_glim_submaps.py` would skip all three and bake any unresolved dri
 
 ## Build
 
-ROS 2 Jazzy + colcon. Built and tested inside an Ubuntu 24.04 distrobox (`distrobox enter ros2-jazzy`); branch `art-jazzy`.
+ROS 2 Jazzy + colcon on a local Ubuntu 24.04 environment. Run commands from
+the repo root so config files that reference `av24.urdf` resolve correctly.
 
 ```bash
-sudo apt-get install -y libpcap-dev   # hard build dep of glim_ros (pcap reader)
-colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+source /opt/ros/jazzy/setup.bash
+make install-deps
+make install-gtsam-points-cuda
+make build
 source install/setup.bash
 ```
 
 Headline dependencies (per-package READMEs go deeper):
 
-- GTSAM 4.2, gtsam_points (GPU factors), Eigen3, PCL, OpenMP, nlohmann::json, spdlog
-- Optional: CUDA 11.8+ (GPU acceleration), Iridescence (viewer), OpenCV
+- GTSAM 4.2, gtsam_points (GPU factors), Iridescence, Eigen3, PCL, OpenMP, nlohmann::json, spdlog
+- Optional: CUDA 11.8+ (GPU acceleration), OpenCV
 
 If `ros2 pkg prefix glim` does not point inside this workspace's `install/`, an apt-installed `ros-jazzy-glim-*` package is being picked up instead of this fork — re-source `install/setup.bash` **after** `/opt/ros/jazzy/setup.bash`. The same caveat applies to `gicp_localization` if a sibling workspace is also sourced.
 

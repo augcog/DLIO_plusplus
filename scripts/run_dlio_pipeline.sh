@@ -2,20 +2,21 @@
 # One-command wrapper around the documented DLIO++ bag prep, map build,
 # map export, and localization replay flow.
 #
-# Run this inside the ROS distrobox. The script will source
-# /opt/ros/jazzy/setup.bash and install/setup.bash when available.
+# Run this from a local ROS 2 Jazzy environment. The script will source
+# /opt/ros/${ROS_DISTRO:-jazzy}/setup.bash and install/setup.bash when
+# available.
 #
 # Common cases:
 #   1. Full pipeline for a run (prep -> map -> export pcd -> localize replay)
 #      scripts/run_dlio_pipeline.sh \
-#        --raw "/path/to/run_5/filtered/all" \
-#        --data-root "/run/host/home/dongc1/dlio_data" \
+#        --raw "../rosbags/putnam/may_26/run_5/filtered/all" \
+#        --data-root "./dlio_data" \
 #        --run "run_5"
 #
 #   2. Prep + localize a different run against an existing map/origin
 #      scripts/run_dlio_pipeline.sh \
-#        --raw "/path/to/run_3/filtered/all" \
-#        --data-root "/run/host/home/dongc1/dlio_data" \
+#        --raw "../rosbags/putnam/may_26/run_3/filtered/all" \
+#        --data-root "./dlio_data" \
 #        --run "run_3" \
 #        --origin-run "run_5" \
 #        --map-run "run_5" \
@@ -26,14 +27,15 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 usage:
-  scripts/run_dlio_pipeline.sh --raw <filtered/all> --data-root <dir> --run <name> [options]
+  scripts/run_dlio_pipeline.sh --raw <filtered/all> --run <name> [options]
 
 required:
   --raw <path>            Raw input bag directory or .mcap file for prep_bag.py
-  --data-root <dir>       Output root directory for generated artifacts
   --run <name>            Logical run name, e.g. run_5
 
 optional:
+  --data-root <dir>       Output root directory for generated artifacts.
+                          Default: ./dlio_data
   --origin-run <name>     Reuse UTM origin from <data-root>/<name>_prepped/utm_origin.txt
   --utm-origin-file <f>   Reuse UTM origin from an explicit utm_origin.txt file
   --map-run <name>        Localize against <data-root>/<name>_map.pcd and
@@ -50,13 +52,13 @@ generated artifacts under <data-root>:
 
 examples:
   scripts/run_dlio_pipeline.sh \
-    --raw "/run/media/.../run_5/filtered/all" \
-    --data-root "/run/host/home/dongc1/dlio_data" \
+    --raw "../rosbags/putnam/may_26/run_5/filtered/all" \
+    --data-root "./dlio_data" \
     --run "run_5"
 
   scripts/run_dlio_pipeline.sh \
-    --raw "/run/media/.../run_3/filtered/all" \
-    --data-root "/run/host/home/dongc1/dlio_data" \
+    --raw "../rosbags/putnam/may_26/run_3/filtered/all" \
+    --data-root "./dlio_data" \
     --run "run_3" \
     --origin-run "run_5" \
     --map-run "run_5" \
@@ -65,7 +67,7 @@ EOF
 }
 
 RAW=""
-DATA_ROOT=""
+DATA_ROOT="./dlio_data"
 RUN_NAME=""
 ORIGIN_RUN=""
 UTM_ORIGIN_FILE=""
@@ -115,7 +117,7 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$RAW" ] || { echo "--raw is required" >&2; usage >&2; exit 1; }
-[ -n "$DATA_ROOT" ] || { echo "--data-root is required" >&2; usage >&2; exit 1; }
+[ -n "$DATA_ROOT" ] || { echo "--data-root must not be empty" >&2; usage >&2; exit 1; }
 [ -n "$RUN_NAME" ] || { echo "--run is required" >&2; usage >&2; exit 1; }
 
 if [ -n "$ORIGIN_RUN" ] && [ -n "$UTM_ORIGIN_FILE" ]; then

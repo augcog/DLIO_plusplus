@@ -21,9 +21,8 @@
     // The old config_odometry_ins.json path (INS-driven, GLIM PAUSES on RTK
     // loss) is left in tree for reference but should not be selected for
     // production mapping that traverses GNSS-denied terrain.
-    // NOTE: the installed gtsam_points has no CUDA support (no nvcc in the
-    // ros2-jazzy distrobox), so the *_gpu configs cannot load — their .so
-    // files are not built.
+    // NOTE: if the local gtsam_points install has no CUDA support, the *_gpu
+    // configs cannot load because their .so files are not built.
     //
     // Odometry choice for MAP BUILDING from RTK-clean bags: the INS-driven
     // estimator. The Putnam track is feature-poor at racing speed; pure

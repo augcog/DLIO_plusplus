@@ -6,7 +6,7 @@
 # (4) replays the prepped bag with /clock. Tears everything down when the
 # replay ends and prints the evaluation.
 #
-# Usage (inside the ros2 distrobox, repo root, both setup.bash sourced):
+# Usage (local ROS 2 Jazzy shell; setup.bash files are sourced when found):
 #   scripts/run_localization_replay.sh <prepped_bag_dir> <map.pcd> <T_world_utm.txt> <out_dir> [rviz]
 set -u
 
@@ -22,6 +22,20 @@ mkdir -p "$OUT"
 [ -e "$OUT/loc_eval" ] && { echo "$OUT/loc_eval already exists — choose a fresh out_dir" >&2; exit 1; }
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+
+source_if_exists() {
+  local file="$1"
+  if [ -f "$file" ]; then
+    # shellcheck disable=SC1090
+    source "$file"
+  fi
+}
+
+source_if_exists "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash"
+source_if_exists "$REPO/install/setup.bash"
+
+command -v ros2 >/dev/null 2>&1 || { echo "ros2 not found; source your ROS environment first" >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "python3 not found" >&2; exit 1; }
 
 cleanup() {
   echo "[replay] stopping nodes..."

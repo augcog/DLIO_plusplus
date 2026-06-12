@@ -1,39 +1,62 @@
 # Map-building + localization pipeline (AV-24, Putnam-style bags)
 
 End-to-end recipe: raw recorded rosbag → GLIM map → GICP localization at IMU
-rate, with trajectory-error checks at each stage. Written for the
-`ros2-jazzy` distrobox on this machine; every command below runs **inside**
-the distrobox and **from the repo root** (the GLIM configs reference
-`av24.urdf` relative to the working directory).
+rate, with trajectory-error checks at each stage. Written for a local ROS 2
+Jazzy workstation. Every command below runs **from the repo root** (the GLIM
+configs reference `av24.urdf` relative to the working directory).
 
 ```bash
-distrobox enter ros2-jazzy
-cd /run/host/home/dongc1/workspace/DLIO_plusplus      # repo root inside the box
+# From anywhere inside this checkout:
+cd "$(git rev-parse --show-toplevel)"
 source /opt/ros/jazzy/setup.bash
-source install/setup.bash
+[ -f install/setup.bash ] && source install/setup.bash
 ```
 
 Paths below use these placeholders — substitute your own:
 
 | Placeholder | Example |
 |---|---|
-| `$RAW_BAG` | `/run/media/dongc1/T7/AI racing Tech/rosbags/putnam/may_26/run_5/filtered/all` |
-| `$DATA` | `/run/host/home/dongc1/dlio_data` (host disk — the T7 drive is full) |
+| `$RAW_BAG` | `../rosbags/putnam/may_26/run_5/filtered/all` |
+| `$DATA` | `./dlio_data` |
 | `$RUN` | `run_5` |
+
+If the raw bags live on another disk, create one local relative alias once,
+for example `ln -s "/path/to/AI racing Tech/rosbags" ../rosbags`, then keep
+the pipeline commands relative to the checkout.
 
 The raw bag must contain `/atlas/imu_calibrated`, `/atlas/pose_filtered`, and
 `/luminar_front|left|right/points`.
+
+Common local runs:
+
+```bash
+# Build run_5's map and localize run_5 against it.
+scripts/run_dlio_pipeline.sh \
+  --raw "../rosbags/putnam/may_26/run_5/filtered/all" \
+  --data-root "./dlio_data" \
+  --run "run_5"
+
+# Prep run_3 with run_5's UTM origin, then localize it against run_5's map.
+scripts/run_dlio_pipeline.sh \
+  --raw "../rosbags/putnam/may_26/run_3/filtered/all" \
+  --data-root "./dlio_data" \
+  --run "run_3" \
+  --origin-run "run_5" \
+  --map-run "run_5" \
+  --rviz true
+```
 
 ## 0. One-time setup
 
 ```bash
 # system deps: libpcap-dev is a hard BUILD dependency of glim_ros (pcap reader);
-# python3-pip is for the bag-prep / eval scripts
-sudo apt-get install -y python3-pip libpcap-dev
-python3 -m pip install --user --break-system-packages mcap mcap-ros2-support pyproj numpy
+# python3-pip is for the bag-prep / eval scripts.
+make install-deps
 
-# build the workspace (CPU-only GLIM; the distrobox has no CUDA toolkit)
-colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+# Build a local CUDA-enabled gtsam_points into .deps/ and rebuild the workspace
+# with the right CMAKE_PREFIX_PATH/RPATH.
+make install-gtsam-points-cuda
+make build
 source install/setup.bash
 ```
 
@@ -178,7 +201,7 @@ For an **interactive** view (mouse orbit / zoom / pan), either:
   `fetch()` from `file://`).
 
 - **offline_viewer** (full resolution + re-optimization/loop-closure tools):
-  `ros2 run glim_ros offline_viewer`, then open the dump directory.
+  `ros2 run glim_ros offline_viewer "$DATA/${RUN}_dump"`.
 
 ## 4. Localize against the map (bag replay)
 
@@ -195,8 +218,8 @@ scripts/run_localization_replay.sh \
 
 (Append `true` as a 5th argument to open RViz.)
 
-Manual version — four processes, four terminals (all in the distrobox, repo
-root, both `setup.bash` sourced):
+Manual version — four processes, four terminals (all local shells, from the
+repo root, with `/opt/ros/jazzy/setup.bash` and `install/setup.bash` sourced):
 
 ```bash
 # T1 — localization node + robot_state_publisher (+ rviz:=true if you want)
@@ -227,6 +250,23 @@ moving, publishes `gicp/localization/pose` per scan and
 To localize a *different* session against this map, prep that session's bag
 (step 1) and reuse the same `map_path` / `utm_transform_path` — the shared
 UTM frame makes the GT bridge and bootstrap line up automatically.
+
+Concrete validation example: use `run_3` as the test run against the map
+built from `run_5`:
+
+```bash
+python3 -u scripts/prep_bag.py \
+  --input "../rosbags/putnam/may_26/run_3/filtered/all" \
+  --output "$DATA/run_3_prepped" \
+  --utm-origin "$(tail -n 1 "$DATA/run_5_prepped/utm_origin.txt")"
+
+scripts/run_localization_replay.sh \
+  "$DATA/run_3_prepped" \
+  "$DATA/run_5_map.pcd" \
+  "$DATA/run_5_dump/T_world_utm.txt" \
+  "$DATA/run_3_loc" \
+  true
+```
 
 ### 4a. Check localization error
 

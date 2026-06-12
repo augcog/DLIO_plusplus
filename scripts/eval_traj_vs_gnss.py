@@ -11,8 +11,8 @@ error statistics of
 Both GLIM's traj_imu and the Atlas INS solution live at the antenna phase
 centre (gps_antenna_top), so this is an apples-to-apples comparison.
 
-Run inside the ros2 distrobox:
-    python3 scripts/eval_traj_vs_gnss.py --dump /path/to/dump --bag /path/to/prepped_bag
+Run from a local ROS 2 Jazzy shell:
+    python3 scripts/eval_traj_vs_gnss.py --dump ./dlio_data/run_5_dump --bag ./dlio_data/run_5_prepped
 """
 
 import argparse

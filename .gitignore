@@ -2,8 +2,11 @@ build/
 install/
 log/
 tmp/
+dlio_data/
+.deps/
 .DS_Store
 CLAUDE.md
 .codex
 *.png
 .claude/
+.vscode/browse.vc.db*
