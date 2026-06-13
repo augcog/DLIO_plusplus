@@ -172,6 +172,16 @@ private:
   bool gt_recovery_enabled_;
   int gt_recovery_min_consecutive_failures_;
   int consecutive_failures_;          // resets to 0 on accept; increments on any non-accept
+
+  // GNSS integrity veto: when RTK-quality GT is fresh (same post-rtk_gate
+  // buffer and max_dt as the snap), a GICP candidate farther than
+  // gt_veto_dist_m_ from it is treated as a failure instead of accepted.
+  // GNSS never supplies the pose here — it only vetoes confident-but-wrong
+  // LiDAR matches (track-aliasing slides), which would otherwise reset the
+  // failure streak and keep the snap recovery from ever engaging. Disarms
+  // automatically when the rtk_gate is dropping samples (buffer goes stale).
+  bool gt_veto_enabled_;
+  double gt_veto_dist_m_;
   bool gt_extrinsics_cached_;
   Eigen::Matrix4f T_base_gtbody_;     // pose of gt_body expressed in base_frame
   std::string gt_body_frame_;          // captured from msg->child_frame_id

@@ -118,8 +118,26 @@
     # via TF (cached on first GT message). IMU biases are preserved. Disabled by
     # default — production deployments without a GT topic keep the existing
     # dead-reckoning behavior. Setting enable=true forces gt_odom/enable=true.
+    # 4 (was 1): snapping on the FIRST failure made GNSS the primary estimator
+    # (2871 snaps in run_5 = one per rejected scan) and never let IMU+LiDAR
+    # re-acquire on their own. At ~20 Hz processing, 4 failures = ~0.2 s of
+    # IMU-only — well inside the IMU's <2 m bridging envelope — before the
+    # GNSS fallback engages.
     localization/gt_recovery/enable: true
-    localization/gt_recovery/min_consecutive_failures: 1
+    localization/gt_recovery/min_consecutive_failures: 4
+
+    # GNSS integrity veto — "GPS assists when RTK is good" without ever
+    # supplying the pose: a candidate that passed every geometric gate but
+    # sits >dist_m from the fresh RTK GT is counted as a failure. Motivation
+    # (run_5 tuned-replay analysis): this track aliases along its length, so
+    # GICP produces confident wrong matches (ratio 0.998, fitness 0.17) when
+    # the prior is >5-10 m off; those false accepts reset the failure streak,
+    # the snap recovery never engages, and one bad accept can kick the
+    # geometric observer into velocity/attitude runaway (measured 308 m).
+    # Uses the same post-rtk_gate buffer + max_dt freshness as gt_recovery,
+    # so it disarms automatically while RTK quality is bad.
+    localization/gt_veto/enable: true
+    localization/gt_veto/dist_m: 3.0
 
     # Initial pose taken directly from GLIM traj_lidar.txt first row.
     # robot_state_publisher (launched alongside this node from the URDF) provides
@@ -142,7 +160,10 @@
     # so this crop box acts on world-frame coords. Disable or set very large if using deskew.
     dlio/preprocessing/cropBoxFilter/size: 80.0  # metres; 160m cube around sensor (sensor frame when deskew=false)
     dlio/preprocessing/voxelFilter/use: true    # Enabled for full-map localization to reduce correspondence ambiguity
-    dlio/preprocessing/voxelFilter/res: 0.75  # keeps the merged 3-lidar scan small enough for <50ms GICP on the full-track map
+    # 0.9 (was 0.75): at 0.75 the GICP median was 53.5 ms — over the 50 ms scan
+    # period — so SensorDataQoS dropped ~79% of scans (run_5 fusion-timeline
+    # analysis). ~2.6k pts/scan brings the whole callback under budget.
+    dlio/preprocessing/voxelFilter/res: 0.9
 
     # Flip Y axis of incoming point cloud (e.g. SAE Y-right -> ROS Y-left without touching Z).
     # When lidar_concat is enabled this runs AFTER merge, so it flips the merged primary+aux cloud.
@@ -261,19 +282,28 @@
     # scans. Measured on the full-track Putnam map: per-scan latency must stay
     # well under the 50 ms scan period or the published pose lags ground truth
     # (each 100 ms of processing latency ≈ 1.5 m of error at race speed).
-    gicp/maxIterations: 32
+    # 24 (was 32): with LiDAR-primary operation the iteration count is what
+    # blows the 50 ms budget on hard scans (32 x ~3 ms); fresher priors from
+    # the depth-1 scan queue need fewer steps, and effectively_converged
+    # already accepts good-fitness results that hit the cap.
+    gicp/maxIterations: 24
 
-    # Number of neighbors used to compute per-point covariances (typical: 20)
-    gicp/correspondenceRandomness: 20
+    # Number of neighbors used to compute per-point covariances (typical: 20).
+    # 10 halves the per-scan covariance build (runs in the scan callback; the
+    # map covariances are built once at load and are unaffected).
+    gicp/correspondenceRandomness: 10
 
     # Maximum correspondence distance (meters)
     # Points further apart than this won't be considered correspondences
-    # Tightened from 5.0 to cut spurious matches against the dense full map.
-    gicp/maxCorrespondenceDistance: 4.0
+    # 3.0 (was 4.0): cheaper neighbor search; the IMU prior is typically
+    # <0.5 m from the solution, so 3 m keeps full margin while cutting cost.
+    gicp/maxCorrespondenceDistance: 3.0
 
-    # Convergence criteria — tightened now that downsampling is re-enabled
-    gicp/transformationEpsilon: 0.004
-    gicp/rotationEpsilon: 0.004
+    # Convergence criteria. 0.01 (was 0.004): declaring convergence at 1 cm
+    # instead of 4 mm saves several iterations per scan — meaningful against
+    # the 50 ms budget — at negligible accuracy cost vs the current error floor.
+    gicp/transformationEpsilon: 0.01
+    gicp/rotationEpsilon: 0.01
 
     # GICP result gating: reject poor registrations and fall back to IMU dead-reckoning.
     # Good alignments on the full map hit fitness ~0.01–0.05 (p90 0.04, p99 0.39).
@@ -289,21 +319,26 @@
     # fitness — the signature of the optimizer landing in a wrong local minimum
     # that the unconstrained axis let it slide into.
     #
-    # Data-driven thresholds (Putnam May 4 run, full run with IMU+lidar_concat):
-    #   healthy at corners: hessian 1–4e9, fitness 0.03–0.06, gt_err ≈ 0.7m
-    #   bad accepts:        hessian 6–13e9, fitness 0.15–0.35, gt_err 10–23m
-    # 5e9 / 0.15 sits cleanly between the two populations.
+    # Data-driven thresholds, recalibrated on the may_26 run_5 replay
+    # (fusion-timeline analysis, 2026-06-12). With lidar_concat ON the healthy
+    # hessian baseline on this track is ~4e11 — the old May-4-derived 5e9 gate
+    # armed on essentially every scan and its rot>1.5deg branch then vetoed 88%
+    # of processed scans, even though 52% of the vetoed candidates were within
+    # 1 m of RTK truth (81% within 2 m). Measured discrimination between
+    # good (gt_err<1m) and bad (gt_err>3m) rejected candidates:
+    #   fitness 0.17 vs 0.54  (discriminative -> warn at 0.35)
+    #   trans   1.0m medians on GOOD candidates (old 1.0m warn fired on them -> 2.5)
+    #   rot     2.27 vs 3.12 deg (NOT discriminative -> branch disabled)
+    #   hessian 3.9e11 vs 9.3e11 (weak -> arm gate at 3e11, above healthy median)
     # Set hessianCondMax <= 0 to disable; set hessianFitnessWarnThreshold <= 0 to
     # restore the old "hessian alone" behavior.
-    gicp/hessianCondMax: 5.0e9
-    gicp/hessianFitnessWarnThreshold: 0.15
-    # Slide signature in degenerate geometry: GICP applies an unusually large
-    # correction to the IMU prior. Healthy GICP scans need <0.5m / <0.5° of
-    # correction because the IMU prior is already good. A 1.27m or 2.83° GICP
-    # correction at hessian 1e10 is the optimizer sliding along an unconstrained
-    # axis even when fitness looks low. Set <=0 to disable that OR branch.
-    gicp/hessianTransWarnM: 1.0
-    gicp/hessianRotWarnDeg: 1.5
+    gicp/hessianCondMax: 3.0e11
+    gicp/hessianFitnessWarnThreshold: 0.35
+    # 1.2 (was 2.5 in the first retune): with the depth-1 scan queue the IMU
+    # prior is fresh, so healthy corrections are well under 1 m; 2.5 admitted
+    # multi-meter degenerate slides at the pit straight.
+    gicp/hessianTransWarnM: 1.2
+    gicp/hessianRotWarnDeg: 0.0
 
 
   

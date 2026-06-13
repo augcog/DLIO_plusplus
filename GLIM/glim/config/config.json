@@ -25,15 +25,27 @@
     // ros2-jazzy distrobox), so the *_gpu configs cannot load — their .so
     // files are not built.
     //
-    // Odometry choice for MAP BUILDING from RTK-clean bags: the INS-driven
-    // estimator. The Putnam track is feature-poor at racing speed; pure
-    // LiDAR+IMU registration (config_odometry_cpu.json) measurably drifts
-    // ~12%/distance and eventually corrupts the global graph (bias soak-up
-    // runaway, verified on run_5). The INS estimator instead interpolates
-    // /gps_p1/filtered_odom_rtk_fixed (true time-of-validity stamps from
-    // prep_bag.py) for the trajectory and deskews scans with INS motion.
-    // It PAUSES when the RTK stream stops — acceptable for offline mapping
-    // of RTK-good runs; check prep_bag's rtk-fixed count before relying on it.
+    // Odometry choice. 2026-06-12: pure LiDAR+IMU (cpu) was RE-TESTED on
+    // run_5 with deskewing fixed, twice (fix_imu_bias false AND true) — both
+    // runs collapse with gtsam::IndeterminantLinearSystemException in the
+    // odometry smoother at the feature-poor corner zone (~t=365 s, the same
+    // region where the localization degeneracy gate fires hardest). The old
+    // verdict against cpu odometry on this track therefore stands and is NOT
+    // a deskewing artifact: GLIM's odometry lacks degeneracy protection
+    // (e.g. a motion-prior fallback) for this geometry. "LiDAR+IMU continuous
+    // mapping with GNSS assist" needs that estimator-level work upstream.
+    // Until then, the INS-driven odometry is the working mapping path for
+    // RTK-clean bags: it interpolates /gps_p1/filtered_odom_rtk_fixed for the
+    // trajectory but PAUSES whenever the RTK stream stops — check prep_bag's
+    // rtk-fixed count before relying on it.
+    // 2026-06-12: CUDA was tried (gtsam_points rebuilt with BUILD_WITH_CUDA,
+    // CUDA 12.8, RTX 5070 Ti) and ABANDONED on this machine: gtsam_points
+    // v1.2.1's GPU kernels misbehave on sm_120/Blackwell — submap overlap
+    // evaluates to 0 on GPU (vs 0.1-0.2 for the same data on CPU), which
+    // starves the global graph of registration factors and crashes it
+    // (IndeterminantLinearSystemException + segfault). Revisit only with a
+    // newer gtsam_points release that supports Blackwell. The CUDA toolchain
+    // and libgtsam_points_cuda.so remain installed but unused.
     "config_odometry": "config_odometry_ins.json",
     // "config_odometry": "config_odometry_cpu.json",
     // "config_odometry": "config_odometry_gpu.json",
@@ -42,6 +54,11 @@
     // reset warnings) and the merged map exceeds RAM. The keyframe-based CPU
     // sub-mapping keeps the graph small and the GNSS anchoring still applies
     // per submap.
+    // GPU sub/global mapping DISABLED on this machine: with gtsam_points
+    // v1.2.1 CUDA on the RTX 5070 Ti (sm_120/Blackwell) every submap overlap
+    // evaluates to 0 -> no registration factors -> underconstrained global
+    // graph -> IndeterminantLinearSystemException + segfault (2104 warnings,
+    // run_5 2026-06-12). GPU odometry + CPU mapping is the working hybrid.
     "config_sub_mapping": "config_sub_mapping_cpu.json",
     "config_global_mapping": "config_global_mapping_cpu.json",
     // The GNSS extension's real config is glim_ext's config_gnss_global.json

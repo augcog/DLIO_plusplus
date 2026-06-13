@@ -733,9 +733,16 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
   this->pointcloud_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   auto pointcloud_sub_opt = rclcpp::SubscriptionOptions();
   pointcloud_sub_opt.callback_group = this->pointcloud_cb_group;
-  // Use sensor-data QoS so rosbag/sensor publishers with BEST_EFFORT are compatible.
+  // Sensor-data QoS (BEST_EFFORT, compatible with rosbag/sensor publishers)
+  // but with history depth 1 instead of SensorDataQoS' default 5: when the
+  // scan callback runs longer than the scan period, a deeper FIFO makes us
+  // process scans that are several periods old, which directly becomes
+  // along-track error (~speed x staleness) because corrections are applied at
+  // scan time. Depth 1 always processes the NEWEST scan; under overload the
+  // same number of scans are dropped either way, but each processed one is
+  // fresh (measured: result age 320 ms -> ~(callback time) with depth 1).
   this->pointcloud_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-      "pointcloud", rclcpp::SensorDataQoS(),
+      "pointcloud", rclcpp::SensorDataQoS(rclcpp::KeepLast(1)),
       std::bind(&gicp_localization::LocalizationNode::callbackPointCloud, this, std::placeholders::_1),
       pointcloud_sub_opt);
 
@@ -1083,6 +1090,15 @@ void gicp_localization::LocalizationNode::getParams() {
   this->get_parameter("localization/gt_recovery/enable", this->gt_recovery_enabled_);
   this->get_parameter("localization/gt_recovery/min_consecutive_failures",
                       this->gt_recovery_min_consecutive_failures_);
+  this->declare_parameter<bool>("localization/gt_veto/enable", false);
+  this->declare_parameter<double>("localization/gt_veto/dist_m", 3.0);
+  this->get_parameter("localization/gt_veto/enable", this->gt_veto_enabled_);
+  this->get_parameter("localization/gt_veto/dist_m", this->gt_veto_dist_m_);
+  if (this->gt_veto_enabled_ && !this->gt_odom_enabled_) {
+    RCLCPP_WARN(this->get_logger(),
+                "localization/gt_veto/enable=true but gt_odom/enable=false — forcing gt_odom on so the buffer fills.");
+    this->gt_odom_enabled_ = true;
+  }
   if (this->gt_recovery_enabled_ && !this->gt_odom_enabled_) {
     RCLCPP_WARN(this->get_logger(),
                 "localization/gt_recovery/enable=true but gt_odom/enable=false — forcing gt_odom on so the buffer fills.");
@@ -2583,8 +2599,33 @@ void gicp_localization::LocalizationNode::performLocalization() {
       gicp_rejected_jump = true;
     }
   }
+  // GNSS integrity veto (see header): only consulted for candidates that
+  // passed every geometric gate, and only when a fresh post-rtk_gate GT
+  // sample exists. Track-aliased matches are confident (low fitness, full
+  // correspondence ratio) yet meters off — without an absolute cross-check
+  // they reset the failure streak and disable the snap recovery while the
+  // estimator walks away.
+  bool gicp_rejected_gt_veto = false;
+  float gt_veto_dist = -1.0f;
+  if (this->gt_veto_enabled_ && effectively_converged && candidate_pose_valid &&
+      !gicp_rejected_fitness && !gicp_rejected_hessian && !gicp_rejected_jump &&
+      this->gt_odom_received_.load() && this->gt_extrinsics_cached_) {
+    GtSample gtv;
+    if (this->getGtPoseAt(this->scan_stamp.seconds(), gtv)) {
+      Eigen::Vector3f p_gt;
+      Eigen::Quaternionf q_gt;
+      if (this->composeGtPoseInBase(gtv, p_gt, q_gt)) {
+        gt_veto_dist = (candidate_pose.block<3, 1>(0, 3) - p_gt).norm();
+        if (gt_veto_dist > this->gt_veto_dist_m_) {
+          gicp_rejected_gt_veto = true;
+        }
+      }
+    }
+  }
+
   const bool gicp_accepted = effectively_converged && candidate_pose_valid &&
-                             !gicp_rejected_fitness && !gicp_rejected_hessian && !gicp_rejected_jump;
+                             !gicp_rejected_fitness && !gicp_rejected_hessian &&
+                             !gicp_rejected_jump && !gicp_rejected_gt_veto;
 
   if (!candidate_pose_valid) {
     RCLCPP_WARN(this->get_logger(), "%s", build_scan_debug_log("invalid_solution").c_str());
@@ -2608,6 +2649,11 @@ void gicp_localization::LocalizationNode::performLocalization() {
     RCLCPP_WARN(this->get_logger(),
                 "GICP REJECTED (jump dT=%.3fm dR=%.2fdeg): %s",
                 jump_trans, jump_rot_deg, build_scan_debug_log("rejected_jump").c_str());
+  } else if (gicp_rejected_gt_veto) {
+    RCLCPP_WARN(this->get_logger(),
+                "GICP REJECTED (GNSS integrity veto: candidate %.2fm from RTK GT > %.2fm): %s",
+                gt_veto_dist, this->gt_veto_dist_m_,
+                build_scan_debug_log("rejected_gt_veto").c_str());
   } else if (large_jump) {
     RCLCPP_WARN(this->get_logger(), "%s", build_scan_debug_log("large_jump").c_str());
   } else if (this->debug_verbose_scan_log_) {
@@ -2709,6 +2755,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
                        : !effectively_converged ? "failed to converge"
                        : gicp_rejected_fitness ? "fitness rejected"
                        : gicp_rejected_hessian ? "degenerate geometry"
+                       : gicp_rejected_gt_veto ? "GNSS integrity veto"
                        : "jump rejected";
     if (matrixFinite(this->T_prior)) {
       this->current_pose = this->T_prior;
