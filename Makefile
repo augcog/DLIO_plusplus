@@ -210,7 +210,7 @@ install-deps: install-glim-apt  ## Install apt, GLIM, rosdep, and Python deps fo
 	rosdep update
 	$(call _source)
 	rosdep install --from-paths . --ignore-src -r -y --rosdistro $(ROS_DISTRO) $(ROSDEP_SKIP_ARG)
-	python3 -m pip install --user --break-system-packages mcap mcap-ros2-support pyproj numpy
+	python3 -m pip install --user --break-system-packages mcap mcap-ros2-support pyproj numpy matplotlib
 
 install-glim-apt:  ## Install required GLIM apt deps from Koide PPAs (Iridescence/GTSAM)
 	sudo apt-get update
@@ -344,6 +344,10 @@ render-map:  ## Render static map views to DATA_ROOT/renders
 	$(call _source_required)
 	python3 scripts/render_map.py --map "$(MAP)" --out "$(DATA_ROOT)/renders" \
 		--traj "$(DUMP)/traj_imu.txt" --views "$(VIEWS)"
+
+viz-cache:  ## Show cached LOC/live_error.csv in RViz without rerunning GICP
+	$(call _source_required)
+	scripts/show_cached_error_viz.sh "$(LOC)" "$(REF_MAP)"
 
 export-map-html:  ## Generate browser viewer folder for MAP
 	$(call _source_required)

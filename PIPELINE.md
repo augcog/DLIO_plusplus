@@ -216,7 +216,31 @@ scripts/run_localization_replay.sh \
     "$DATA/${RUN}_loc"
 ```
 
-(Append `true` as a 5th argument to open RViz.)
+(Append `true` as a 5th argument to open RViz.) The replay script also starts
+`scripts/live_gnss_error_monitor.py`: RViz shows the GICP trajectory in green,
+the GNSS/RTK reference trajectory in red, and a live marker from the GICP pose
+to the nearest GNSS pose. It also publishes a live 3D "error rollercoaster":
+the GNSS path stays on the physical map, while the colored curtain rises by
+the current GICP-vs-GNSS error in meters. It writes live error samples to
+`$DATA/${RUN}_loc/live_error.csv` and refreshes
+`$DATA/${RUN}_loc/live_error.png` during replay.
+
+Do **not** rerun localization just to inspect the same result again. Once
+`live_error.csv` exists, use the cached RViz path instead:
+
+```bash
+scripts/show_cached_error_viz.sh \
+    "$DATA/${RUN}_loc" \
+    "$DATA/${MAP_RUN:-$RUN}_map.pcd"
+
+# Same idea through Make:
+make viz-cache RUN=run_3 MAP_RUN=run_5 LOC="$DATA/run_3_loc_gnss_live"
+```
+
+This republishes the saved red GNSS path, green GICP path, current error
+marker, sampled map backdrop, and live 3D error rollercoaster from the CSV.
+It does not start `gicp_localization`, does not play a rosbag, and does not
+rebuild or reload the GICP map.
 
 Manual version — four processes, four terminals (all local shells, from the
 repo root, with `/opt/ros/jazzy/setup.bash` and `install/setup.bash` sourced):
@@ -234,11 +258,22 @@ ros2 launch gicp_localization localization_with_tf.launch.py \
 python3 gicp_localization/scripts/utm_to_map_odom.py --ros-args \
     -p utm_transform_path:="$DATA/${RUN}_dump/T_world_utm.txt"
 
-# T3 — record the outputs for evaluation (optional but recommended)
-ros2 bag record -o "$DATA/${RUN}_loc_eval" \
-    /gicp/localization/odom /gps_p1/filtered_odom_map
+# T3 — live GNSS-vs-GICP overlay/error plot for RViz and PNG output
+python3 scripts/live_gnss_error_monitor.py --ros-args \
+    -p est_topic:=/gicp/localization/odom \
+    -p gnss_topic:=/gps_p1/filtered_odom_map \
+    -p csv_path:="$DATA/${RUN}_loc/live_error.csv" \
+    -p plot_path:="$DATA/${RUN}_loc/live_error.png"
 
-# T4 — replay (last; --clock because the node runs with use_sim_time)
+# T4 — record the outputs for evaluation (optional but recommended)
+ros2 bag record -o "$DATA/${RUN}_loc_eval" \
+    /gicp/localization/odom /gps_p1/filtered_odom_map \
+    /gps_p1/filtered_odom_map/path \
+    /gicp/localization/debug/gnss_error_m \
+    /gicp/localization/debug/gnss_error_markers \
+    /gicp/localization/debug/gnss_error_rollercoaster
+
+# T5 — replay (last; --clock because the node runs with use_sim_time)
 ros2 bag play "$DATA/${RUN}_prepped" --clock 100
 ```
 
@@ -279,6 +314,10 @@ python3 scripts/eval_odom_vs_gt.py \
 
 Prints the publish rate of the localized odom (should be ~99 Hz) and position
 error stats vs the RTK INS solution.
+
+During replay, `live_error.csv`/`live_error.png` in the localization output
+directory provide the same GICP-vs-GNSS comparison incrementally, so RViz can
+display the live error while the final evaluation bag is still being recorded.
 
 Reference result (run_5 localized against its own map, full 791 s replay):
 ~99 Hz output, horizontal error median 0.57 m / rms 2.4 m; 66 % of samples

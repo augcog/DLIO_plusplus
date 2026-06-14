@@ -1,3 +1,9 @@
+# Localization Development Log
+Dear Allen, Kevin
+I want to continusely record what is changed and what is next step with a log document in this repo. It's eazier for both agent and developer to understand and update changes over time.
+
+
+
 # DLIO++
 
 ROS 2 perception stack for the AV-24 Cybertruck autonomous race car. Pairs a GPU-accelerated LiDAR-inertial SLAM front end with a map-based localizer so the vehicle can build a map offline, then localize against it online at IMU rate.
@@ -107,6 +113,9 @@ Headline dependencies (per-package READMEs go deeper):
 
 - GTSAM 4.2, gtsam_points (GPU factors), Iridescence, Eigen3, PCL, OpenMP, nlohmann::json, spdlog
 - Optional: CUDA 11.8+ (GPU acceleration), OpenCV
+- Python bag/pipeline tools: `mcap`, `mcap-ros2-support`, `pyproj`, `numpy`, and `matplotlib`.
+  `make install-deps` installs them with:
+  `python3 -m pip install --user --break-system-packages mcap mcap-ros2-support pyproj numpy matplotlib`
 
 If `ros2 pkg prefix glim` does not point inside this workspace's `install/`, an apt-installed `ros-jazzy-glim-*` package is being picked up instead of this fork — re-source `install/setup.bash` **after** `/opt/ros/jazzy/setup.bash`. The same caveat applies to `gicp_localization` if a sibling workspace is also sourced.
 
@@ -133,6 +142,9 @@ ros2 launch gicp_localization localization_with_tf.launch.py rviz:=true \
     pointcloud_topic:=/luminar_front/points \
     imu_topic:=/gps_p1/imu \
     gt_odom_topic:=/gps_p1/filtered_odom_map
+
+# Re-open a previous localization result in RViz without rerunning GICP/rosbag.
+scripts/show_cached_error_viz.sh <result_dir_with_live_error.csv> <map.pcd>
 ```
 
 ---

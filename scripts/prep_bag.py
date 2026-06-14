@@ -12,7 +12,8 @@ native topics, which none of the pipeline configs subscribe to:
 
 This script writes a new rosbag2 (mcap) directory containing:
 
-    /luminar_front|left|right/points   byte-for-byte passthrough
+    /luminar_front|left|right/points   passthrough by default; optionally shifted
+                                       by --lidar-time-offset
     /gps_p1/imu                        re-stamped IMU, frame_id "gps_antenna_top"
     /gps_p1/filtered_odom              nav_msgs/Odometry in the fixed "utm" frame
     /gps_p1/filtered_odom_rtk_fixed    same, gated to RTK-FIXED quality only
@@ -45,6 +46,16 @@ validity on the P1 monotonic clock), so stamps are rebuilt exactly as
 p1_time + OFF, where OFF is the lower envelope of (arrival - p1_time)
 (arrival can only be late, never early).
 
+LiDAR time alignment: LiDAR PointCloud2 header stamps are left unchanged by
+default and are treated as the scan reference time on the ROS/INS time axis.
+Per-point Luminar timestamps are not used as an absolute INS-time source here;
+they are only checked as an intra-scan clock (timestamp_i - min_timestamp).
+The script prints a LiDAR-vs-odom timing report and writes
+time_alignment_report.txt. If an external calibration finds a fixed LiDAR-INS
+time delay, pass --lidar-time-offset SECONDS to add that offset to LiDAR
+PointCloud2 header.stamp and rosbag log_time. Point-level timestamps are left
+untouched because GLIM uses them only through their per-scan relative offsets.
+
 Run from a local ROS 2 Jazzy shell. Dependencies:
     pip install --user --break-system-packages mcap mcap-ros2-support pyproj numpy
 
@@ -56,9 +67,11 @@ Usage:
 """
 
 import argparse
+import bisect
 import glob
 import math
 import os
+import struct
 import sys
 
 import numpy as np
@@ -88,6 +101,14 @@ ODOM_RTK_OUT = "/gps_p1/filtered_odom_rtk_fixed"
 OUT_FRAME = "utm"
 BODY_FRAME = "gps_antenna_top"
 SOLUTION_TYPE_RTK_FIXED = 4  # fusion_engine SolutionType enum
+TIME_FIELD_NAMES = ("t", "time", "time_stamp", "timestamp")
+
+# sensor_msgs/msg/PointField constants. Importing PointField directly is not
+# needed and keeps this script compatible with mcap's dynamic message classes.
+PF_UINT8 = 2
+PF_UINT32 = 6
+PF_FLOAT32 = 7
+PF_FLOAT64 = 8
 
 
 def input_mcaps(path):
@@ -144,6 +165,226 @@ def fit_p1_clock_offset(pose_pairs):
     return lambda t: t + np.interp(t, env_t, env_off)
 
 
+def stamp_to_sec(stamp):
+    return stamp.sec + stamp.nanosec * 1e-9
+
+
+def set_stamp(stamp, t):
+    stamp.sec, stamp.nanosec = to_ros_time(t)
+
+
+def nearest_abs_delta(stamps, t):
+    if len(stamps) == 0:
+        return None
+    idx = bisect.bisect_left(stamps, t)
+    candidates = []
+    if idx < len(stamps):
+        candidates.append(abs(stamps[idx] - t))
+    if idx > 0:
+        candidates.append(abs(stamps[idx - 1] - t))
+    return min(candidates) if candidates else None
+
+
+def point_time_field(msg):
+    for f in msg.fields:
+        if f.name in TIME_FIELD_NAMES:
+            return f
+    return None
+
+
+def unpack_point_time(data, offset, datatype, count):
+    if datatype == PF_UINT8 and count == 8:
+        return struct.unpack_from("<Q", data, offset)[0] * 1e-9
+    if datatype == PF_UINT32:
+        return struct.unpack_from("<I", data, offset)[0] * 1e-9
+    if datatype == PF_FLOAT32:
+        return float(struct.unpack_from("<f", data, offset)[0])
+    if datatype == PF_FLOAT64:
+        return float(struct.unpack_from("<d", data, offset)[0])
+    return None
+
+
+def point_time_minmax(msg):
+    field = point_time_field(msg)
+    if field is None:
+        return None
+    count = int(msg.width) * int(msg.height)
+    if count == 0:
+        return None
+
+    tmin = None
+    tmax = None
+    offset = int(field.offset)
+    point_step = int(msg.point_step)
+    data = msg.data
+    for i in range(count):
+        t = unpack_point_time(data, i * point_step + offset, field.datatype, int(field.count))
+        if t is None:
+            return None
+        if tmin is None or t < tmin:
+            tmin = t
+        if tmax is None or t > tmax:
+            tmax = t
+
+    return {
+        "name": field.name,
+        "datatype": int(field.datatype),
+        "count": int(field.count),
+        "min": tmin,
+        "max": tmax,
+        "span": max(0.0, tmax - tmin),
+        "absolute_like": tmax > 1.0,
+    }
+
+
+def ms_summary(values):
+    if not values:
+        return "n=0"
+    arr = np.asarray(values, dtype=float) * 1e3
+    return (f"n={len(arr)} median={np.median(arr):.3f} ms "
+            f"p95={np.percentile(arr, 95):.3f} ms "
+            f"min={arr.min():.3f} ms max={arr.max():.3f} ms")
+
+
+def signed_ms_summary(values):
+    if not values:
+        return "n=0"
+    arr = np.asarray(values, dtype=float) * 1e3
+    return (f"n={len(arr)} median={np.median(arr):.3f} ms "
+            f"min={arr.min():.3f} ms max={arr.max():.3f} ms "
+            f"range={(arr.max() - arr.min()):.3f} ms")
+
+
+def init_lidar_time_diagnostics(p1_to_ros, pose_pairs, samples_per_topic,
+                                lidar_time_offset, nearest_warn_ms,
+                                clock_drift_warn_ms):
+    return {
+        "samples_per_topic": samples_per_topic,
+        "lidar_time_offset": lidar_time_offset,
+        "nearest_warn_ms": nearest_warn_ms,
+        "clock_drift_warn_ms": clock_drift_warn_ms,
+        "odom_stamps": sorted(float(x) for x in p1_to_ros(pose_pairs[:, 1])),
+        "topics": {
+            topic: {
+                "samples": 0,
+                "missing_time": 0,
+                "unsupported_time": 0,
+                "header_log": [],
+                "scan_span": [],
+                "header_min_point": [],
+                "header_dt": [],
+                "point_min_dt": [],
+                "nearest_odom_start": [],
+                "nearest_odom_end": [],
+                "last_header": None,
+                "last_point_min": None,
+                "field_desc": None,
+            }
+            for topic in LIDAR_TOPICS
+        },
+    }
+
+
+def update_lidar_time_diagnostics(diag, topic, msg, log_time_ns):
+    samples_per_topic = diag["samples_per_topic"]
+    if samples_per_topic <= 0 or topic not in diag["topics"]:
+        return
+
+    st = diag["topics"][topic]
+    if st["samples"] >= samples_per_topic:
+        return
+
+    header_t = stamp_to_sec(msg.header.stamp)
+    log_t = log_time_ns * 1e-9
+    st["samples"] += 1
+    st["header_log"].append(log_t - header_t)
+
+    if st["last_header"] is not None:
+        st["header_dt"].append(header_t - st["last_header"])
+    st["last_header"] = header_t
+
+    nearest_start = nearest_abs_delta(diag["odom_stamps"], header_t)
+    if nearest_start is not None:
+        st["nearest_odom_start"].append(nearest_start)
+
+    point_stats = point_time_minmax(msg)
+    if point_stats is None:
+        if point_time_field(msg) is None:
+            st["missing_time"] += 1
+        else:
+            st["unsupported_time"] += 1
+        return
+
+    st["field_desc"] = (f"{point_stats['name']} datatype={point_stats['datatype']} "
+                        f"count={point_stats['count']}")
+    st["scan_span"].append(point_stats["span"])
+    scan_end_t = header_t + point_stats["span"]
+    nearest_end = nearest_abs_delta(diag["odom_stamps"], scan_end_t)
+    if nearest_end is not None:
+        st["nearest_odom_end"].append(nearest_end)
+    if point_stats["absolute_like"]:
+        st["header_min_point"].append(header_t - point_stats["min"])
+        if st["last_point_min"] is not None:
+            st["point_min_dt"].append(point_stats["min"] - st["last_point_min"])
+        st["last_point_min"] = point_stats["min"]
+
+
+def format_lidar_time_diagnostics(diag):
+    """Report LiDAR scan reference stamps against the re-stamped INS/odom axis.
+
+    This intentionally does not estimate physical LiDAR-INS latency from motion.
+    Timestamps can prove that the bag's clocks are mutually usable, but a
+    constant sensor latency needs external calibration or a trajectory residual
+    sweep.  --lidar-time-offset is the explicit hook for applying that result.
+    """
+    lines = []
+    lidar_time_offset = diag["lidar_time_offset"]
+    nearest_warn_ms = diag["nearest_warn_ms"]
+    clock_drift_warn_ms = diag["clock_drift_warn_ms"]
+
+    lines.append("[prep_bag] LiDAR/INS time alignment report")
+    lines.append(f"[prep_bag]   applied lidar_time_offset={lidar_time_offset:+.9f}s "
+                 "(positive moves LiDAR later on the ROS/INS axis)")
+
+    if diag["samples_per_topic"] <= 0:
+        lines.append("[prep_bag]   skipped (--lidar-time-check-samples <= 0)")
+        return lines
+
+    for topic, st in diag["topics"].items():
+        lines.append(f"[prep_bag]   {topic}: samples={st['samples']}")
+        if st["field_desc"]:
+            lines.append(f"[prep_bag]     point time field: {st['field_desc']}")
+        if st["missing_time"]:
+            lines.append(f"[prep_bag]     WARNING: {st['missing_time']} sampled clouds had no per-point time field")
+        if st["unsupported_time"]:
+            lines.append(f"[prep_bag]     WARNING: {st['unsupported_time']} sampled clouds had an unsupported time field")
+        lines.append(f"[prep_bag]     bag_log_time - header.stamp: {signed_ms_summary(st['header_log'])}")
+        lines.append(f"[prep_bag]     LiDAR header dt: {ms_summary(st['header_dt'])}")
+        if st["scan_span"]:
+            lines.append(f"[prep_bag]     LiDAR scan span from per-point time: {ms_summary(st['scan_span'])}")
+        if st["header_min_point"]:
+            lines.append(f"[prep_bag]     header.stamp - min(point_time): {signed_ms_summary(st['header_min_point'])}")
+            spread_ms = (max(st["header_min_point"]) - min(st["header_min_point"])) * 1e3
+            if spread_ms > clock_drift_warn_ms:
+                lines.append(f"[prep_bag]     WARNING: header-to-point clock offset spread {spread_ms:.3f} ms "
+                             f"> {clock_drift_warn_ms:.3f} ms")
+        if st["point_min_dt"]:
+            lines.append(f"[prep_bag]     point-min dt: {ms_summary(st['point_min_dt'])}")
+        lines.append(f"[prep_bag]     nearest odom to scan start: {ms_summary(st['nearest_odom_start'])}")
+        if st["nearest_odom_end"]:
+            lines.append(f"[prep_bag]     nearest odom to scan end: {ms_summary(st['nearest_odom_end'])}")
+
+        all_nearest = st["nearest_odom_start"] + st["nearest_odom_end"]
+        if all_nearest and max(all_nearest) * 1e3 > nearest_warn_ms:
+            lines.append(f"[prep_bag]     WARNING: LiDAR scan window is farther than "
+                         f"{nearest_warn_ms:.1f} ms from nearest odom sample")
+
+    lines.append("[prep_bag]   NOTE: this check validates timestamp-axis compatibility. "
+                 "It cannot infer true physical LiDAR-INS latency from stamps alone; "
+                 "apply measured latency with --lidar-time-offset.")
+    return lines
+
+
 def dejitter(stamps, nominal_period=0.01):
     """Backward-min de-jitter of arrival-stamped samples onto a uniform grid."""
     if len(stamps) < 100:
@@ -198,6 +439,19 @@ def main():
                          "session to share its frame.")
     ap.add_argument("--rtk-max-var-xy", type=float, default=1e-3, help="m^2 gate for the rtk_fixed topic")
     ap.add_argument("--rtk-max-var-z", type=float, default=5e-3, help="m^2 gate for the rtk_fixed topic")
+    ap.add_argument("--lidar-time-offset", type=float, default=0.0,
+                    help="Seconds added to /luminar_* PointCloud2 header.stamp and bag log_time. "
+                         "Positive moves LiDAR later on the ROS/INS time axis. Point-level "
+                         "timestamps are left untouched.")
+    ap.add_argument("--lidar-time-check-samples", type=int, default=200,
+                    help="Number of LiDAR clouds per topic to sample for the timing report; "
+                         "set 0 to skip.")
+    ap.add_argument("--lidar-odom-warn-ms", type=float, default=20.0,
+                    help="Warn when scan start/end is farther than this from the nearest "
+                         "re-stamped odom sample.")
+    ap.add_argument("--lidar-clock-drift-warn-ms", type=float, default=2.0,
+                    help="Warn when header.stamp - min(point timestamp) varies by more than "
+                         "this across sampled LiDAR clouds.")
     args = ap.parse_args()
 
     if os.path.exists(args.output):
@@ -214,6 +468,16 @@ def main():
         sys.exit(f"no messages on {POSE_IN} — wrong input bag?")
     new_imu_stamps = dejitter(imu_stamps)
     p1_to_ros = fit_p1_clock_offset(pose_pairs)
+    lidar_diag = init_lidar_time_diagnostics(
+        p1_to_ros, pose_pairs,
+        args.lidar_time_check_samples,
+        args.lidar_time_offset,
+        args.lidar_odom_warn_ms,
+        args.lidar_clock_drift_warn_ms,
+    )
+    if abs(args.lidar_time_offset) > 1e-12:
+        print(f"[prep_bag] applying fixed LiDAR time offset {args.lidar_time_offset:+.9f}s "
+              "to PointCloud2 header.stamp and bag log_time")
 
     writer = rosbag2_py.SequentialWriter()
     writer.open(
@@ -238,6 +502,7 @@ def main():
     imu_idx = 0
     counts = {"lidar": 0, "imu": 0, "odom": 0, "rtk": 0, "rtk_rejected": 0}
     deg2rad_sq = (math.pi / 180.0) ** 2
+    lidar_offset_ns = int(round(args.lidar_time_offset * 1e9))
 
     print("[prep_bag] pass 2/2: writing output bag ...")
     wanted = LIDAR_TOPICS + [IMU_IN, POSE_IN]
@@ -250,8 +515,34 @@ def main():
             for schema, channel, message in reader.iter_messages(topics=wanted):
                 topic = channel.topic
                 if topic in LIDAR_TOPICS:
-                    # passthrough: mcap payload is already CDR — do NOT decode
-                    writer.write(topic, message.data, message.log_time)
+                    need_lidar_diag = (
+                        args.lidar_time_check_samples > 0
+                        and lidar_diag["topics"][topic]["samples"] < args.lidar_time_check_samples
+                    )
+                    lidar_msg = None
+                    if lidar_offset_ns != 0 or need_lidar_diag:
+                        decode = decoders.get(schema.id)
+                        if decode is None:
+                            decode = decoder_factory.decoder_for("cdr", schema)
+                            decoders[schema.id] = decode
+                        lidar_msg = decode(message.data)
+
+                    if lidar_offset_ns == 0:
+                        if need_lidar_diag:
+                            update_lidar_time_diagnostics(lidar_diag, topic, lidar_msg, message.log_time)
+                        # passthrough: mcap payload is already CDR — do NOT decode
+                        writer.write(topic, message.data, message.log_time)
+                    else:
+                        shifted_stamp = stamp_to_sec(lidar_msg.header.stamp) + args.lidar_time_offset
+                        if shifted_stamp < 0.0:
+                            sys.exit(f"LiDAR time offset shifts {topic} header.stamp negative")
+                        set_stamp(lidar_msg.header.stamp, shifted_stamp)
+                        shifted_log_time = message.log_time + lidar_offset_ns
+                        if shifted_log_time < 0:
+                            sys.exit(f"LiDAR time offset shifts {topic} bag log_time negative")
+                        if need_lidar_diag:
+                            update_lidar_time_diagnostics(lidar_diag, topic, lidar_msg, shifted_log_time)
+                        writer.write(topic, serialize_message(lidar_msg), shifted_log_time)
                     counts["lidar"] += 1
                     continue
                 decode = decoders.get(schema.id)
@@ -335,6 +626,13 @@ def main():
                     else:
                         counts["rtk_rejected"] += 1
     del writer  # flush + write metadata.yaml
+
+    time_report_lines = format_lidar_time_diagnostics(lidar_diag)
+    with open(os.path.join(args.output, "time_alignment_report.txt"), "w") as tf:
+        tf.write("\n".join(time_report_lines))
+        tf.write("\n")
+    for line in time_report_lines:
+        print(line)
 
     print(f"[prep_bag] done: {counts['lidar']} lidar, {counts['imu']} imu, "
           f"{counts['odom']} odom ({counts['rtk']} rtk-fixed, {counts['rtk_rejected']} rejected)")

@@ -134,8 +134,15 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source_if_exists() {
   local file="$1"
   if [ -f "$file" ]; then
+    local restore_nounset=false
+    case "$-" in
+      *u*) restore_nounset=true; set +u ;;
+    esac
     # shellcheck disable=SC1090
     source "$file"
+    if [ "$restore_nounset" = true ]; then
+      set -u
+    fi
   fi
 }
 

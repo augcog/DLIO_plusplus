@@ -41,6 +41,7 @@ def generate_launch_description():
     odom_topic = LaunchConfiguration('odom_topic', default='/odom')
     gt_odom_topic = LaunchConfiguration('gt_odom_topic', default='/gps_p1/filtered_odom_map')
     imu_only = LaunchConfiguration('imu_only', default='false')
+    publish_tf = LaunchConfiguration('publish_tf', default='false')
     urdf_path = LaunchConfiguration(
         'urdf_path',
         default='')
@@ -75,6 +76,9 @@ def generate_launch_description():
     declare_imu_only_arg = DeclareLaunchArgument(
         'imu_only', default_value=imu_only,
         description='If true, disable GICP and run IMU-only propagation')
+    declare_publish_tf_arg = DeclareLaunchArgument(
+        'publish_tf', default_value=publish_tf,
+        description='If true, publish map -> base_frame TF. Useful for RViz views/displays.')
     declare_urdf_path_arg = DeclareLaunchArgument(
         'urdf_path', default_value=urdf_path,
         description='Absolute path to the vehicle URDF used by robot_state_publisher '
@@ -135,6 +139,7 @@ def generate_launch_description():
             localization_yaml_path,
             {'localization/lidar_frame': child_frame_value},
             {'localization/imu_only': LaunchConfiguration('imu_only')},
+            {'localization/publish_tf': LaunchConfiguration('publish_tf')},
         ]
         if map_path_value:
             params.append({'localization/map_path': map_path_value})
@@ -196,6 +201,7 @@ def generate_launch_description():
         declare_odom_topic_arg,
         declare_gt_odom_topic_arg,
         declare_imu_only_arg,
+        declare_publish_tf_arg,
         declare_urdf_path_arg,
         declare_parent_frame_arg,
         declare_child_frame_arg,
