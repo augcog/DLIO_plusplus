@@ -18,11 +18,16 @@ import matplotlib.pyplot as plt
 from matplotlib import colormaps
 import numpy as np
 import rclpy
-from geometry_msgs.msg import Point, PoseStamped
+from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry, Path as PathMsg
 from rclpy.node import Node
-from std_msgs.msg import ColorRGBA, Float64
+from std_msgs.msg import Float64
 from visualization_msgs.msg import Marker, MarkerArray
+
+from error_viz_common import error_color, make_error_cylinders, make_marker, marker_point
+
+
+ROLLER_NS = "gicp_gnss_error_rollercoaster"
 
 
 def stamp_to_sec(stamp):
@@ -39,10 +44,6 @@ def pose_stamped_from_odom(msg):
 def point_from_odom(msg):
     p = msg.pose.pose.position
     return np.array([p.x, p.y, p.z], dtype=float)
-
-
-def marker_point(x, y, z):
-    return Point(x=float(x), y=float(y), z=float(z))
 
 
 class LiveGnssErrorMonitor(Node):
@@ -263,17 +264,7 @@ class LiveGnssErrorMonitor(Node):
         return MarkerArray(markers=[delete, line, text, gnss_sphere])
 
     def color_for_error(self, err, alpha=1.0):
-        level = float(np.clip(err / self.rollercoaster_color_max, 0.0, 1.0))
-        rgba = self.rollercoaster_cmap(level)
-        saturation = 0.18 + 0.82 * np.sqrt(level)
-        base = np.array([0.22, 0.22, 0.24], dtype=float)
-        rgb = base * (1.0 - saturation) + np.asarray(rgba[:3], dtype=float) * saturation
-        return ColorRGBA(
-            r=float(rgb[0]),
-            g=float(rgb[1]),
-            b=float(rgb[2]),
-            a=float(alpha),
-        )
+        return error_color(self.rollercoaster_cmap, err, self.rollercoaster_color_max, alpha)
 
     def add_rollercoaster_sample(self, gnss, e2d, e3d):
         p = gnss.pose.pose.position
@@ -291,14 +282,7 @@ class LiveGnssErrorMonitor(Node):
             self.last_roller_xy = np.array([last[0], last[1]], dtype=float)
 
     def base_marker(self, frame, stamp, marker_id, marker_type, action=Marker.ADD):
-        marker = Marker()
-        marker.header.frame_id = frame
-        marker.header.stamp = stamp
-        marker.ns = "gicp_gnss_error_rollercoaster"
-        marker.id = marker_id
-        marker.type = marker_type
-        marker.action = action
-        return marker
+        return make_marker(frame, stamp, ROLLER_NS, marker_id, marker_type, action)
 
     def publish_rollercoaster(self):
         with self.lock:
@@ -327,20 +311,18 @@ class LiveGnssErrorMonitor(Node):
         shadow.color.a = 0.55
         shadow.points = [marker_point(*p) for p in shadow_base]
 
-        cylinders = []
-        for i, (base_point, top_point, err) in enumerate(zip(shadow_base, top, e2d)):
-            height = float(top_point[2] - base_point[2])
-            if height <= 1e-3:
-                continue
-            cylinder = self.base_marker(frame, stamp, 1000 + i, Marker.CYLINDER)
-            cylinder.pose.position = marker_point(
-                base_point[0], base_point[1], base_point[2] + height * 0.5)
-            cylinder.pose.orientation.w = 1.0
-            cylinder.scale.x = self.rollercoaster_cylinder_diameter
-            cylinder.scale.y = self.rollercoaster_cylinder_diameter
-            cylinder.scale.z = height
-            cylinder.color = self.color_for_error(err, self.rollercoaster_curtain_alpha)
-            cylinders.append(cylinder)
+        cylinders = make_error_cylinders(
+            frame,
+            stamp,
+            ROLLER_NS,
+            1000,
+            shadow_base,
+            top,
+            e2d,
+            self.rollercoaster_cylinder_diameter,
+            self.rollercoaster_curtain_alpha,
+            self.color_for_error,
+        )
 
         imax = int(np.argmax(e2d))
         peak = self.base_marker(frame, stamp, 4, Marker.SPHERE)

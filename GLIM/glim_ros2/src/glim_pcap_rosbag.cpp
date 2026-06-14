@@ -271,14 +271,15 @@ int main(int argc, char** argv) {
     if (!ptp_shift_set) {
       const uint64_t scan_ptp_ns = s.t_ns;  // first ray's PTP timestamp
       if (anchor_mode == AnchorMode::FORCE_TO_BAG_START) {
-        // mirrors merge_luminar_pcap.py:524 (force_anchor_ns - scan_ptp_ns)
+        // Mirrors scripts/merge_luminar_pcap.py force-anchor mode:
+        // force_anchor_ns - scan_ptp_ns.
         ptp_to_ros_shift_ns = static_cast<int64_t>(bag_start_ns) - static_cast<int64_t>(scan_ptp_ns);
       } else {
         // NATURAL: shift = first_packet_wall_ns - first_ray_ptp_ns. We use
         // the FIRST packet's wall-clock time (not the last packet's) so the
         // shift represents the constant offset between wall-clock and PTP
         // master clocks, with no scan-duration bias. Using last-packet time
-        // (as merge_luminar_pcap.py:528-529 does) bakes in ~50ms of scan
+        // (as the Python reference's natural-anchor path does) bakes in ~50ms of scan
         // accumulation latency, which manifests downstream as IMU/lidar
         // sync error proportional to vehicle velocity (~0.15m at 3m/s).
         ptp_to_ros_shift_ns = static_cast<int64_t>(s.wall_clock_first_packet_ns) -

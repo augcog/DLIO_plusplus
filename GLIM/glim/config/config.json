@@ -7,32 +7,22 @@
     "config_viewer": "config_viewer.json",
     "config_sensors": "config_sensors.json",
     "config_preprocess": "config_preprocess.json",
-    // RTK-tolerant mapping design:
-    //   * Primary odometry = LiDAR + IMU fused (gpu/cpu/ct estimator). Runs
-    //     continuously, no external pose required, no holes during RTK loss.
-    //   * Global anchoring = libgnss_global.so extension (enabled in
-    //     config_ros.json), which adds GNSS-position factors to the iSAM2
-    //     graph whenever a usable RTK-FIXED sample arrives. During GNSS-denied
-    //     passages the GNSS factor stream goes silent and LiDAR+IMU odometry
-    //     alone drives the trajectory until RTK reacquires.
-    //   * Pre-filter (gicp_localization/scripts/rtk_fixed_odom_filter.py)
-    //     gates the GNSS topic to RTK-FIXED quality only, so degraded fixes
-    //     never poison the global graph.
-    // The old config_odometry_ins.json path (INS-driven, GLIM PAUSES on RTK
-    // loss) is left in tree for reference but should not be selected for
-    // production mapping that traverses GNSS-denied terrain.
+    // Current offline map-building default: the INS-driven estimator.
+    //
+    // Putnam race bags are feature-poor at speed; pure LiDAR+IMU registration
+    // measurably drifts and can corrupt the graph.  The INS estimator instead
+    // interpolates /gps_p1/filtered_odom_rtk_fixed (true time-of-validity
+    // stamps from prep_bag.py) for the trajectory and deskews scans with INS
+    // motion. It PAUSES when the RTK-fixed stream stops, so use it for
+    // RTK-good offline map builds and check prep_bag's RTK count first.
+    //
+    // RTK-tolerant LiDAR+IMU mapping remains available by switching to
+    // config_odometry_gpu.json (or cpu/ct). In that mode, libgnss_global.so
+    // adds sparse RTK position priors and the estimator can continue through
+    // GNSS dropouts, at the cost of more drift risk on this track.
+    //
     // NOTE: if the local gtsam_points install has no CUDA support, the *_gpu
     // configs cannot load because their .so files are not built.
-    //
-    // Odometry choice for MAP BUILDING from RTK-clean bags: the INS-driven
-    // estimator. The Putnam track is feature-poor at racing speed; pure
-    // LiDAR+IMU registration (config_odometry_cpu.json) measurably drifts
-    // ~12%/distance and eventually corrupts the global graph (bias soak-up
-    // runaway, verified on run_5). The INS estimator instead interpolates
-    // /gps_p1/filtered_odom_rtk_fixed (true time-of-validity stamps from
-    // prep_bag.py) for the trajectory and deskews scans with INS motion.
-    // It PAUSES when the RTK stream stops — acceptable for offline mapping
-    // of RTK-good runs; check prep_bag's rtk-fixed count before relying on it.
     "config_odometry": "config_odometry_ins.json",
     // "config_odometry": "config_odometry_cpu.json",
     // "config_odometry": "config_odometry_gpu.json",

@@ -1,5 +1,12 @@
 # Getting started
 
+!!! note
+    This page is the upstream GLIM quickstart for the public Ouster sample
+    data. DLIO++'s checked-in AV-24 mapping default uses
+    `config_odometry_ins.json` with Point One Atlas RTK-fixed odometry instead.
+    For this repository's active race-car workflow, start with
+    `GLIM/README.md` and `PIPELINE.md`.
+
 ## Prerequisite
 
 1. Install GLIM on your system following [the installation section](installation.md). Alternatively, you can also use [prebuilt docker images](docker.md).

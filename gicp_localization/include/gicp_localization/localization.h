@@ -159,7 +159,7 @@ private:
   // Atlas-reported pose covariance (pose.covariance[0,7,14] -- xx, yy, zz)
   // exceeds the configured thresholds. The gate inspects the gt_odom message
   // itself; no separate status topic is involved. Replaces the old
-  // BESTGNSSPOS-enum gate (removed when the NovAtel path was retired).
+  // legacy BESTGNSSPOS-enum gate (removed with the old NovAtel path).
   bool rtk_gate_enabled_;
   double rtk_gate_max_pose_var_xy_;  // m^2; reject if cov[0] or cov[7] > this
   double rtk_gate_max_pose_var_z_;   // m^2; reject if cov[14] > this

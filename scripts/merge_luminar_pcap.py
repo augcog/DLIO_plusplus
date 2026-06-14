@@ -1,6 +1,13 @@
+#!/usr/bin/env python3
+"""Reference Python merger for Luminar Iris PCAP data and ROS 2 bags.
+
+The production mapping path uses the faster C++ `glim_pcap_rosbag`
+executable. Keep this script as a debug/reference fallback for validating
+packet decoding, PointCloud2 layout, and timestamp alignment behavior.
+"""
+
 # Copyright 2025 Jeff Liu
 
-import os
 import argparse
 import subprocess
 import heapq
@@ -12,12 +19,9 @@ import time
 from collections import defaultdict
 from std_msgs.msg import Header
 from sensor_msgs.msg import PointCloud2, PointField
-import yaml
 import rosbag2_py
 
 # ------ CONSTANTS -------#
-
-INT64_MAX = (1 << 63) - 1
 
 # AV-24 Luminars IPs and topics
 LIDARS = {
@@ -569,9 +573,6 @@ def uq12_12_to_float(u):
 def uq1_15_to_float(u):
     return u / float(1 << 15)
 
-def u64_le(b, i):
-    return int.from_bytes(b[i:i+8], "little", signed=False)
-
 def read_bits(b, bit_ofs, nbits):
     byte_ofs = bit_ofs // 8
     bit_in_byte = bit_ofs % 8
@@ -711,10 +712,6 @@ def get_rosbag_options_write(path, serialization_format='cdr'):
         input_serialization_format=serialization_format,
         output_serialization_format=serialization_format)
     return storage_options, converter_options
-
-def create_topic(writer, topic_name, topic_type, serialization_format='cdr'):
-    tm = rosbag2_py.TopicMetadata(name=topic_name, type=topic_type, serialization_format=serialization_format)
-    writer.create_topic(tm)
 
 def open_rosbags(bag_path_input, bag_path_output):
     storage_in, conv_in = get_rosbag_options_read(bag_path_input)

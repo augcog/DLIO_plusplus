@@ -64,12 +64,11 @@
     // Extension modules.
     // libgnss_global.so adds GNSS-position factors to the iSAM2 global graph
     // whenever a usable RTK-FIXED sample arrives on the gnss topic configured
-    // in config_gnss_global.json. The primary trajectory comes from
-    // LiDAR + IMU odometry (config_odometry_gpu.json), so during GNSS-denied
-    // passages the GNSS factor stream simply goes silent and LiDAR+IMU alone
-    // drives mapping. Once RTK reacquires, the next GNSS factor pulls the
-    // post-dropout trajectory back into the global frame; iSAM2 smooths the
-    // dropout retroactively.
+    // in config_gnss_global.json. With the current INS-driven odometry config,
+    // the same RTK-fixed stream also supplies the primary trajectory, so GLIM
+    // pauses where that stream has gaps. If config_odometry_gpu/cpu/ct is
+    // selected instead, the GNSS factor stream becomes a sparse global anchor
+    // while LiDAR+IMU odometry continues through dropouts.
     // Viewer modules (libstandard_viewer.so, librviz_viewer.so) are disabled
     // for unattended offline mapping runs; re-add them when you want the live
     // 3D view during mapping. They are not required for map/dump output.
@@ -85,11 +84,10 @@
     "imu_topic": "/gps_p1/imu",
     "points_topic": "/luminar_front/points",
     "image_topic": "/image",
-    // External INS / GNSS-aided odometry. Consumed ONLY by
-    // libodometry_estimation_ins.so. With the current config.json (gpu
-    // LiDAR+IMU odometry), this topic is unused -- GNSS enters the system
-    // through libgnss_global.so via config_gnss_global.json's gnss_topic.
-    // Left set for completeness / for switching back to the INS estimator.
+    // External INS / GNSS-aided odometry. Consumed by the current
+    // libodometry_estimation_ins.so selection in config.json. If switching to
+    // LiDAR+IMU odometry, this topic becomes unused by odometry; GNSS then
+    // enters through libgnss_global.so via config_gnss_global.json.
     "external_odom_topic": "/gps_p1/filtered_odom_rtk_fixed",
     "external_odom_qos": {
       "profile": "default",

@@ -31,12 +31,12 @@ constexpr uint16_t kEtherTypeIPv4 = 0x0800;
 constexpr uint16_t kEtherTypeVlan = 0x8100;
 constexpr uint16_t kEtherTypeQinQ = 0x88a8;
 
-// Output PointCloud2 layout. MUST be byte-identical to merge_luminar_pcap.py
+// Output PointCloud2 layout. MUST be byte-identical to scripts/merge_luminar_pcap.py
 // PC2_FIELDS / POINT_STEP=56 — extract_raw_points keys on field name + offset
 // + datatype, and config_sensors.json points at "reflectance" + "line_index".
 constexpr uint32_t kPointStep = 56;
 
-// Per-point byte offsets inside one row (matches merge_luminar_pcap.py:48-71).
+// Per-point byte offsets inside one row (matches PC2_FIELDS in scripts/merge_luminar_pcap.py).
 struct PointOff {
   static constexpr int timestamp = 0;        // UINT8[8]
   static constexpr int x = 8;
@@ -124,7 +124,7 @@ struct IrisPacketHeader {
 };
 
 // Bit-level reader for the Luminar Iris payload. Mirrors the Python
-// read_bits() in merge_luminar_pcap.py.
+// read_bits() in scripts/merge_luminar_pcap.py.
 class BitReader {
 public:
   BitReader(const uint8_t* data, size_t len) : data_(data), bits_(len * 8) {}
@@ -169,7 +169,7 @@ float uq1_15_to_float(uint32_t u) { return static_cast<float>(u) / static_cast<f
 
 // Parse an Iris UDP payload into a header and a list of returns. Returns
 // false if the packet is not a v1.3 data packet or the payload is malformed.
-// Mirrors merge_luminar_pcap.py:583-693.
+// Mirrors parse_iris_payload() in scripts/merge_luminar_pcap.py.
 bool parse_iris_payload(const uint8_t* payload, size_t len, IrisPacketHeader& hdr, std::vector<RayReturn>& returns) {
   if (len < 16) return false;
   BitReader br(payload, len);
@@ -323,7 +323,7 @@ uint64_t prescan_pcap_first_epoch_ns(const std::string& path) {
 
 // ---------------------------------------------------------------------------
 // AssemblerImpl: groups rays into scans, finalizes on key change or timeout.
-// Mirrors merge_luminar_pcap.py:172-314 (ScanAssemblerPC2).
+// Mirrors ScanAssemblerPC2 in scripts/merge_luminar_pcap.py.
 // ---------------------------------------------------------------------------
 struct IrisPcapReader::AssemblerImpl {
   struct Key {

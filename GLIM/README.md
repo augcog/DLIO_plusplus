@@ -22,10 +22,10 @@ This directory is the GLIM workspace inside the [`augcog/DLIO_plusplus`](https:/
 
 ### Key Features
 
-- **LiDAR+IMU tight fusion as primary odometry** — runs every scan via VGICP + GTSAM `CombinedImuFactor` preintegration. No external pose required; mapping cannot stall on GNSS loss.
-- **RTK-FIXED-only GNSS anchoring** — a small ROS2 pre-filter (`gicp_localization/scripts/rtk_fixed_odom_filter.py`) admits only Atlas samples whose pose covariance indicates a FIXED-integer solution. `libgnss_global.so` then turns each forwarded message into a position-prior factor on the iSAM2 graph.
-- **Seamless GNSS-denied continuity** — when RTK quality degrades, the filter stops forwarding and the GNSS factor stream goes silent. LiDAR+IMU odometry continues to extend the map perimeter; on RTK reacquisition the next factor anchors the post-dropout trajectory back to the global frame and iSAM2 retroactively smooths the dropout.
-- **Geo-referenced output** — `T_world_utm.txt` saves the SE(3) transform from the local odom frame to Atlas's reported map frame for downstream use (GICP localization, post-processing, etc.).
+- **INS-driven offline map-building default** — `config.json` currently selects `config_odometry_ins.json`, which interpolates `/gps_p1/filtered_odom_rtk_fixed` for the mapping trajectory and deskews scans with Atlas INS motion. This is the stable Putnam-track path for RTK-good bags; it pauses where the RTK-fixed stream has gaps.
+- **RTK-FIXED-only GNSS anchoring** — `libgnss_global.so` consumes Atlas samples whose pose covariance indicates FIXED-integer quality and turns them into position-prior factors on the global graph. The same stream also provides the current INS-driven trajectory.
+- **LiDAR+IMU dropout-tolerant mode remains available** — switching `config.json` to `config_odometry_gpu.json` (or CPU/CT variants) makes VGICP+IMU the primary odometry and uses GNSS factors as sparse global anchors. That mode is useful for GNSS-denied terrain but has more drift risk on this feature-poor track.
+- **Geo-referenced output** — `T_world_utm.txt` saves the SE(3) transform from the local UTM frame to GLIM's map/world frame for GICP localization and post-processing.
 
 The exact behavior of this fork should be taken from the checked-in config and source files in this repository, not assumed to match upstream defaults.
 
@@ -128,34 +128,36 @@ source install/setup.bash
 ### Mapping pipeline overview
 
 ```
-                              ┌─────────────────────────────┐
-       /gps_p1/imu (99 Hz) ──▶│  GLIM odometry estimator    │
-  /luminar_*/points (10 Hz) ─▶│  libodometry_estimation_gpu │── per-scan ─┐
-                              │  (VGICP + CombinedImuFactor) │             │
-                              └─────────────────────────────┘             │
-                                                                          ▼
-                                                            ┌──────────────────────┐
-                                                            │  Global mapping     │
-                                                            │  iSAM2 pose graph   │
-                                                            │  (sub-maps + loop   │
-                                                            │   closures + GNSS)  │
-                                                            └──────────────────────┘
-                                                                          ▲
-                                                                          │ GNSS prior factor
-                                                                          │ (only when arriving)
-                                                            ┌──────────────────────┐
-  /gps_p1/filtered_odom ──▶ rtk_fixed_odom_filter.py ──▶   │ libgnss_global.so   │
-                            (drops every sample with        │ subscribes to       │
-                             cov > FIXED thresholds)        │ /gps_p1/filtered_   │
-                                                            │ odom_rtk_fixed      │
-                                                            └──────────────────────┘
+  /gps_p1/filtered_odom ──▶ RTK covariance gate ──▶ /gps_p1/filtered_odom_rtk_fixed
+                                                               │
+                                                               ├──▶ libodometry_estimation_ins
+                                                               │    (primary trajectory + deskew)
+                                                               │
+                                                               └──▶ libgnss_global.so
+                                                                    (position priors + T_world_utm)
+
+  /luminar_front/points ───────────────────────────▶ GLIM mapping graph / map output
 ```
 
-The odometry estimator and the GNSS extension are deliberately decoupled. Odometry runs every scan regardless of GNSS state. The GNSS extension turns each *received* message into one prior factor on the global graph; if no messages arrive, no factors are added — but the trajectory still gets scan-to-scan factors from VGICP and IMU preintegration, so the map perimeter keeps extending.
+The checked-in default is deliberately INS-driven for RTK-clean offline map
+builds. The mapping trajectory follows `/gps_p1/filtered_odom_rtk_fixed`, so
+the map is stable on feature-poor Putnam sections but pauses if the RTK-fixed
+stream stops. `libgnss_global.so` still writes the UTM-to-map alignment and
+adds position priors to the global graph.
+
+The older dropout-tolerant LiDAR+IMU mode is still available by selecting
+`config_odometry_gpu.json` (or CPU/CT variants) in `glim/config/config.json`.
+In that mode odometry runs every scan and GNSS factors become sparse anchors,
+but that is not the current default because it drifted on the high-speed,
+low-feature Putnam bags.
 
 ### Startup procedure (RTK FIXED required at session start)
 
-The mapping session must start with Atlas in RTK FIXED. The odometry estimator can technically run earlier (it does not require any GNSS), but you want the *first* GNSS prior factor to land while RTK is FIXED so the global map frame is anchored to centimetre-level absolute position.
+The current INS-driven mapping path should start with Atlas in RTK FIXED. It
+uses `/gps_p1/filtered_odom_rtk_fixed` as the trajectory source, so no LiDAR
+frame is inserted until that stream covers the scan. In LiDAR+IMU mode, odometry
+can run before GNSS is fixed, but the first GNSS prior should still land while
+RTK is FIXED so the global frame is anchored cleanly.
 
 **Step 1 — Park with sky view, wait for Atlas FIXED:**
 - Stop the vehicle at the intended map origin with a clear sky view.
@@ -181,12 +183,23 @@ ros2 launch glim_ros glim_ros.launch.py config_path:=config
 ros2 launch glim_ros glim_ros.launch.py config_path:=config use_sim_time:=true
 ros2 bag play <your_bag_file.db3> --clock
 ```
-You should see `estimate initial IMU state` from the LiDAR+IMU loose-init within ~5 s, followed by the first GNSS-prior factor insertion from `gnss_global` once a FIXED sample lands. Map points appear in the viewer.
+With the current INS-driven config, map points appear once RTK-fixed odometry
+covers the LiDAR scan window. If you switch to LiDAR+IMU odometry, you should
+instead see `estimate initial IMU state` from loose-init followed by GNSS-prior
+factor insertion when a FIXED sample lands.
 
 **Step 4 — Drive the track:**
-Watch the viewer; the map should grow continuously. The filter will print FIXED↔NOT_FIXED transitions whenever Atlas's RTK quality crosses the covariance gate — these are diagnostic, not errors, and the map keeps extending through them.
+Watch the viewer; with the current INS-driven config the map grows while
+RTK-fixed odometry is available and pauses through gaps. The filter will print
+FIXED/NOT_FIXED transitions whenever Atlas's RTK quality crosses the covariance
+gate. In LiDAR+IMU mode, the map can keep extending through those gaps.
 
-### RTK-denied terrain strategy
+### RTK-denied terrain strategy for LiDAR+IMU mode
+
+This section applies when `config.json` is switched from the current
+INS-driven default to `config_odometry_gpu.json` / CPU / CT. The current
+`config_odometry_ins.json` path instead pauses when `/gps_p1/filtered_odom_rtk_fixed`
+has gaps.
 
 GLIM is designed for tracks that include GNSS-denied passages (tunnels, dense foliage, urban canyons, mountain switchbacks where multipath kills FIXED quality temporarily). The behaviour is:
 
@@ -262,7 +275,7 @@ GLIM `gnss_global` messages (global anchoring):
 [gnss_global] saved T_world_utm (4x4 SE(3)) to: <dump_path>/T_world_utm.txt
 ```
 
-GLIM odometry messages (LiDAR+IMU pipeline health):
+GLIM odometry messages (only when using LiDAR+IMU odometry):
 ```
 [odometry_estimation] estimate initial IMU state          # ~5 s after start
 [validate_imu] residual=…                                 # per-keyframe IMU sanity
@@ -291,11 +304,11 @@ Each directory contains:
 - `config.json` — Main config (selects which odometry estimator to load)
 - `config_ros.json` — ROS topics and extension modules
 - `config_sensors.json` — Sensor noise + IMU/LiDAR extrinsics (`T_lidar_imu`)
-- `config_odometry_gpu.json` — **Currently selected** odometry estimator (VGICP + IMU)
-- `config_odometry_ins.json` — Alternative INS-driven estimator (NOT selected; pauses on RTK loss)
+- `config_odometry_ins.json` — **Currently selected** offline map-building estimator (Atlas INS trajectory; pauses on RTK-fixed gaps)
+- `config_odometry_gpu.json` — Optional VGICP + IMU estimator for dropout-tolerant mapping
 - `config_odometry_{cpu,ct}.json` — Other alternatives (CPU-only VGICP, continuous-time)
 - `config_preprocess.json` — Point cloud preprocessing
-- `config_global_mapping_gpu.json` — Loop closure and global optimization (iSAM2 backend)
+- `config_sub_mapping_cpu.json` / `config_global_mapping_cpu.json` — Current mapping backends
 
 **GNSS Extension (`glim_ext/config/`):**
 - `config_gnss_global.json` — RTK prior factor topic and precision
@@ -331,12 +344,12 @@ Loosen these to admit RTK-FLOAT if your sky view is poor; tighten to reject Atla
     "gnss_msg_type": "nav_msgs/msg/Odometry",
     "min_baseline": 5.0,
     "enable_orientation_prior": false,
-    "prior_inf_scale": [1e4, 1e4, 1e3],
+    "prior_inf_scale": [1e6, 1e6, 1e5],
     "enable_lever_arm": false
   }
 }
 ```
-- `prior_inf_scale` is **precision** (1/variance), not sigma. Equivalent sigmas: σ_x = σ_y ≈ 1 cm, σ_z ≈ 3 cm — about 2× looser than Atlas's reported precision.
+- `prior_inf_scale` is **precision** (1/variance), not sigma. Equivalent sigmas: σ_x = σ_y ≈ 1 mm, σ_z ≈ 3 mm. This intentionally pins RTK-clean INS-driven maps tightly to Atlas; loosen if GNSS factors visibly fight LiDAR consistency in LiDAR+IMU mode.
 - `enable_orientation_prior: false` because Atlas does not populate the `sensor_msgs/Imu.orientation` field; INS attitude comes through IMU preintegration on the LiDAR+IMU side instead.
 - `enable_lever_arm: false` because Atlas firmware already projects to `gps_antenna_top`. Software-side lever-arm would double-compensate.
 
@@ -354,16 +367,14 @@ Loosen these to admit RTK-FLOAT if your sky view is poor; tighten to reject Atla
 ```
 Revert to 0.2 / 0.05 if you ever re-point GLIM at a raw MEMS IMU stream.
 
-**Odometry estimator** (`config_odometry_gpu.json`):
+**Current odometry estimator** (`config_odometry_ins.json`):
 ```json
 {
   "odometry_estimation": {
-    "so_name": "libodometry_estimation_gpu.so",
-    "initialization_mode": "LOOSE",
-    "initialization_window_size": 5.0,    // seconds of IMU+LiDAR before init optimization runs
-    "init_pose_damping_scale": 1e10,      // tight origin anchor while initializing
-    "fix_imu_bias": true,                 // Atlas bias is pre-calibrated; freezing is safer through long GNSS dropouts
-    "smoother_lag": 2.0,                  // seconds; bump to ≥ expected_dropout_duration for retroactive correction
+    "so_name": "libodometry_estimation_ins.so",
+    "urdf_ins_frame": "gps_antenna_top",
+    "enable_lidar_refinement": false,
+    "max_ins_wait_seconds": 0.05,
     "num_threads": 2
   }
 }
@@ -380,11 +391,12 @@ Sub/global mapping use library defaults; tune up if you have spare cores.
 
 | Symptom | Likely fix |
 |---|---|
-| Loop closures show >10 cm Z error through dropouts | Tighten `prior_inf_scale[2]` from 1e3 to 1e4 |
-| GNSS factors visibly tug the trajectory each scan | Loosen `prior_inf_scale` to `[5e3, 5e3, 5e2]` |
-| Dropout segment shows visible kink after iSAM2 finishes | Bump `smoother_lag` to ≥ longest expected dropout duration (5×–10× by default) |
-| Map-viewer points jitter on still vehicle | Tighten `imu_acc_noise` further (e.g. 0.02) or check vibration coupling |
-| Sub-mm jitter in IMU bias estimates | Already at `imu_bias_noise: 1e-5`; if still problematic, set `fix_imu_bias: true` (already is in current config) |
+| INS-driven map pauses unexpectedly | Check the RTK-fixed sample count from `prep_bag.py`; the current odometry source only inserts scans covered by `/gps_p1/filtered_odom_rtk_fixed`. |
+| Loop closures show >10 cm Z error through dropouts in LiDAR+IMU mode | Tighten `prior_inf_scale[2]` above `1e5` or increase the active smoothing window. |
+| GNSS factors visibly tug the trajectory each scan in LiDAR+IMU mode | Loosen `prior_inf_scale` from `[1e6, 1e6, 1e5]` so LiDAR consistency has more room. |
+| Dropout segment shows visible kink after iSAM2 finishes in LiDAR+IMU mode | Bump `smoother_lag` to >= longest expected dropout duration (5x-10x by default). |
+| Map-viewer points jitter on still vehicle in LiDAR+IMU mode | Tighten `imu_acc_noise` further (e.g. 0.02) or check vibration coupling. |
+| IMU bias jitters in LiDAR+IMU mode | Keep `imu_bias_noise` small; if needed, set `fix_imu_bias: true` in the selected LiDAR+IMU odometry config. |
 | Pre-filter never reaches FIXED | Loosen `max_pose_var_xy` / `max_pose_var_z` to admit RTK-FLOAT for that session |
 
 ## Coordinate Transformation
@@ -431,12 +443,12 @@ And saved to the map directory when mapping completes:
 - Verify `gnss_topic` in `config_gnss_global.json` matches the filter's output (`/gps_p1/filtered_odom_rtk_fixed` by default).
 - Vehicle hasn't traveled `min_baseline` (5.0 m by default) since the first GNSS factor — `libgnss_global.so` needs two well-separated samples to initialize the SE(3) anchor.
 
-### Map shows discontinuity / kink after a GNSS-denied passage
+### Map shows discontinuity / kink after a GNSS-denied passage in LiDAR+IMU mode
 - Increase `smoother_lag` in `config_odometry_gpu.json` to a duration longer than the dropout. iSAM2 can only redistribute error inside the active smoothing window.
 - For very long dropouts, plan re-traversal on a later lap so loop closure factors can refine the trajectory.
 
-### Trajectory drifts visibly during long FIXED stretch
-- IMU bias may not be locked. Verify `fix_imu_bias: true` in `config_odometry_gpu.json` (current default).
+### Trajectory drifts visibly during long FIXED stretch in LiDAR+IMU mode
+- IMU bias may not be locked. Verify `fix_imu_bias: true` in the selected LiDAR+IMU odometry config.
 - Check Atlas's pose covariance is actually still FIXED (`pose.covariance[0]` < 1e-3 m²); transient bias-walk during good FIXED can briefly degrade.
 
 ### LiDAR points appear shifted by a fixed offset everywhere
@@ -485,8 +497,9 @@ See individual package directories for full license texts.
 This fork includes:
 - **Point One Atlas dual-antenna RTK-INS integration** — all GNSS/RTK/IMU input from `/gps_p1/*`, both IMU and pose projected to `gps_antenna_top` by Atlas firmware (no software lever-arm needed).
 - **RTK-FIXED-only covariance gate** — `gicp_localization/scripts/rtk_fixed_odom_filter.py` pre-filters Atlas's `/gps_p1/filtered_odom` to admit only FIXED-integer quality before feeding GLIM's GNSS factor source.
-- **GNSS-denied terrain continuity** — LiDAR+IMU odometry (`libodometry_estimation_gpu.so`) runs continuously; GNSS factors are sparse and optional. Mapping never pauses or develops holes; iSAM2 retroactively smooths trajectory through dropouts once RTK reacquires.
-- **Atlas-derived precision tuning** — `prior_inf_scale`, `imu_*_noise`, and `fix_imu_bias` are all sized against the measured noise envelope of Atlas RTK-FIXED on AV-24 (see *Key Parameters* above).
+- **INS-driven RTK-clean map-building default** — `libodometry_estimation_ins.so` follows Atlas RTK-fixed odometry for stable offline maps on the feature-poor Putnam course.
+- **Optional GNSS-denied terrain continuity** — LiDAR+IMU odometry (`libodometry_estimation_gpu.so` or CPU/CT variants) remains available when continuous mapping through RTK gaps is more important than the extra drift risk.
+- **Atlas-derived precision tuning** — `prior_inf_scale` and IMU noise parameters are sized against the measured noise envelope of Atlas RTK-FIXED on AV-24 (see *Key Parameters* above).
 - Automatic SE(3) transformation saving (`T_world_utm.txt`).
 - GNSS module fixes for ROS2 compatibility.
 - Enhanced logging for debugging RTK transitions and dropout/recovery behaviour.

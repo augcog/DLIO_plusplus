@@ -164,7 +164,7 @@ odom/geo/Kab: 0.0                  # Online accel-bias adaptation disabled
 odom/geo/Kgb: 0.0                  # Online gyro-bias adaptation disabled
 ```
 
-`Kab`/`Kgb` are intentionally zero for the fused NovAtel INS path. Initial
+`Kab`/`Kgb` are intentionally zero for the fused Point One Atlas INS path. Initial
 RTK/stationary calibration may still seed `state.b`, but GICP residuals do not
 continue rewriting IMU bias online unless these gains are explicitly raised.
 

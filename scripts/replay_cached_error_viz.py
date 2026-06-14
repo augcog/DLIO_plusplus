@@ -18,7 +18,6 @@ import argparse
 import csv
 import re
 import sys
-from pathlib import Path
 
 import matplotlib
 
@@ -26,19 +25,20 @@ matplotlib.use("Agg")
 from matplotlib import colormaps
 import numpy as np
 import rclpy
-from geometry_msgs.msg import Point, PoseStamped, TransformStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped
 from nav_msgs.msg import Odometry, Path as PathMsg
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
-from std_msgs.msg import ColorRGBA, Float64, Header
+from std_msgs.msg import Float64, Header
 from tf2_ros import TransformBroadcaster
 from visualization_msgs.msg import Marker, MarkerArray
 
+from error_viz_common import error_color, make_error_cylinders, make_marker, marker_point
 
-def marker_point(x, y, z):
-    return Point(x=float(x), y=float(y), z=float(z))
+
+ROLLER_NS = "cached_gicp_gnss_error"
 
 
 def load_error_csv(path):
@@ -186,12 +186,7 @@ class CachedErrorViz(Node):
         self.map_pub.publish(self.map_msg)
 
     def color_for_error(self, err, alpha=1.0):
-        level = float(np.clip(err / self.color_max, 0.0, 1.0))
-        rgba = self.cmap(level)
-        saturation = 0.18 + 0.82 * np.sqrt(level)
-        base = np.array([0.22, 0.22, 0.24], dtype=float)
-        rgb = base * (1.0 - saturation) + np.asarray(rgba[:3], dtype=float) * saturation
-        return ColorRGBA(r=float(rgb[0]), g=float(rgb[1]), b=float(rgb[2]), a=float(alpha))
+        return error_color(self.cmap, err, self.color_max, alpha)
 
     def tick(self):
         if self.index >= len(self.rows):
@@ -263,14 +258,7 @@ class CachedErrorViz(Node):
             self.gicp_path_pub.publish(self.gicp_path)
 
     def base_marker(self, stamp, marker_id, marker_type, action=Marker.ADD):
-        marker = Marker()
-        marker.header.frame_id = self.frame
-        marker.header.stamp = stamp
-        marker.ns = "cached_gicp_gnss_error"
-        marker.id = marker_id
-        marker.type = marker_type
-        marker.action = action
-        return marker
+        return make_marker(self.frame, stamp, ROLLER_NS, marker_id, marker_type, action)
 
     def publish_current_error(self, gicp, gnss, e2d, e3d, stamp):
         delete = self.base_marker(stamp, 0, Marker.LINE_STRIP, Marker.DELETEALL)
@@ -347,20 +335,18 @@ class CachedErrorViz(Node):
         shadow.color.a = 0.55
         shadow.points = [marker_point(*p) for p in shadow_base]
 
-        cylinders = []
-        for i, (base_point, top_point, err) in enumerate(zip(shadow_base, top, e2d)):
-            height = float(top_point[2] - base_point[2])
-            if height <= 1e-3:
-                continue
-            cylinder = self.base_marker(stamp, 1000 + i, Marker.CYLINDER)
-            cylinder.pose.position = marker_point(
-                base_point[0], base_point[1], base_point[2] + height * 0.5)
-            cylinder.pose.orientation.w = 1.0
-            cylinder.scale.x = self.rollercoaster_cylinder_diameter
-            cylinder.scale.y = self.rollercoaster_cylinder_diameter
-            cylinder.scale.z = height
-            cylinder.color = self.color_for_error(err, self.args.rollercoaster_curtain_alpha)
-            cylinders.append(cylinder)
+        cylinders = make_error_cylinders(
+            self.frame,
+            stamp,
+            ROLLER_NS,
+            1000,
+            shadow_base,
+            top,
+            e2d,
+            self.rollercoaster_cylinder_diameter,
+            self.args.rollercoaster_curtain_alpha,
+            self.color_for_error,
+        )
 
         imax = int(np.argmax(e2d))
         peak = self.base_marker(stamp, 14, Marker.SPHERE)

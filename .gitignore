@@ -10,3 +10,7 @@ CLAUDE.md
 .vscode/
 *.png
 .claude/
+
+# Python cache artifacts
+__pycache__/
+*.py[cod]

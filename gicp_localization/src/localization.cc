@@ -796,13 +796,13 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
       }
       RCLCPP_FATAL(this->get_logger(),
                    "IMU topic hard guard triggered: resolved topic '%s' is not in allowlist [%s]. "
-                   "Expected fused NovAtel IMU path.",
+                   "Expected fused Point One Atlas IMU path.",
                    resolved_imu_topic.c_str(), oss.str().c_str());
       throw std::runtime_error("IMU topic hard guard mismatch");
     }
   }
   RCLCPP_INFO(this->get_logger(),
-              "IMU input topic: %s (expect NovAtel INS IMU, frame='%s', strict_frame_match=%s)",
+              "IMU input topic: %s (expect Point One Atlas INS IMU, frame='%s', strict_frame_match=%s)",
               resolved_imu_topic.c_str(),
               this->imu_frame.c_str(),
               this->imu_require_frame_match_ ? "true" : "false");
@@ -1269,7 +1269,7 @@ void gicp_localization::LocalizationNode::getParams() {
   RCLCPP_INFO(this->get_logger(), "Sensor type: %s", sensor_type_str.c_str());
 
   // Geometric Observer parameters. Position/orientation gains stay active, but
-  // online IMU bias adaptation defaults off for the fused NovAtel INS path; the
+  // online IMU bias adaptation defaults off for the fused Point One Atlas INS path; the
   // initial RTK/stationary calibration still seeds state.b once before
   // propagation.
   this->declare_parameter<double>("odom/geo/Kp", 4.5);
@@ -3336,8 +3336,8 @@ void gicp_localization::LocalizationNode::callbackImu(const sensor_msgs::msg::Im
   // One-shot defensive check: warn if the incoming IMU header.frame_id does
   // not match the configured imu_frame. The single-source P1 design assumes
   // both are "gps_antenna_top"; any other combination usually indicates the
-  // imu_topic launch arg was re-pointed at a different IMU (e.g. a NovAtel
-  // or VectorNav source) without also updating localization/imu_frame. The
+  // imu_topic launch arg was re-pointed at a different non-Atlas IMU without
+  // also updating localization/imu_frame. The
   // code would otherwise silently treat the foreign IMU's axes / lever-arm
   // as if they were at gps_antenna_top, because the TF lookup base_frame ->
   // imu_frame still returns identity in our yaml. Atomic exchange ensures the
@@ -4171,7 +4171,7 @@ void gicp_localization::LocalizationNode::updateState() {
   err_body = qhat.conjugate()._transformVector(err);
 
   // Optional online bias adaptation. Keep disabled by default for fused
-  // NovAtel INS input so GICP residuals do not chase drift by rewriting the
+  // Point One Atlas INS input so GICP residuals do not chase drift by rewriting the
   // trusted IMU bias estimate. Setting Kab/Kgb > 0 restores the upstream DLIO
   // adaptive observer behavior.
   if (this->geo_Kab_ > 0.0) {

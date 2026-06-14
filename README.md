@@ -1,9 +1,3 @@
-# Localization Development Log
-Dear Allen, Kevin
-I want to continusely record what is changed and what is next step with a log document in this repo. It's eazier for both agent and developer to understand and update changes over time.
-
-
-
 # DLIO++
 
 ROS 2 perception stack for the AV-24 Cybertruck autonomous race car. Pairs a GPU-accelerated LiDAR-inertial SLAM front end with a map-based localizer so the vehicle can build a map offline, then localize against it online at IMU rate.
@@ -181,6 +175,7 @@ Upstream GLIM publishes `glim`, `glim_ext`, and `glim_ros2` as three sibling rep
 **Offline tooling**
 
 - **`glim_pcap_rosbag`** (`glim_ros2/src/glim_pcap_rosbag.cpp` + `iris_pcap_reader.cpp`). Reads raw Luminar `.pcap` files alongside a sibling mcap (for IMU and GNSS) and runs offline mapping directly, skipping the intermediate "decode pcap into a bag" step. Useful when the live-recorded mcap is missing LiDAR or had a decode hiccup.
+- **`scripts/merge_luminar_pcap.py`** remains as a slower Python reference/debug fallback for validating Luminar packet decoding, PointCloud2 layout, and timestamp alignment against the C++ reader.
 
 ### gicp_localization (vs. the vectr-ucla DLIO line)
 
