@@ -7,6 +7,6 @@ dlio_data/
 .DS_Store
 CLAUDE.md
 .codex
+.vscode/
 *.png
 .claude/
-.vscode/browse.vc.db*
