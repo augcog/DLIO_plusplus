@@ -164,18 +164,16 @@ MAP_RUN="${DLIO_MAP_RUN:-${MAP_RUN:-}}"
 RVIZ="${DLIO_RVIZ:-${RVIZ:-false}}"
 DRY_RUN="${DLIO_DRY_RUN:-${DRY_RUN:-false}}"
 
-if [ -z "$RAW" ] && [ -z "$PREPPED_INPUT" ] && [ -n "${DLIO_ROSBAG_ROOT:-}" ] && [ -n "$RUN_NAME" ]; then
-  RAW="${DLIO_ROSBAG_ROOT%/}/putnam/may_26/${RUN_NAME}/filtered/all"
-fi
-
 while [ $# -gt 0 ]; do
   case "$1" in
     --raw)
       RAW="${2:-}"
+      PREPPED_INPUT=""
       shift 2
       ;;
     --prepped)
       PREPPED_INPUT="${2:-}"
+      RAW=""
       shift 2
       ;;
     --data-root)
@@ -223,6 +221,10 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
+
+if [ -z "$RAW" ] && [ -z "$PREPPED_INPUT" ] && [ -n "${DLIO_ROSBAG_ROOT:-}" ] && [ -n "$RUN_NAME" ]; then
+  RAW="${DLIO_ROSBAG_ROOT%/}/putnam/may_26/${RUN_NAME}/filtered/all"
+fi
 
 if [ -z "$RAW" ] && [ -z "$PREPPED_INPUT" ]; then
   echo "one of --raw or --prepped is required" >&2

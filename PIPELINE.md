@@ -264,14 +264,20 @@ One-command version (starts everything, waits for the map to load, replays
 in real time, tears down, prints the error stats):
 
 ```bash
+DATA="${DATA:-./dlio_data}"
+RUN="${RUN:-run_5}"
+MAP_RUN="${MAP_RUN:-$RUN}"
+
 scripts/run_localization_replay.sh \
     "$DATA/${RUN}_prepped" \
-    "$DATA/${RUN}_map.pcd" \
-    "$DATA/${RUN}_dump/T_world_utm.txt" \
-    "$DATA/${RUN}_loc"
+    "$DATA/${MAP_RUN}_map.pcd" \
+    "$DATA/${MAP_RUN}_dump/T_world_utm.txt" \
+    "$DATA/${RUN}_loc" \
+    true
 ```
 
-(Append `true` as a 5th argument to open RViz.) The replay script also starts
+The final `true` opens RViz; set it to `false` or omit it for headless replay.
+The replay script also starts
 `scripts/live_gnss_error_monitor.py`: RViz shows the GICP trajectory in green,
 the GNSS/RTK reference trajectory in red, and a live marker from the GICP pose
 to the nearest GNSS pose. It also publishes a live 3D "error rollercoaster":

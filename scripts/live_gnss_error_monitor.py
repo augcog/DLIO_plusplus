@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 from matplotlib import colormaps
 import numpy as np
 import rclpy
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import Point, PoseStamped
 from nav_msgs.msg import Odometry, Path as PathMsg
 from rclpy.node import Node
 from std_msgs.msg import Float64

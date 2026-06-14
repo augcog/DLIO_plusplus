@@ -15,8 +15,20 @@ if [ $# -lt 4 ]; then
   exit 1
 fi
 BAG="$1"; MAP="$2"; UTM="$3"; OUT="$4"; RVIZ="${5:-false}"
+
+missing_input() {
+  local path="$1"
+  echo "missing: $path" >&2
+  echo "Hint: PIPELINE.md examples use DATA/RUN placeholders. Set them first, e.g.:" >&2
+  echo '  DATA="${DATA:-./dlio_data}"' >&2
+  echo '  RUN="${RUN:-run_5}"' >&2
+  echo '  MAP_RUN="${MAP_RUN:-$RUN}"' >&2
+  echo "or pass concrete paths to this script." >&2
+  exit 1
+}
+
 for f in "$BAG" "$MAP" "$UTM"; do
-  [ -e "$f" ] || { echo "missing: $f" >&2; exit 1; }
+  [ -e "$f" ] || missing_input "$f"
 done
 mkdir -p "$OUT"
 [ -e "$OUT/loc_eval" ] && { echo "$OUT/loc_eval already exists — choose a fresh out_dir" >&2; exit 1; }
