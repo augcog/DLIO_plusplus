@@ -7,41 +7,116 @@
 # available.
 #
 # Common cases:
+#   0. Preferred public-clone setup: copy the root config template, edit local
+#      paths, then run without flags.
+#      cp dlio.env.example dlio.env
+#      ${EDITOR:-nano} dlio.env
+#      scripts/run_dlio_pipeline.sh
+#
 #   1. Full pipeline for a run (prep -> map -> export pcd -> localize replay)
 #      scripts/run_dlio_pipeline.sh \
-#        --raw "../rosbags/putnam/may_26/run_5/filtered/all" \
+#        --raw "${DLIO_ROSBAG_ROOT:-../rosbags}/putnam/may_26/run_5/filtered/all" \
 #        --data-root "./dlio_data" \
 #        --run "run_5"
 #
 #   2. Prep + localize a different run against an existing map/origin
 #      scripts/run_dlio_pipeline.sh \
-#        --raw "../rosbags/putnam/may_26/run_3/filtered/all" \
+#        --raw "${DLIO_ROSBAG_ROOT:-../rosbags}/putnam/may_26/run_3/filtered/all" \
 #        --data-root "./dlio_data" \
 #        --run "run_3" \
 #        --origin-run "run_5" \
 #        --map-run "run_5" \
 #        --rviz true
+#
+#   3. Reuse an already-prepped bag when the raw bag is not mounted locally
+#      scripts/run_dlio_pipeline.sh \
+#        --prepped "./dlio_data/run_3_prepped" \
+#        --data-root "./dlio_data" \
+#        --run "run_3" \
+#        --map-run "run_5" \
+#        --rviz true
+#
+#   4. Validate local config and paths without starting ROS replay
+#      scripts/run_dlio_pipeline.sh --dry-run
 
 set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONFIG_FILE="$REPO/dlio.env"
+LOAD_CONFIG="true"
+CONFIG_LOADED="false"
+
+args=("$@")
+idx=0
+while [ "$idx" -lt "${#args[@]}" ]; do
+  case "${args[$idx]}" in
+    --config)
+      CONFIG_FILE="${args[$((idx + 1))]:-}"
+      idx=$((idx + 2))
+      ;;
+    --no-config)
+      LOAD_CONFIG="false"
+      idx=$((idx + 1))
+      ;;
+    *)
+      idx=$((idx + 1))
+      ;;
+  esac
+done
+
+source_if_exists() {
+  local file="$1"
+  if [ -f "$file" ]; then
+    local restore_nounset=false
+    case "$-" in
+      *u*) restore_nounset=true; set +u ;;
+    esac
+    # shellcheck disable=SC1090
+    source "$file"
+    if [ "$restore_nounset" = true ]; then
+      set -u
+    fi
+  fi
+}
+
+if [ "$LOAD_CONFIG" = "true" ]; then
+  if [ -f "$CONFIG_FILE" ]; then
+    source_if_exists "$CONFIG_FILE"
+    CONFIG_LOADED="true"
+  elif [ "$CONFIG_FILE" != "$REPO/dlio.env" ]; then
+    echo "config file not found: $CONFIG_FILE" >&2
+    exit 1
+  fi
+fi
 
 usage() {
   cat <<'EOF'
 usage:
-  scripts/run_dlio_pipeline.sh --raw <filtered/all> --run <name> [options]
+  scripts/run_dlio_pipeline.sh [--config dlio.env] [options]
+  scripts/run_dlio_pipeline.sh (--raw <filtered/all> | --prepped <bag>) --run <name> [options]
 
 required:
-  --raw <path>            Raw input bag directory or .mcap file for prep_bag.py
-  --run <name>            Logical run name, e.g. run_5
+  --raw <path>            Raw input bag directory or .mcap file for prep_bag.py.
+                          Can also be set as DLIO_RAW in dlio.env.
+  --prepped <path>        Existing prepared bag directory or .mcap file; skips prep.
+                          Can also be set as DLIO_PREPPED in dlio.env.
+  --run <name>            Logical run name, e.g. run_5.
+                          Can also be set as DLIO_RUN in dlio.env.
 
 optional:
+  --config <file>         Read pipeline defaults from this env file.
+                          Default: ./dlio.env when present.
+  --no-config             Ignore ./dlio.env.
   --data-root <dir>       Output root directory for generated artifacts.
-                          Default: ./dlio_data
+                          Default: ./dlio_data, or DLIO_DATA_ROOT.
   --origin-run <name>     Reuse UTM origin from <data-root>/<name>_prepped/utm_origin.txt
   --utm-origin-file <f>   Reuse UTM origin from an explicit utm_origin.txt file
   --map-run <name>        Localize against <data-root>/<name>_map.pcd and
                           <data-root>/<name>_dump/T_world_utm.txt.
                           Default: current --run. If different, map building is skipped.
   --rviz <true|false>     Pass-through to localization replay helper. Default: false
+  --dry-run               Validate config, paths, and output choices, then exit
+                          before prep/mapping/localization starts.
   -h, --help              Show this help
 
 generated artifacts under <data-root>:
@@ -51,33 +126,56 @@ generated artifacts under <data-root>:
   <run>_loc/              Localization replay logs + evaluation
 
 examples:
+  cp dlio.env.example dlio.env
+  ${EDITOR:-nano} dlio.env
+  scripts/run_dlio_pipeline.sh
+
   scripts/run_dlio_pipeline.sh \
-    --raw "../rosbags/putnam/may_26/run_5/filtered/all" \
+    --raw "${DLIO_ROSBAG_ROOT:-../rosbags}/putnam/may_26/run_5/filtered/all" \
     --data-root "./dlio_data" \
     --run "run_5"
 
   scripts/run_dlio_pipeline.sh \
-    --raw "../rosbags/putnam/may_26/run_3/filtered/all" \
+    --raw "${DLIO_ROSBAG_ROOT:-../rosbags}/putnam/may_26/run_3/filtered/all" \
     --data-root "./dlio_data" \
     --run "run_3" \
     --origin-run "run_5" \
     --map-run "run_5" \
     --rviz true
+
+  scripts/run_dlio_pipeline.sh \
+    --prepped "./dlio_data/run_3_prepped" \
+    --data-root "./dlio_data" \
+    --run "run_3" \
+    --map-run "run_5" \
+    --rviz true
+
+  scripts/run_dlio_pipeline.sh --dry-run
 EOF
 }
 
-RAW=""
-DATA_ROOT="./dlio_data"
-RUN_NAME=""
-ORIGIN_RUN=""
-UTM_ORIGIN_FILE=""
-MAP_RUN=""
-RVIZ="false"
+RAW="${DLIO_RAW:-${RAW:-}}"
+PREPPED_INPUT="${DLIO_PREPPED:-${PREPPED_INPUT:-}}"
+DATA_ROOT="${DLIO_DATA_ROOT:-${DATA_ROOT:-./dlio_data}}"
+RUN_NAME="${DLIO_RUN:-${RUN_NAME:-}}"
+ORIGIN_RUN="${DLIO_ORIGIN_RUN:-${ORIGIN_RUN:-}}"
+UTM_ORIGIN_FILE="${DLIO_UTM_ORIGIN_FILE:-${UTM_ORIGIN_FILE:-}}"
+MAP_RUN="${DLIO_MAP_RUN:-${MAP_RUN:-}}"
+RVIZ="${DLIO_RVIZ:-${RVIZ:-false}}"
+DRY_RUN="${DLIO_DRY_RUN:-${DRY_RUN:-false}}"
+
+if [ -z "$RAW" ] && [ -z "$PREPPED_INPUT" ] && [ -n "${DLIO_ROSBAG_ROOT:-}" ] && [ -n "$RUN_NAME" ]; then
+  RAW="${DLIO_ROSBAG_ROOT%/}/putnam/may_26/${RUN_NAME}/filtered/all"
+fi
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --raw)
       RAW="${2:-}"
+      shift 2
+      ;;
+    --prepped)
+      PREPPED_INPUT="${2:-}"
       shift 2
       ;;
     --data-root)
@@ -104,6 +202,16 @@ while [ $# -gt 0 ]; do
       RVIZ="${2:-}"
       shift 2
       ;;
+    --dry-run)
+      DRY_RUN="true"
+      shift
+      ;;
+    --config)
+      shift 2
+      ;;
+    --no-config)
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -116,7 +224,16 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[ -n "$RAW" ] || { echo "--raw is required" >&2; usage >&2; exit 1; }
+if [ -z "$RAW" ] && [ -z "$PREPPED_INPUT" ]; then
+  echo "one of --raw or --prepped is required" >&2
+  usage >&2
+  exit 1
+fi
+if [ -n "$RAW" ] && [ -n "$PREPPED_INPUT" ]; then
+  echo "use either --raw or --prepped, not both" >&2
+  usage >&2
+  exit 1
+fi
 [ -n "$DATA_ROOT" ] || { echo "--data-root must not be empty" >&2; usage >&2; exit 1; }
 [ -n "$RUN_NAME" ] || { echo "--run is required" >&2; usage >&2; exit 1; }
 
@@ -124,27 +241,14 @@ if [ -n "$ORIGIN_RUN" ] && [ -n "$UTM_ORIGIN_FILE" ]; then
   echo "use either --origin-run or --utm-origin-file, not both" >&2
   exit 1
 fi
+if [ -n "$PREPPED_INPUT" ] && { [ -n "$ORIGIN_RUN" ] || [ -n "$UTM_ORIGIN_FILE" ]; }; then
+  echo "--origin-run/--utm-origin-file only apply when preparing from --raw" >&2
+  exit 1
+fi
 
 if [ -z "$MAP_RUN" ]; then
   MAP_RUN="$RUN_NAME"
 fi
-
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
-source_if_exists() {
-  local file="$1"
-  if [ -f "$file" ]; then
-    local restore_nounset=false
-    case "$-" in
-      *u*) restore_nounset=true; set +u ;;
-    esac
-    # shellcheck disable=SC1090
-    source "$file"
-    if [ "$restore_nounset" = true ]; then
-      set -u
-    fi
-  fi
-}
 
 source_if_exists "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash"
 source_if_exists "$REPO/install/setup.bash"
@@ -152,10 +256,34 @@ source_if_exists "$REPO/install/setup.bash"
 command -v ros2 >/dev/null 2>&1 || { echo "ros2 not found; source your ROS environment first" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "python3 not found" >&2; exit 1; }
 
-[ -e "$RAW" ] || { echo "raw input does not exist: $RAW" >&2; exit 1; }
+if [ "$CONFIG_LOADED" = "true" ]; then
+  echo "[pipeline] config: $CONFIG_FILE"
+fi
+
+if [ -n "$RAW" ] && [ ! -e "$RAW" ]; then
+  case "$RAW" in
+    /*) RAW_RESOLVED="$RAW" ;;
+    *) RAW_RESOLVED="$(pwd)/$RAW" ;;
+  esac
+  echo "raw input does not exist: $RAW" >&2
+  echo "resolved from current directory as: $RAW_RESOLVED" >&2
+  echo "If the raw bags live on another disk, set DLIO_ROSBAG_ROOT or create a symlink, e.g.:" >&2
+  echo "  export DLIO_ROSBAG_ROOT=/path/to/rosbags" >&2
+  echo "  ln -s /path/to/rosbags \"$REPO/../rosbags\"" >&2
+  echo "If this run is already prepared, use --prepped <prepared_bag> instead." >&2
+  exit 1
+fi
+if [ -n "$PREPPED_INPUT" ] && [ ! -e "$PREPPED_INPUT" ]; then
+  echo "prepped input does not exist: $PREPPED_INPUT" >&2
+  exit 1
+fi
 mkdir -p "$DATA_ROOT"
 
-PREPPED="$DATA_ROOT/${RUN_NAME}_prepped"
+PREPPED_OUT="$DATA_ROOT/${RUN_NAME}_prepped"
+PREPPED="$PREPPED_OUT"
+if [ -n "$PREPPED_INPUT" ]; then
+  PREPPED="$PREPPED_INPUT"
+fi
 DUMP="$DATA_ROOT/${RUN_NAME}_dump"
 MAP="$DATA_ROOT/${RUN_NAME}_map.pcd"
 LOC="$DATA_ROOT/${RUN_NAME}_loc"
@@ -175,8 +303,9 @@ if [ -n "$UTM_ORIGIN_FILE" ]; then
   UTM_ORIGIN_ARGS=(--utm-origin "$UTM_ORIGIN_VALUE")
 fi
 
-if [ -e "$PREPPED" ]; then
-  echo "refusing to overwrite existing prepped output: $PREPPED" >&2
+if [ -z "$PREPPED_INPUT" ] && [ -e "$PREPPED_OUT" ]; then
+  echo "refusing to overwrite existing prepped output: $PREPPED_OUT" >&2
+  echo "Use --prepped \"$PREPPED_OUT\" to reuse it, or choose a fresh --run name." >&2
   exit 1
 fi
 if [ -e "$LOC" ]; then
@@ -195,20 +324,34 @@ else
 fi
 
 echo "[pipeline] repo root: $REPO"
-echo "[pipeline] raw input: $RAW"
+if [ -n "$RAW" ]; then
+  echo "[pipeline] raw input: $RAW"
+else
+  echo "[pipeline] prepped input: $PREPPED"
+fi
 echo "[pipeline] data root: $DATA_ROOT"
 echo "[pipeline] run name: $RUN_NAME"
 echo "[pipeline] map run: $MAP_RUN"
 echo "[pipeline] full pipeline: $FULL_PIPELINE"
+echo "[pipeline] dry run: $DRY_RUN"
 if [ ${#UTM_ORIGIN_ARGS[@]} -gt 0 ]; then
   echo "[pipeline] reusing UTM origin from: $UTM_ORIGIN_FILE"
 fi
 
-echo "[pipeline] step 1/4: prepping bag"
-python3 -u "$REPO/scripts/prep_bag.py" \
-  --input "$RAW" \
-  --output "$PREPPED" \
-  "${UTM_ORIGIN_ARGS[@]}"
+if [ "$DRY_RUN" = "true" ]; then
+  echo "[pipeline] dry run complete; exiting before prep/mapping/localization"
+  exit 0
+fi
+
+if [ -n "$RAW" ]; then
+  echo "[pipeline] step 1/4: prepping bag"
+  python3 -u "$REPO/scripts/prep_bag.py" \
+    --input "$RAW" \
+    --output "$PREPPED" \
+    "${UTM_ORIGIN_ARGS[@]}"
+else
+  echo "[pipeline] step 1/4: using existing prepped bag"
+fi
 
 if [ "$FULL_PIPELINE" = "true" ]; then
   echo "[pipeline] step 2/4: building map with GLIM"

@@ -10,38 +10,93 @@ configs reference `av24.urdf` relative to the working directory).
 cd "$(git rev-parse --show-toplevel)"
 source /opt/ros/jazzy/setup.bash
 [ -f install/setup.bash ] && source install/setup.bash
+
+# Set once per workstation. Raw bags are not stored in this repository.
+cp dlio.env.example dlio.env
+${EDITOR:-nano} dlio.env
+```
+
+## Local config file
+
+`dlio.env.example` is the tracked template. Copy it to `dlio.env` once per
+workstation and edit the local values there. `dlio.env` is git-ignored, so it
+is the right place for private mount points such as external drives, selected
+run names, or already-prepped bag paths.
+
+Minimum config for the Putnam-style examples:
+
+```bash
+DLIO_ROSBAG_ROOT="/path/to/rosbags"
+DLIO_DATA_ROOT="./dlio_data"
+DLIO_RUN="run_5"
+```
+
+If your raw bag is not laid out as
+`$DLIO_ROSBAG_ROOT/putnam/may_26/$DLIO_RUN/filtered/all`, set `DLIO_RAW`
+directly. If you already have a prepared bag and want to skip prep, set
+`DLIO_PREPPED` instead of `DLIO_RAW`.
+
+`scripts/run_dlio_pipeline.sh` reads `./dlio.env` automatically. Use
+`--config <file>` for another config file, `--no-config` to ignore it, or CLI
+flags such as `--run`, `--raw`, and `--map-run` to override the file for a
+single command.
+
+Before launching a long replay, validate the local config and paths:
+
+```bash
+scripts/run_dlio_pipeline.sh --dry-run
 ```
 
 Paths below use these placeholders — substitute your own:
 
 | Placeholder | Example |
 |---|---|
-| `$RAW_BAG` | `../rosbags/putnam/may_26/run_5/filtered/all` |
+| `$DLIO_ROSBAG_ROOT` | `/path/to/rosbags`, the directory that contains `putnam/may_26/...` |
+| `$RAW_BAG` | `${DLIO_ROSBAG_ROOT:-../rosbags}/putnam/may_26/run_5/filtered/all` |
 | `$DATA` | `./dlio_data` |
 | `$RUN` | `run_5` |
 
-If the raw bags live on another disk, create one local relative alias once,
-for example `ln -s "/path/to/AI racing Tech/rosbags" ../rosbags`, then keep
-the pipeline commands relative to the checkout.
+Keep machine-specific storage paths out of git. Put them in
+`dlio.env`, which is ignored by git, or pass the same values through
+CLI flags. You can also create one local relative alias once, for example
+`ln -s "/path/to/rosbags" ../rosbags`, then keep the pipeline commands
+relative to the checkout.
+
+The `run_5` / `run_3` examples below are Putnam dataset examples, not files
+shipped with this repository. On a fresh clone they run after you either mount
+the matching raw bags under `DLIO_ROSBAG_ROOT` or replace those run names and
+paths with your own dataset.
 
 The raw bag must contain `/atlas/imu_calibrated`, `/atlas/pose_filtered`, and
 `/luminar_front|left|right/points`.
 
-Common local runs:
+Example runs:
 
 ```bash
+# Use the local root config. This is the preferred path for public clones.
+scripts/run_dlio_pipeline.sh
+
 # Build run_5's map and localize run_5 against it.
 scripts/run_dlio_pipeline.sh \
-  --raw "../rosbags/putnam/may_26/run_5/filtered/all" \
+  --raw "${DLIO_ROSBAG_ROOT:-../rosbags}/putnam/may_26/run_5/filtered/all" \
   --data-root "./dlio_data" \
   --run "run_5"
 
 # Prep run_3 with run_5's UTM origin, then localize it against run_5's map.
 scripts/run_dlio_pipeline.sh \
-  --raw "../rosbags/putnam/may_26/run_3/filtered/all" \
+  --raw "${DLIO_ROSBAG_ROOT:-../rosbags}/putnam/may_26/run_3/filtered/all" \
   --data-root "./dlio_data" \
   --run "run_3" \
   --origin-run "run_5" \
+  --map-run "run_5" \
+  --rviz true
+
+# If the raw bags are not mounted but this checkout already has a prepared bag,
+# skip prep and replay localization directly against the existing run_5 map.
+scripts/run_dlio_pipeline.sh \
+  --prepped "./dlio_data/run_3_prepped" \
+  --data-root "./dlio_data" \
+  --run "run_3" \
   --map-run "run_5" \
   --rviz true
 ```
@@ -291,7 +346,7 @@ built from `run_5`:
 
 ```bash
 python3 -u scripts/prep_bag.py \
-  --input "../rosbags/putnam/may_26/run_3/filtered/all" \
+  --input "${DLIO_ROSBAG_ROOT:-../rosbags}/putnam/may_26/run_3/filtered/all" \
   --output "$DATA/run_3_prepped" \
   --utm-origin "$(tail -n 1 "$DATA/run_5_prepped/utm_origin.txt")"
 

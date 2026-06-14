@@ -9,6 +9,28 @@ If you are reviewing this codebase: read this file first.
 
 ---
 
+## Local environment config policy
+
+The public repository tracks `dlio.env.example` as the template for local
+pipeline settings. The real `dlio.env` file is intentionally git-ignored and
+may contain machine-specific mount points, run choices, or prepared-bag paths.
+
+Agent rules:
+- Do not hard-code private paths such as `/home/...` or `/media/...` into
+  README, PIPELINE, scripts, or committed configs. Use `dlio.env.example`,
+  `DLIO_ROSBAG_ROOT`, `DLIO_RAW`, or CLI flags instead.
+- Do not commit `dlio.env`. If a local run needs one and it is missing, either
+  tell the user to copy `dlio.env.example` to `dlio.env` or create/update the
+  ignored `dlio.env` only when the user explicitly asks for local setup.
+- When documenting pipeline usage, README should explain the purpose of
+  `dlio.env`, PIPELINE should show the concrete setup steps, and AGENTS should
+  preserve this policy for future agent runs.
+- If you add new pipeline path knobs, add them to `dlio.env.example`, teach
+  `scripts/run_dlio_pipeline.sh` to read them, and keep CLI flags as
+  per-run overrides.
+
+---
+
 ## Confirmed non-issues
 
 ### 1. `Isotropic::Information(prior_inf_scale.asDiagonal())` is correct (was — superseded)

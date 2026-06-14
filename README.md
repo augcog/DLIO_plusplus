@@ -69,15 +69,35 @@ When the `imu_topic:=` launch arg points at a non-existent topic, the subscripti
 > evaluation) including the `/atlas/*` → `/gps_p1/*` conversion step that the
 > raw AV-24 recordings require.
 
+Raw rosbags, generated maps, and `dlio_data/` outputs are intentionally not
+versioned. For public clones, copy `dlio.env.example` to
+`dlio.env`, fill in the local dataset paths, then run the pipeline
+wrapper. The local `dlio.env` file is ignored by git.
+
+```bash
+cp dlio.env.example dlio.env
+${EDITOR:-nano} dlio.env
+scripts/run_dlio_pipeline.sh
+```
+
+`dlio.env.example` is the committed template. `dlio.env` is your private
+workstation file; keep local mount points, selected run names, and optional
+prepared-bag overrides there. `scripts/run_dlio_pipeline.sh` reads it
+automatically, and any CLI flag you pass still overrides the file for that
+one run.
+
 1. **Record** a bag containing IMU + LiDAR + GNSS topics during a driving session.
 1b. **Prep** the bag with `scripts/prep_bag.py` (topic conversion, IMU/GNSS
    re-stamping, UTM odometry — see PIPELINE.md §1).
 2. **Map** offline with GLIM:
    ```bash
-   ros2 run glim_ros glim_rosbag <prepped_bag> --ros-args -p dump_path:=/tmp/dump
+   DATA="${DATA:-./dlio_data}"
+   PREPPED_BAG="$DATA/run_5_prepped"
+   DUMP_DIR="$DATA/run_5_dump"
+   ros2 run glim_ros glim_rosbag "$PREPPED_BAG" --ros-args -p dump_path:="$DUMP_DIR"
    ```
    Outputs `graph.bin`, `traj_lidar.txt`, `odom_lidar.txt`, numbered submap point clouds, and `T_world_utm.txt` (GNSS-to-map SE(3)) into `dump_path`.
-3. **Convert** submaps into a single PCD map. Scripted route (used by the automated pipeline): `ros2 run glim_ros glim_dump_to_pcd <dump_dir> <out.pcd>`. QA route (recommended before freezing a production map): open the dump in `glim_ros offline_viewer`, inspect/re-optimize/close loops, export PLY, then `gicp_localization/scripts/convert_ply_to_pcd.py` — see "Why the offline_viewer step is manual" below for what the GUI pass buys you.
+3. **Convert** submaps into a single PCD map. Scripted route (used by the automated pipeline): `ros2 run glim_ros glim_dump_to_pcd "$DUMP_DIR" "$DATA/run_5_map.pcd"`. QA route (recommended before freezing a production map): open the dump in `glim_ros offline_viewer`, inspect/re-optimize/close loops, export PLY, then `gicp_localization/scripts/convert_ply_to_pcd.py` — see "Why the offline_viewer step is manual" below for what the GUI pass buys you.
 4. **Localize** online against that PCD map with `gicp_localization`. Point the launch file at the PCD and (optionally) the matching `T_world_utm.txt`.
 
 ### Why the offline_viewer step is manual
@@ -116,14 +136,21 @@ If `ros2 pkg prefix glim` does not point inside this workspace's `install/`, an 
 ## Quick Reference
 
 ```bash
+export DATA="${DATA:-./dlio_data}"
+
 # Live SLAM with real sensors (config_path defaults to the glim package's config/)
 ros2 run glim_ros glim_rosnode --ros-args -p config_path:=config
 
 # Offline bag → map (ROS 2 mcap input)
-ros2 run glim_ros glim_rosbag <bag_path> --ros-args -p dump_path:=<out_dir>
+PREPPED_BAG="$DATA/run_5_prepped"
+DUMP_DIR="$DATA/run_5_dump"
+ros2 run glim_ros glim_rosbag "$PREPPED_BAG" --ros-args -p dump_path:="$DUMP_DIR"
 
 # Offline pcap → map (raw Luminar pcap + IMU/GNSS from a sibling mcap)
-ros2 run glim_ros glim_pcap_rosbag <pcap_dir> <mcap_bag> --ros-args -p dump_path:=<out_dir>
+PCAP_PATH="/path/to/luminar_capture.pcap"
+MCAP_BAG="/path/to/sibling_bag.mcap"
+PCAP_DUMP_DIR="$DATA/pcap_dump"
+ros2 run glim_ros glim_pcap_rosbag "$PCAP_PATH" "$MCAP_BAG" --ros-args -p dump_path:="$PCAP_DUMP_DIR"
 
 # Inspect a saved map
 ros2 run glim_ros offline_viewer
@@ -132,13 +159,17 @@ ros2 run glim_ros offline_viewer
 # (single-source P1 design: IMU + GT odom both from Atlas, at gps_antenna_top;
 #  gt_odom must be in the MAP frame — for bag replay use
 #  gicp_localization/scripts/utm_to_map_odom.py, see PIPELINE.md §4)
+MAP_PATH="$DATA/run_5_map.pcd"
+UTM_TF="$DATA/run_5_dump/T_world_utm.txt"
 ros2 launch gicp_localization localization_with_tf.launch.py rviz:=true \
     pointcloud_topic:=/luminar_front/points \
     imu_topic:=/gps_p1/imu \
-    gt_odom_topic:=/gps_p1/filtered_odom_map
+    gt_odom_topic:=/gps_p1/filtered_odom_map \
+    map_path:="$MAP_PATH" \
+    utm_transform_path:="$UTM_TF"
 
 # Re-open a previous localization result in RViz without rerunning GICP/rosbag.
-scripts/show_cached_error_viz.sh <result_dir_with_live_error.csv> <map.pcd>
+scripts/show_cached_error_viz.sh "$DATA/run_3_loc_gnss_live" "$MAP_PATH"
 ```
 
 ---
@@ -149,7 +180,7 @@ The two packages started from different upstream codebases and diverged for diff
 
 ### GLIM (vs. `koide3/glim`, `glim_ext`, `glim_ros2`)
 
-Upstream GLIM publishes `glim`, `glim_ext`, and `glim_ros2` as three sibling repos. This fork keeps them together inside `DLIO_plusplus/GLIM/` and adds:
+Upstream GLIM publishes `glim`, `glim_ext`, and `glim_ros2` as three sibling repos. This fork keeps them together under `GLIM/` and adds:
 
 **Sensor / preprocessing**
 
@@ -219,7 +250,7 @@ Upstream GLIM publishes `glim`, `glim_ext`, and `glim_ros2` as three sibling rep
 ## Repo Layout
 
 ```
-DLIO_plusplus/
+repo-root/
 ├── GLIM/                # SLAM workspace (glim, glim_ext, glim_ros2)
 ├── gicp_localization/   # Map-based localization package
 ├── dlio/                # Convenience metapackage
