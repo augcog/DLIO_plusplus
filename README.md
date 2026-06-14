@@ -1,6 +1,6 @@
 # DLIO++
 
-https://drive.google.com/file/d/15UakSaWzjoIB35DNQZRRd4rf3OvrjUqs/view?usp=sharing
+[![DLIO++ demo](docs/assets/dlio_demo.gif)](https://drive.google.com/file/d/15UakSaWzjoIB35DNQZRRd4rf3OvrjUqs/view?usp=sharing)
 
 ROS 2 perception stack for the AV-24 Cybertruck autonomous race car. Pairs a GPU-accelerated LiDAR-inertial SLAM front end with a map-based localizer so the vehicle can build a map offline, then localize against it online at IMU rate.
 
