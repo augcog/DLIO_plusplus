@@ -220,7 +220,7 @@ scripts/run_localization_replay.sh \
 `scripts/live_gnss_error_monitor.py`: RViz shows the GICP trajectory in green,
 the GNSS/RTK reference trajectory in red, and a live marker from the GICP pose
 to the nearest GNSS pose. It also publishes a live 3D "error rollercoaster":
-the GNSS path stays on the physical map, while the colored curtain rises by
+the GNSS path stays on the physical map, while colored vertical cylinders rise by
 the current GICP-vs-GNSS error in meters. It writes live error samples to
 `$DATA/${RUN}_loc/live_error.csv` and refreshes
 `$DATA/${RUN}_loc/live_error.png` during replay.

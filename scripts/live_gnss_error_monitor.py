@@ -65,11 +65,12 @@ class LiveGnssErrorMonitor(Node):
         self.declare_parameter("rollercoaster_publish_period", 0.5)
         self.declare_parameter("rollercoaster_min_step", 0.75)
         self.declare_parameter("rollercoaster_max_points", 3000)
-        self.declare_parameter("rollercoaster_z_scale", 10.0)
+        self.declare_parameter("rollercoaster_z_scale", 20.0)
         self.declare_parameter("rollercoaster_baseline_z", 0.0)
         self.declare_parameter("rollercoaster_color_max", 3.0)
-        self.declare_parameter("rollercoaster_curtain_alpha", 0.28)
-        self.declare_parameter("rollercoaster_line_width", 0.75)
+        self.declare_parameter("rollercoaster_curtain_alpha", 1.0)
+        self.declare_parameter("rollercoaster_cylinder_diameter", 1.5)
+        self.declare_parameter("rollercoaster_line_width", -1.0)
 
         self.est_topic = self.get_parameter("est_topic").value
         self.gnss_topic = self.get_parameter("gnss_topic").value
@@ -92,8 +93,11 @@ class LiveGnssErrorMonitor(Node):
             1e-6, float(self.get_parameter("rollercoaster_color_max").value))
         self.rollercoaster_curtain_alpha = float(
             np.clip(self.get_parameter("rollercoaster_curtain_alpha").value, 0.0, 1.0))
-        self.rollercoaster_line_width = max(
-            0.05, float(self.get_parameter("rollercoaster_line_width").value))
+        self.rollercoaster_cylinder_diameter = max(
+            0.01, float(self.get_parameter("rollercoaster_cylinder_diameter").value))
+        legacy_line_width = float(self.get_parameter("rollercoaster_line_width").value)
+        if legacy_line_width > 0.0:
+            self.rollercoaster_cylinder_diameter = max(0.01, legacy_line_width)
         self.rollercoaster_cmap = colormaps["inferno"]
 
         csv = str(self.get_parameter("csv_path").value)
@@ -259,12 +263,15 @@ class LiveGnssErrorMonitor(Node):
         return MarkerArray(markers=[delete, line, text, gnss_sphere])
 
     def color_for_error(self, err, alpha=1.0):
-        rgba = self.rollercoaster_cmap(
-            float(np.clip(err / self.rollercoaster_color_max, 0.0, 1.0)))
+        level = float(np.clip(err / self.rollercoaster_color_max, 0.0, 1.0))
+        rgba = self.rollercoaster_cmap(level)
+        saturation = 0.18 + 0.82 * np.sqrt(level)
+        base = np.array([0.22, 0.22, 0.24], dtype=float)
+        rgb = base * (1.0 - saturation) + np.asarray(rgba[:3], dtype=float) * saturation
         return ColorRGBA(
-            r=float(rgba[0]),
-            g=float(rgba[1]),
-            b=float(rgba[2]),
+            r=float(rgb[0]),
+            g=float(rgb[1]),
+            b=float(rgb[2]),
             a=float(alpha),
         )
 
@@ -312,35 +319,28 @@ class LiveGnssErrorMonitor(Node):
 
         delete = self.base_marker(frame, stamp, 0, Marker.LINE_STRIP, Marker.DELETEALL)
 
-        ridge = self.base_marker(frame, stamp, 1, Marker.LINE_STRIP)
-        ridge.scale.x = self.rollercoaster_line_width
-        ridge.color.a = 1.0
-        ridge.points = [marker_point(*p) for p in top]
-        ridge.colors = [self.color_for_error(e, 1.0) for e in e2d]
-
-        curtain = self.base_marker(frame, stamp, 2, Marker.TRIANGLE_LIST)
-        curtain.color.a = self.rollercoaster_curtain_alpha
-        curtain_points = []
-        curtain_colors = []
-        for i in range(len(shadow_base) - 1):
-            avg_err = 0.5 * (e2d[i] + e2d[i + 1])
-            color = self.color_for_error(avg_err, self.rollercoaster_curtain_alpha)
-            vertices = (
-                shadow_base[i], top[i], top[i + 1],
-                shadow_base[i], top[i + 1], shadow_base[i + 1],
-            )
-            curtain_points.extend(marker_point(*v) for v in vertices)
-            curtain_colors.extend([color] * 6)
-        curtain.points = curtain_points
-        curtain.colors = curtain_colors
-
         shadow = self.base_marker(frame, stamp, 3, Marker.LINE_STRIP)
-        shadow.scale.x = max(0.25, self.rollercoaster_line_width * 0.45)
+        shadow.scale.x = max(0.25, self.rollercoaster_cylinder_diameter * 0.25)
         shadow.color.r = 0.95
         shadow.color.g = 0.95
         shadow.color.b = 0.95
         shadow.color.a = 0.55
         shadow.points = [marker_point(*p) for p in shadow_base]
+
+        cylinders = []
+        for i, (base_point, top_point, err) in enumerate(zip(shadow_base, top, e2d)):
+            height = float(top_point[2] - base_point[2])
+            if height <= 1e-3:
+                continue
+            cylinder = self.base_marker(frame, stamp, 1000 + i, Marker.CYLINDER)
+            cylinder.pose.position = marker_point(
+                base_point[0], base_point[1], base_point[2] + height * 0.5)
+            cylinder.pose.orientation.w = 1.0
+            cylinder.scale.x = self.rollercoaster_cylinder_diameter
+            cylinder.scale.y = self.rollercoaster_cylinder_diameter
+            cylinder.scale.z = height
+            cylinder.color = self.color_for_error(err, self.rollercoaster_curtain_alpha)
+            cylinders.append(cylinder)
 
         imax = int(np.argmax(e2d))
         peak = self.base_marker(frame, stamp, 4, Marker.SPHERE)
@@ -358,7 +358,7 @@ class LiveGnssErrorMonitor(Node):
         text.text = f"max GICP-GNSS {e2d[imax]:.1f} m"
 
         self.rollercoaster_pub.publish(MarkerArray(
-            markers=[delete, curtain, shadow, ridge, peak, text]))
+            markers=[delete, shadow, *cylinders, peak, text]))
 
     def save_plot(self):
         if not self.plot_path:

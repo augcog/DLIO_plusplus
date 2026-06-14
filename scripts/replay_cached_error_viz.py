@@ -7,7 +7,7 @@ republishes the visualization topics that RViz expects:
 - red GNSS path
 - green GICP path
 - current GICP/GNSS error marker
-- 3D error "rollercoaster" curtain
+- 3D error "rollercoaster" vertical cylinders
 - optional sampled PCD map backdrop
 
 It is intentionally lightweight: no rosbag playback, no localization node, no
@@ -123,6 +123,11 @@ class CachedErrorViz(Node):
         self.color_max = max(self.color_max, 1e-6)
         self.roller_points = []
         self.last_roller_xy = None
+        self.last_roller_publish_ns = None
+        self.rollercoaster_cylinder_diameter = args.rollercoaster_cylinder_diameter
+        if args.rollercoaster_line_width > 0.0:
+            self.rollercoaster_cylinder_diameter = args.rollercoaster_line_width
+        self.rollercoaster_cylinder_diameter = max(0.01, self.rollercoaster_cylinder_diameter)
 
         self.gnss_path = PathMsg()
         self.gnss_path.header.frame_id = self.frame
@@ -181,15 +186,20 @@ class CachedErrorViz(Node):
         self.map_pub.publish(self.map_msg)
 
     def color_for_error(self, err, alpha=1.0):
-        rgba = self.cmap(float(np.clip(err / self.color_max, 0.0, 1.0)))
-        return ColorRGBA(r=float(rgba[0]), g=float(rgba[1]), b=float(rgba[2]), a=float(alpha))
+        level = float(np.clip(err / self.color_max, 0.0, 1.0))
+        rgba = self.cmap(level)
+        saturation = 0.18 + 0.82 * np.sqrt(level)
+        base = np.array([0.22, 0.22, 0.24], dtype=float)
+        rgb = base * (1.0 - saturation) + np.asarray(rgba[:3], dtype=float) * saturation
+        return ColorRGBA(r=float(rgb[0]), g=float(rgb[1]), b=float(rgb[2]), a=float(alpha))
 
     def tick(self):
         if self.index >= len(self.rows):
             if self.args.loop:
                 self.reset()
             elif self.args.hold:
-                self.publish_rollercoaster()
+                if self.should_publish_rollercoaster():
+                    self.publish_rollercoaster()
                 return
             else:
                 rclpy.shutdown()
@@ -207,12 +217,14 @@ class CachedErrorViz(Node):
         self.publish_paths(gicp, gnss, stamp)
         self.publish_current_error(gicp, gnss, e2d, e3d, stamp)
         self.add_roller_sample(gnss, e2d, e3d)
-        self.publish_rollercoaster(stamp)
+        if self.should_publish_rollercoaster():
+            self.publish_rollercoaster(stamp)
 
     def reset(self):
         self.index = 0
         self.roller_points.clear()
         self.last_roller_xy = None
+        self.last_roller_publish_ns = None
         self.gnss_path.poses.clear()
         self.gicp_path.poses.clear()
 
@@ -302,6 +314,17 @@ class CachedErrorViz(Node):
             last = self.roller_points[-1]
             self.last_roller_xy = np.array([last[0], last[1]], dtype=float)
 
+    def should_publish_rollercoaster(self):
+        now_ns = self.get_clock().now().nanoseconds
+        if self.last_roller_publish_ns is None:
+            self.last_roller_publish_ns = now_ns
+            return True
+        period_ns = int(max(0.05, self.args.rollercoaster_publish_period) * 1e9)
+        if now_ns - self.last_roller_publish_ns < period_ns:
+            return False
+        self.last_roller_publish_ns = now_ns
+        return True
+
     def publish_rollercoaster(self, stamp=None):
         if len(self.roller_points) < 2:
             return
@@ -318,31 +341,26 @@ class CachedErrorViz(Node):
 
         delete = self.base_marker(stamp, 10, Marker.LINE_STRIP, Marker.DELETEALL)
 
-        curtain = self.base_marker(stamp, 11, Marker.TRIANGLE_LIST)
-        curtain_points = []
-        curtain_colors = []
-        for i in range(len(shadow_base) - 1):
-            avg = 0.5 * (e2d[i] + e2d[i + 1])
-            color = self.color_for_error(avg, self.args.rollercoaster_curtain_alpha)
-            vertices = (
-                shadow_base[i], top[i], top[i + 1],
-                shadow_base[i], top[i + 1], shadow_base[i + 1],
-            )
-            curtain_points.extend(marker_point(*v) for v in vertices)
-            curtain_colors.extend([color] * 6)
-        curtain.points = curtain_points
-        curtain.colors = curtain_colors
-
         shadow = self.base_marker(stamp, 12, Marker.LINE_STRIP)
-        shadow.scale.x = 0.35
+        shadow.scale.x = max(0.25, self.rollercoaster_cylinder_diameter * 0.25)
         shadow.color.r = shadow.color.g = shadow.color.b = 0.95
         shadow.color.a = 0.55
         shadow.points = [marker_point(*p) for p in shadow_base]
 
-        ridge = self.base_marker(stamp, 13, Marker.LINE_STRIP)
-        ridge.scale.x = self.args.rollercoaster_line_width
-        ridge.points = [marker_point(*p) for p in top]
-        ridge.colors = [self.color_for_error(e, 1.0) for e in e2d]
+        cylinders = []
+        for i, (base_point, top_point, err) in enumerate(zip(shadow_base, top, e2d)):
+            height = float(top_point[2] - base_point[2])
+            if height <= 1e-3:
+                continue
+            cylinder = self.base_marker(stamp, 1000 + i, Marker.CYLINDER)
+            cylinder.pose.position = marker_point(
+                base_point[0], base_point[1], base_point[2] + height * 0.5)
+            cylinder.pose.orientation.w = 1.0
+            cylinder.scale.x = self.rollercoaster_cylinder_diameter
+            cylinder.scale.y = self.rollercoaster_cylinder_diameter
+            cylinder.scale.z = height
+            cylinder.color = self.color_for_error(err, self.args.rollercoaster_curtain_alpha)
+            cylinders.append(cylinder)
 
         imax = int(np.argmax(e2d))
         peak = self.base_marker(stamp, 14, Marker.SPHERE)
@@ -356,7 +374,7 @@ class CachedErrorViz(Node):
         text.color.r = text.color.g = text.color.b = text.color.a = 1.0
         text.text = f"cached max GICP-GNSS {e2d[imax]:.1f} m"
 
-        self.roller_pub.publish(MarkerArray(markers=[delete, curtain, shadow, ridge, peak, text]))
+        self.roller_pub.publish(MarkerArray(markers=[delete, shadow, *cylinders, peak, text]))
 
 
 def main():
@@ -376,15 +394,17 @@ def main():
     ap.add_argument("--map-period", type=float, default=1.0)
     ap.add_argument("--rollercoaster-min-step", type=float, default=0.75)
     ap.add_argument("--rollercoaster-max-points", type=int, default=3000)
-    ap.add_argument("--rollercoaster-z-scale", type=float, default=10.0)
+    ap.add_argument("--rollercoaster-publish-period", type=float, default=0.5)
+    ap.add_argument("--rollercoaster-z-scale", type=float, default=20.0)
     ap.add_argument(
         "--rollercoaster-baseline-z",
         type=float,
         default=0.0,
         help="vertical offset added to the physical map z baseline before drawing error height",
     )
-    ap.add_argument("--rollercoaster-curtain-alpha", type=float, default=0.28)
-    ap.add_argument("--rollercoaster-line-width", type=float, default=0.75)
+    ap.add_argument("--rollercoaster-curtain-alpha", type=float, default=1.0, help="vertical cylinder alpha")
+    ap.add_argument("--rollercoaster-cylinder-diameter", type=float, default=1.5)
+    ap.add_argument("--rollercoaster-line-width", type=float, default=-1.0, help="legacy alias for cylinder diameter")
     ap.add_argument("--cmap", default="inferno")
     ap.add_argument("--color-percentile", type=float, default=98.0)
     ap.add_argument("--color-max", type=float, default=0.0)

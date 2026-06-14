@@ -2,9 +2,9 @@
 """Render a 3D "roller coaster" view of localization error on the map.
 
 The XY position comes from the GNSS or GICP trajectory in map coordinates.
-The plotted height above the trajectory is the GICP-vs-GNSS error in meters.
-A translucent curtain is filled below the error curve so high-error regions
-read like physical hills above the driven line.
+At each sample, a vertical colored bar rises from the physical trajectory by
+the GICP-vs-GNSS error in meters, so high-error regions stand out without
+moving the track laterally.
 
 Example:
     python3 scripts/render_error_rollercoaster.py \
@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib import colormaps
 from matplotlib.colors import Normalize
-from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
+from mpl_toolkits.mplot3d.art3d import Line3DCollection
 
 
 def load_live_error_csv(path, position_source, error_field):
@@ -180,20 +180,11 @@ def render(args):
     color_max = max(float(color_max), 1e-6)
     norm = Normalize(vmin=0.0, vmax=color_max)
 
-    segs = np.stack([top[:-1], top[1:]], axis=1)
-    seg_err = 0.5 * (err[:-1] + err[1:])
-    lc = Line3DCollection(segs, cmap=cmap, norm=norm, linewidth=args.line_width)
-    lc.set_array(seg_err)
-    ax.add_collection3d(lc)
-
-    curtain_verts = [
-        [shadow_base[i], top[i], top[i + 1], shadow_base[i + 1]]
-        for i in range(len(shadow_base) - 1)
-    ]
-    curtain_colors = cmap(norm(seg_err))
-    curtain_colors[:, 3] = args.curtain_alpha
-    curtain = Poly3DCollection(curtain_verts, facecolors=curtain_colors, edgecolors="none")
-    ax.add_collection3d(curtain)
+    bar_segs = np.stack([shadow_base, top], axis=1)
+    bar_colors = cmap(norm(err))
+    bar_colors[:, 3] = args.curtain_alpha
+    bars = Line3DCollection(bar_segs, colors=bar_colors, linewidth=args.line_width)
+    ax.add_collection3d(bars)
 
     # Shadow/reference on the physical trajectory.
     ax.plot(
@@ -291,7 +282,7 @@ def main():
     ap.add_argument("--map-max-points", type=int, default=180000)
     ap.add_argument("--map-point-size", type=float, default=0.18)
     ap.add_argument("--map-alpha", type=float, default=0.18)
-    ap.add_argument("--curtain-alpha", type=float, default=0.23)
+    ap.add_argument("--curtain-alpha", type=float, default=0.70, help="vertical bar alpha")
     ap.add_argument("--line-width", type=float, default=2.2)
     ap.add_argument("--cmap", default="inferno")
     ap.add_argument("--color-percentile", type=float, default=98.0)
