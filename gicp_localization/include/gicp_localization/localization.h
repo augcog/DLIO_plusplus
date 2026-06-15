@@ -98,6 +98,13 @@ private:
                             Eigen::Vector3f& v_ang_body_out) const;
   // GT-driven pose recovery. Returns true when the snap fired (guards passed and
   // a time-matched GT sample with finite extrinsic was applied to the state).
+  bool applyGtSampleToState(const GtSample& gt, const rclcpp::Time& stamp,
+                            const char* reason, int failure_count,
+                            bool pose_mutex_already_held,
+                            bool publish_snap_marker,
+                            bool update_gicp_anchor,
+                            bool reset_failures,
+                            bool log_snap);
   bool maybeSnapPoseToGT(const char* reason);
   void applyInitialPose(const Eigen::Vector3f& p, const Eigen::Quaternionf& q,
                         const rclcpp::Time& stamp, const std::string& source);
@@ -176,6 +183,11 @@ private:
   // base_frame ← gt_body TF once. Snap composes T_map_base = T_map_gtbody * inv(T_base_gtbody).
   bool gt_recovery_enabled_;
   int gt_recovery_min_consecutive_failures_;
+  bool gt_recovery_hold_on_lidar_timeout_;
+  double gt_recovery_lidar_timeout_sec_;
+  bool gt_rejection_enabled_;
+  double gt_rejection_max_pos_err_m_;
+  double gt_rejection_max_rot_err_deg_;
   int consecutive_failures_;          // resets to 0 on accept; increments on any non-accept
   bool gt_extrinsics_cached_;
   Eigen::Matrix4f T_base_gtbody_;     // pose of gt_body expressed in base_frame
@@ -251,6 +263,7 @@ private:
   pcl::PointCloud<PointType>::Ptr original_scan;
   rclcpp::Time scan_stamp;
   double prev_scan_stamp;
+  std::atomic<double> last_pointcloud_stamp_;
   double observer_dt_;
   std::string last_scan_input_frame_;
   size_t last_raw_point_count_;

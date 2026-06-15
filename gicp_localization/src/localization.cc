@@ -728,6 +728,7 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
 
   // Initialize previous scan stamp
   this->prev_scan_stamp = 0.0;
+  this->last_pointcloud_stamp_.store(-1.0);
   this->observer_dt_ = 0.0;
   this->last_scan_input_frame_.clear();
   this->last_raw_point_count_ = 0;
@@ -1151,9 +1152,21 @@ void gicp_localization::LocalizationNode::getParams() {
   // requires the same subscriber to be active, so it implies gt_odom/enable.
   this->declare_parameter<bool>("localization/gt_recovery/enable", false);
   this->declare_parameter<int>("localization/gt_recovery/min_consecutive_failures", 3);
+  this->declare_parameter<bool>("localization/gt_recovery/hold_on_lidar_timeout", false);
+  this->declare_parameter<double>("localization/gt_recovery/lidar_timeout_sec", 0.5);
   this->get_parameter("localization/gt_recovery/enable", this->gt_recovery_enabled_);
   this->get_parameter("localization/gt_recovery/min_consecutive_failures",
                       this->gt_recovery_min_consecutive_failures_);
+  this->get_parameter("localization/gt_recovery/hold_on_lidar_timeout",
+                      this->gt_recovery_hold_on_lidar_timeout_);
+  this->get_parameter("localization/gt_recovery/lidar_timeout_sec",
+                      this->gt_recovery_lidar_timeout_sec_);
+  this->declare_parameter<bool>("localization/gt_rejection/enable", false);
+  this->declare_parameter<double>("localization/gt_rejection/max_pos_err_m", 0.0);
+  this->declare_parameter<double>("localization/gt_rejection/max_rot_err_deg", 0.0);
+  this->get_parameter("localization/gt_rejection/enable", this->gt_rejection_enabled_);
+  this->get_parameter("localization/gt_rejection/max_pos_err_m", this->gt_rejection_max_pos_err_m_);
+  this->get_parameter("localization/gt_rejection/max_rot_err_deg", this->gt_rejection_max_rot_err_deg_);
   if (this->gt_recovery_enabled_ && !this->gt_odom_enabled_) {
     RCLCPP_WARN(this->get_logger(),
                 "localization/gt_recovery/enable=true but gt_odom/enable=false — forcing gt_odom on so the buffer fills.");
@@ -1161,6 +1174,9 @@ void gicp_localization::LocalizationNode::getParams() {
   }
   if (this->gt_recovery_min_consecutive_failures_ < 1) {
     this->gt_recovery_min_consecutive_failures_ = 1;
+  }
+  if (this->gt_recovery_lidar_timeout_sec_ <= 0.0) {
+    this->gt_recovery_lidar_timeout_sec_ = 0.5;
   }
 
   this->get_parameter("localization/publish_tf", this->publish_tf_);
@@ -1406,9 +1422,16 @@ void gicp_localization::LocalizationNode::getParams() {
               this->gicp_hessian_rot_warn_deg_,
               this->gicp_hessian_cond_max_ > 0.0 ? "on" : "disabled");
   RCLCPP_INFO(this->get_logger(),
-              "GT recovery: %s (min consecutive failures=%d)",
+              "GT recovery: %s (min consecutive failures=%d, lidar-timeout hold=%s after %.2fs)",
               this->gt_recovery_enabled_ ? "ENABLED" : "DISABLED",
-              this->gt_recovery_min_consecutive_failures_);
+              this->gt_recovery_min_consecutive_failures_,
+              this->gt_recovery_hold_on_lidar_timeout_ ? "on" : "off",
+              this->gt_recovery_lidar_timeout_sec_);
+  RCLCPP_INFO(this->get_logger(),
+              "GT rejection gate: %s (pos>%.2fm or rot>%.1fdeg)",
+              this->gt_rejection_enabled_ ? "ENABLED" : "DISABLED",
+              this->gt_rejection_max_pos_err_m_,
+              this->gt_rejection_max_rot_err_deg_);
   RCLCPP_INFO(this->get_logger(), "Debug: publish=%s jump_log=%s thresholds=[%.2fm, %.1fdeg]",
               this->debug_pub_enabled_ ? "ENABLED" : "DISABLED",
               this->debug_jump_log_enabled_ ? "ENABLED" : "DISABLED",
@@ -1743,6 +1766,8 @@ void gicp_localization::LocalizationNode::processPointCloud(
       return;
     }
   }
+
+  this->last_pointcloud_stamp_.store(pc->header.stamp.sec + pc->header.stamp.nanosec * 1e-9);
 
   if (!this->initialized) {
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
@@ -2750,6 +2775,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
   bool gicp_rejected_fitness = false;
   bool gicp_rejected_jump = false;
   bool gicp_rejected_hessian = false;
+  bool gicp_rejected_gt = false;
   if (effectively_converged && candidate_pose_valid) {
     if (fitness_score > this->gicp_fitness_reject_threshold_) {
       gicp_rejected_fitness = true;
@@ -2776,10 +2802,17 @@ void gicp_localization::LocalizationNode::performLocalization() {
       gicp_rejected_hessian = true;
     } else if (this->gicp_reject_large_jumps_ && large_jump) {
       gicp_rejected_jump = true;
+    } else if (this->gt_rejection_enabled_ && gt_pos_err >= 0.0 &&
+               ((this->gt_rejection_max_pos_err_m_ > 0.0 &&
+                 gt_pos_err > this->gt_rejection_max_pos_err_m_) ||
+                (this->gt_rejection_max_rot_err_deg_ > 0.0 &&
+                 gt_rot_err_deg > this->gt_rejection_max_rot_err_deg_))) {
+      gicp_rejected_gt = true;
     }
   }
   const bool gicp_accepted = effectively_converged && candidate_pose_valid &&
-                             !gicp_rejected_fitness && !gicp_rejected_hessian && !gicp_rejected_jump;
+                             !gicp_rejected_fitness && !gicp_rejected_hessian &&
+                             !gicp_rejected_jump && !gicp_rejected_gt;
 
   if (!candidate_pose_valid) {
     RCLCPP_WARN(this->get_logger(), "%s", build_scan_debug_log("invalid_solution").c_str());
@@ -2803,6 +2836,13 @@ void gicp_localization::LocalizationNode::performLocalization() {
     RCLCPP_WARN(this->get_logger(),
                 "GICP REJECTED (jump dT=%.3fm dR=%.2fdeg): %s",
                 jump_trans, jump_rot_deg, build_scan_debug_log("rejected_jump").c_str());
+  } else if (gicp_rejected_gt) {
+    RCLCPP_WARN(this->get_logger(),
+                "GICP REJECTED (GT divergence pos=%.3fm rot=%.2fdeg exceeds %.3fm/%.2fdeg): %s",
+                gt_pos_err, gt_rot_err_deg,
+                this->gt_rejection_max_pos_err_m_,
+                this->gt_rejection_max_rot_err_deg_,
+                build_scan_debug_log("rejected_gt").c_str());
   } else if (large_jump) {
     RCLCPP_WARN(this->get_logger(), "%s", build_scan_debug_log("large_jump").c_str());
   } else if (this->debug_verbose_scan_log_) {
@@ -2904,6 +2944,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
                        : !effectively_converged ? "failed to converge"
                        : gicp_rejected_fitness ? "fitness rejected"
                        : gicp_rejected_hessian ? "degenerate geometry"
+                       : gicp_rejected_gt ? "GT divergence rejected"
                        : "jump rejected";
     if (matrixFinite(this->T_prior)) {
       this->current_pose = this->T_prior;
@@ -3124,7 +3165,7 @@ void gicp_localization::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Od
     Eigen::Quaternionf init_q;
     if (this->composeGtPoseInBase(s, init_p, init_q)) {
       this->use_odom_init_applied_ = true;
-      const rclcpp::Time stamp_ros(msg->header.stamp.sec, msg->header.stamp.nanosec);
+      const rclcpp::Time stamp_ros(msg->header.stamp, RCL_ROS_TIME);
       this->applyInitialPose(init_p, init_q, stamp_ros, "gt_odom");
       {
         std::lock_guard<std::mutex> lock(this->geo.mtx);
@@ -3142,20 +3183,46 @@ void gicp_localization::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Od
     }
   }
 
-  std::lock_guard<std::mutex> lock(this->gt_odom_mtx_);
-  if (!this->gt_odom_buffer_.empty() && s.stamp <= this->gt_odom_buffer_.back().stamp) {
-    // Out-of-order or duplicate timestamp; drop to keep buffer monotone.
-    return;
+  bool first_gt_sample = false;
+  {
+    std::lock_guard<std::mutex> lock(this->gt_odom_mtx_);
+    if (!this->gt_odom_buffer_.empty() && s.stamp <= this->gt_odom_buffer_.back().stamp) {
+      // Out-of-order or duplicate timestamp; drop to keep buffer monotone.
+      return;
+    }
+    this->gt_odom_buffer_.push_back(s);
+    while (this->gt_odom_buffer_.size() > this->gt_odom_buffer_size_) {
+      this->gt_odom_buffer_.pop_front();
+    }
+    first_gt_sample = !this->gt_odom_received_.exchange(true);
   }
-  this->gt_odom_buffer_.push_back(s);
-  while (this->gt_odom_buffer_.size() > this->gt_odom_buffer_size_) {
-    this->gt_odom_buffer_.pop_front();
-  }
-  if (!this->gt_odom_received_.exchange(true)) {
+
+  if (first_gt_sample) {
     RCLCPP_INFO(this->get_logger(),
                 "First ground-truth odom received at stamp=%.3f frame=%s child_frame=%s",
                 s.stamp, msg->header.frame_id.c_str(),
                 msg->child_frame_id.empty() ? "(empty)" : msg->child_frame_id.c_str());
+  }
+
+  if (this->gt_recovery_enabled_ &&
+      this->gt_recovery_hold_on_lidar_timeout_ &&
+      this->initialized.load() &&
+      this->gt_extrinsics_cached_) {
+    const double last_lidar_stamp = this->last_pointcloud_stamp_.load();
+    const double lidar_gap = last_lidar_stamp > 0.0
+                                 ? (s.stamp - last_lidar_stamp)
+                                 : 0.0;
+    if (lidar_gap > this->gt_recovery_lidar_timeout_sec_) {
+      const rclcpp::Time stamp_ros(msg->header.stamp, RCL_ROS_TIME);
+      if (this->applyGtSampleToState(s, stamp_ros, "LiDAR timeout hold",
+                                     this->consecutive_failures_,
+                                     false, false, true, true, false)) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                             "GT recovery: holding state on GT after %.3fs without LiDAR "
+                             "(last_lidar=%.3f gt=%.3f)",
+                             lidar_gap, last_lidar_stamp, s.stamp);
+      }
+    }
   }
 }
 
@@ -3381,6 +3448,111 @@ bool gicp_localization::LocalizationNode::tryRtkCalibrationStep(
   return true;
 }
 
+bool gicp_localization::LocalizationNode::applyGtSampleToState(
+    const GtSample& gt, const rclcpp::Time& stamp,
+    const char* reason, int failure_count,
+    bool pose_mutex_already_held,
+    bool publish_snap_marker,
+    bool update_gicp_anchor,
+    bool reset_failures,
+    bool log_snap) {
+  Eigen::Vector3f p_new;
+  Eigen::Quaternionf q_new;
+  if (!this->composeGtPoseInBase(gt, p_new, q_new)) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "GT recovery: composeGtPoseInBase returned false; deferring correction.");
+    return false;
+  }
+
+  Eigen::Vector3f v_base_body;
+  Eigen::Vector3f omega_base_body;
+  const bool twist_is_zero = gt.v_lin_body.norm() < 0.05f && gt.v_ang_body.norm() < 0.01f;
+  if (twist_is_zero) {
+    static bool warned_zero_twist = false;
+    if (!warned_zero_twist) {
+      warned_zero_twist = true;
+      RCLCPP_INFO(this->get_logger(),
+                  "GT recovery: incoming GT twist appears empty (lin=%.3f, ang=%.3f rad/s); "
+                  "correcting with zero velocity",
+                  gt.v_lin_body.norm(), gt.v_ang_body.norm());
+    }
+    v_base_body = Eigen::Vector3f::Zero();
+    omega_base_body = Eigen::Vector3f::Zero();
+  } else if (!this->composeGtTwistInBase(gt, v_base_body, omega_base_body)) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "GT recovery: composeGtTwistInBase returned false; deferring correction.");
+    return false;
+  }
+
+  const Eigen::Vector3f v_base_world = q_new * v_base_body;
+  const Eigen::Vector3f omega_base_world = q_new * omega_base_body;
+
+  auto write_state = [&]() {
+    this->current_pose.setIdentity();
+    this->current_pose.block<3, 3>(0, 0) = q_new.toRotationMatrix();
+    this->current_pose.block<3, 1>(0, 3) = p_new;
+    if (update_gicp_anchor) {
+      this->last_gicp_pose_ = this->current_pose;
+      this->last_gicp_stamp_ = stamp;
+      this->last_gicp_valid_ = true;
+    }
+    {
+      std::lock_guard<std::mutex> lock(this->geo.mtx);
+      this->state.p = p_new;
+      this->state.q = q_new;
+      this->state.v.lin.b = v_base_body;
+      this->state.v.lin.w = v_base_world;
+      this->state.v.ang.b = omega_base_body;
+      this->state.v.ang.w = omega_base_world;
+      // state.b.gyro and state.b.accel intentionally preserved.
+      this->geo.prev_p = p_new;
+      this->geo.prev_q = q_new;
+      this->geo.prev_vel = v_base_world;
+      ++this->geo.update_seq;  // discard any in-flight propagateState computations
+    }
+    this->basePose.p = p_new;
+    this->basePose.q = q_new;
+    this->prev_vel = v_base_world;
+  };
+
+  if (pose_mutex_already_held) {
+    write_state();
+  } else {
+    std::lock_guard<std::mutex> pose_lock(this->pose_mutex);
+    write_state();
+  }
+
+  if (log_snap) {
+    RCLCPP_WARN(this->get_logger(),
+                "Localization: snapped pose to GT (%s after %d consecutive non-accepts) - "
+                "pose=[%.2f,%.2f,%.2f] v=[%.2f,%.2f,%.2f]m/s omega=[%.2f,%.2f,%.2f]rad/s | gt_body=%s",
+                reason, failure_count,
+                p_new.x(), p_new.y(), p_new.z(),
+                v_base_world.x(), v_base_world.y(), v_base_world.z(),
+                omega_base_body.x(), omega_base_body.y(), omega_base_body.z(),
+                this->gt_body_frame_.c_str());
+  }
+
+  if (publish_snap_marker) {
+    geometry_msgs::msg::PoseStamped snap_msg;
+    snap_msg.header.stamp = stamp;
+    snap_msg.header.frame_id = this->map_frame;
+    snap_msg.pose.position.x = p_new.x();
+    snap_msg.pose.position.y = p_new.y();
+    snap_msg.pose.position.z = p_new.z();
+    snap_msg.pose.orientation.w = q_new.w();
+    snap_msg.pose.orientation.x = q_new.x();
+    snap_msg.pose.orientation.y = q_new.y();
+    snap_msg.pose.orientation.z = q_new.z();
+    if (this->gt_snap_pub) this->gt_snap_pub->publish(snap_msg);
+  }
+
+  if (reset_failures) {
+    this->consecutive_failures_ = 0;
+  }
+  return true;
+}
+
 bool gicp_localization::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
   // DIAGNOSTIC: prove helper is being called. Remove once snap behavior verified.
   RCLCPP_INFO(this->get_logger(),
@@ -3429,96 +3601,9 @@ bool gicp_localization::LocalizationNode::maybeSnapPoseToGT(const char* reason) 
     return false;
   }
 
-  // Pose composition: bring gt sample from gt_body_frame into base_frame.
-  // Shared with the diagnostic cross-check via composeGtPoseInBase.
-  Eigen::Vector3f p_new;
-  Eigen::Quaternionf q_new;
-  if (!this->composeGtPoseInBase(gt, p_new, q_new)) {
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                         "GT recovery: composeGtPoseInBase returned false "
-                         "(extrinsic not cached). Deferring snap.");
-    return false;
-  }
-
-  // Twist composition: GT twist is at gt_body. Move it to base via the lever-arm
-  // correction (mirrors callbackImu's centripetal-acceleration term).
-  // r_gtbody_to_base in gt_body frame:
-  const Eigen::Matrix3f R_base_gtbody = this->T_base_gtbody_.block<3, 3>(0, 0);
-  const Eigen::Vector3f t_base_gtbody = this->T_base_gtbody_.block<3, 1>(0, 3);
-  const Eigen::Matrix3f R_gtbody_base = R_base_gtbody.transpose();
-  const Eigen::Vector3f t_gtbody_base = -R_gtbody_base * t_base_gtbody;
-  Eigen::Vector3f v_base_body;
-  Eigen::Vector3f omega_base_body;
-  const bool twist_is_zero = gt.v_lin_body.norm() < 0.05f && gt.v_ang_body.norm() < 0.01f;
-  if (twist_is_zero) {
-    static bool warned_zero_twist = false;
-    if (!warned_zero_twist) {
-      warned_zero_twist = true;
-      RCLCPP_INFO(this->get_logger(),
-                  "GT recovery: incoming GT twist appears empty (lin=%.3f, ang=%.3f rad/s); "
-                  "snapping with zero velocity",
-                  gt.v_lin_body.norm(), gt.v_ang_body.norm());
-    }
-    v_base_body = Eigen::Vector3f::Zero();
-    omega_base_body = Eigen::Vector3f::Zero();
-  } else {
-    omega_base_body = R_gtbody_base * gt.v_ang_body;
-    v_base_body = R_gtbody_base * (gt.v_lin_body + gt.v_ang_body.cross(t_gtbody_base));
-  }
-  const Eigen::Vector3f v_base_world = q_new * v_base_body;
-  const Eigen::Vector3f omega_base_world = q_new * omega_base_body;
-
-  // Apply state. Caller (performLocalization) already holds pose_mutex (line 1768),
-  // so we MUST NOT re-acquire it here — std::mutex is non-recursive and that would
-  // deadlock the entire scan callback. geo.mtx, however, is taken in narrow scopes
-  // by performLocalization, never held across this call site, so locking it here
-  // is correct.
-  this->current_pose.setIdentity();
-  this->current_pose.block<3, 3>(0, 0) = q_new.toRotationMatrix();
-  this->current_pose.block<3, 1>(0, 3) = p_new;
-  {
-    std::lock_guard<std::mutex> lock(this->geo.mtx);
-    this->state.p = p_new;
-    this->state.q = q_new;
-    this->state.v.lin.b = v_base_body;
-    this->state.v.lin.w = v_base_world;
-    this->state.v.ang.b = omega_base_body;
-    this->state.v.ang.w = omega_base_world;
-    // state.b.gyro and state.b.accel intentionally preserved.
-    this->geo.prev_p = p_new;
-    this->geo.prev_q = q_new;
-    this->geo.prev_vel = v_base_world;
-    ++this->geo.update_seq;  // discard any in-flight propagateState computations
-  }
-  this->basePose.p = p_new;
-  this->basePose.q = q_new;
-  this->prev_vel = v_base_world;
-
-  RCLCPP_WARN(this->get_logger(),
-              "Localization: ⟳ snapped pose to GT (%s after %d consecutive non-accepts) — "
-              "pose=[%.2f,%.2f,%.2f] v=[%.2f,%.2f,%.2f]m/s ω=[%.2f,%.2f,%.2f]rad/s | gt_body=%s",
-              reason, this->consecutive_failures_,
-              p_new.x(), p_new.y(), p_new.z(),
-              v_base_world.x(), v_base_world.y(), v_base_world.z(),
-              omega_base_body.x(), omega_base_body.y(), omega_base_body.z(),
-              this->gt_body_frame_.c_str());
-
-  {
-    geometry_msgs::msg::PoseStamped snap_msg;
-    snap_msg.header.stamp = this->scan_stamp;
-    snap_msg.header.frame_id = this->map_frame;
-    snap_msg.pose.position.x = p_new.x();
-    snap_msg.pose.position.y = p_new.y();
-    snap_msg.pose.position.z = p_new.z();
-    snap_msg.pose.orientation.w = q_new.w();
-    snap_msg.pose.orientation.x = q_new.x();
-    snap_msg.pose.orientation.y = q_new.y();
-    snap_msg.pose.orientation.z = q_new.z();
-    if (this->gt_snap_pub) this->gt_snap_pub->publish(snap_msg);
-  }
-
-  this->consecutive_failures_ = 0;
-  return true;
+  return this->applyGtSampleToState(gt, this->scan_stamp, reason,
+                                    this->consecutive_failures_,
+                                    true, true, false, true, true);
 }
 
 void gicp_localization::LocalizationNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu) {

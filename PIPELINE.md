@@ -14,6 +14,13 @@ source /opt/ros/jazzy/setup.bash
 # Set once per workstation. Raw bags are not stored in this repository.
 cp dlio.env.example dlio.env
 ${EDITOR:-nano} dlio.env
+
+# Load local values for the manual snippets below.
+[ -f dlio.env ] && source dlio.env
+DATA="${DLIO_DATA_ROOT:-./dlio_data}"
+RUN="${DLIO_RUN:-run_5}"
+MAP_RUN="${DLIO_MAP_RUN:-$RUN}"
+RAW_BAG="${DLIO_RAW:-${DLIO_ROSBAG_ROOT:-../rosbags}/putnam/may_26/${RUN}/filtered/all}"
 ```
 
 ## Local config file
@@ -47,7 +54,7 @@ Before launching a long replay, validate the local config and paths:
 scripts/run_dlio_pipeline.sh --dry-run
 ```
 
-Paths below use these placeholders — substitute your own:
+Manual snippets below use these shell placeholders:
 
 | Placeholder | Example |
 |---|---|
@@ -55,6 +62,11 @@ Paths below use these placeholders — substitute your own:
 | `$RAW_BAG` | `${DLIO_ROSBAG_ROOT:-../rosbags}/putnam/may_26/run_5/filtered/all` |
 | `$DATA` | `./dlio_data` |
 | `$RUN` | `run_5` |
+
+Set them explicitly, or source `dlio.env` and derive them as shown above.
+Before running a copied manual snippet, `printf '%s\n' "$DATA" "$RUN"` should
+print non-empty values. If either is empty, paths such as
+`"$DATA/${RUN}_dump"` collapse to `/_dump`.
 
 Keep machine-specific storage paths out of git. Put them in
 `dlio.env`, which is ignored by git, or pass the same values through
@@ -124,7 +136,8 @@ it: the IMU is re-stamped onto its true uniform sampling grid (backward-min
 de-jitter), the pose stream is re-stamped exactly from the FusionEngine
 `p1_time` time-of-validity, the LLA pose becomes `nav_msgs/Odometry` in a
 fixed local-UTM frame, an RTK-FIXED-only copy is gated out for GLIM's GNSS
-factors, and the three Luminar topics pass through untouched.
+factors, and the three Luminar topics keep their scan stamps while their
+per-point `UINT8[8]` timestamps are repaired onto the same ROS/INS epoch.
 
 ```bash
 python3 -u scripts/prep_bag.py \
@@ -289,6 +302,16 @@ the current GICP-vs-GNSS error in meters. It writes live error samples to
 Do **not** rerun localization just to inspect the same result again. Once
 `live_error.csv` exists, use the cached RViz path instead:
 
+Validation-only replay overrides:
+
+- `DESKEW=true|false` switches `dlio/deskew` for Luminar timestamp tests.
+- `GT_RECOVERY_ENABLED=false` and `GT_REJECTION_ENABLED=false` disable the
+  GT recovery/rejection safety rails when measuring raw GICP deskew fitness.
+  Do not use those settings for production-quality localization metrics.
+- `BAG_PLAY_ARGS="--start-offset S --playback-duration D"` appends rosbag play
+  arguments for short regression windows; leave it unset for full pipeline
+  runs.
+
 ```bash
 scripts/show_cached_error_viz.sh \
     "$DATA/${RUN}_loc" \
@@ -413,5 +436,9 @@ Two latency rules worth knowing before re-tuning:
   initialized (see the prep-script RTK warning). The map is usable but only
   in its local frame: localization init/GT features and the UTM mirrors won't
   work.
+- **GLIM aborts while creating `/_dump`** — the manual snippet was run with
+  empty `DATA`/`RUN` shell placeholders. Source `dlio.env` and set
+  `DATA="${DLIO_DATA_ROOT:-./dlio_data}"` plus `RUN="${DLIO_RUN:-run_5}"`, or
+  run `scripts/run_dlio_pipeline.sh` so the wrapper derives paths itself.
 - **`ros2 pkg prefix glim_ros` points outside this repo** — re-source
   `install/setup.bash` after `/opt/ros/jazzy/setup.bash`.

@@ -19,8 +19,11 @@ DESKEW="${DESKEW:-false}"
 CROP_SIZE="${CROP_SIZE:-80.0}"
 SENSOR_TYPE="${SENSOR_TYPE:-luminar}"
 LIDAR_CONCAT_ENABLED="${LIDAR_CONCAT_ENABLED:-true}"
+GT_RECOVERY_ENABLED="${GT_RECOVERY_ENABLED:-true}"
+GT_REJECTION_ENABLED="${GT_REJECTION_ENABLED:-true}"
 VERBOSE="${VERBOSE:-false}"
 VERBOSE_SCAN_LOG="${VERBOSE_SCAN_LOG:-false}"
+BAG_PLAY_ARGS="${BAG_PLAY_ARGS:-}"
 
 missing_input() {
   local path="$1"
@@ -107,6 +110,8 @@ stdbuf -oL -eL ros2 launch gicp_localization localization_with_tf.launch.py \
     crop_size:="$CROP_SIZE" \
     sensor_type:="$SENSOR_TYPE" \
     lidar_concat_enabled:="$LIDAR_CONCAT_ENABLED" \
+    gt_recovery_enabled:="$GT_RECOVERY_ENABLED" \
+    gt_rejection_enabled:="$GT_REJECTION_ENABLED" \
     verbose:="$VERBOSE" \
     verbose_scan_log:="$VERBOSE_SCAN_LOG" > "$OUT/localization.log" 2>&1 &
 LOC_PID=$!
@@ -155,7 +160,9 @@ echo "[replay] localization node is up"
 sleep 3
 
 echo "[replay] playing bag (realtime, with /clock)"
-ros2 bag play "$BAG" --clock 100 > "$OUT/play.log" 2>&1 &
+# shellcheck disable=SC2206
+EXTRA_BAG_PLAY_ARGS=($BAG_PLAY_ARGS)
+ros2 bag play "$BAG" --clock 100 "${EXTRA_BAG_PLAY_ARGS[@]}" > "$OUT/play.log" 2>&1 &
 PLAY_PID=$!
 wait "$PLAY_PID"
 echo "[replay] bag finished; letting the pipeline drain"

@@ -12,8 +12,10 @@ native topics, which none of the pipeline configs subscribe to:
 
 This script writes a new rosbag2 (mcap) directory containing:
 
-    /luminar_front|left|right/points   passthrough by default; optionally shifted
-                                       by --lidar-time-offset
+    /luminar_front|left|right/points   header/log stamps optionally shifted by
+                                       --lidar-time-offset; Luminar UINT8[8]
+                                       per-point timestamps repaired onto the
+                                       same ROS/INS epoch by default
     /gps_p1/imu                        re-stamped IMU, frame_id "gps_antenna_top"
     /gps_p1/filtered_odom              nav_msgs/Odometry in the fixed "utm" frame
     /gps_p1/filtered_odom_rtk_fixed    same, gated to RTK-FIXED quality only
@@ -46,15 +48,18 @@ validity on the P1 monotonic clock), so stamps are rebuilt exactly as
 p1_time + OFF, where OFF is the lower envelope of (arrival - p1_time)
 (arrival can only be late, never early).
 
-LiDAR time alignment: LiDAR PointCloud2 header stamps are left unchanged by
-default and are treated as the scan reference time on the ROS/INS time axis.
-Luminar per-point UINT8[8] timestamps are expected to be full epoch
-nanoseconds, so GLIM/GICP can derive both the scan-relative deskew offsets
-and a sane absolute branch decision. The script prints a LiDAR-vs-odom timing
+LiDAR time alignment: LiDAR PointCloud2 header stamps are treated as the scan
+reference time on the ROS/INS time axis. Some Putnam bags already have header
+stamps on that axis while Luminar UINT8[8] per-point timestamps remain on the
+raw sensor/PTP clock; that makes GLIM overwrite the frame stamp with a sensor
+clock value and skip every scan as unsynchronized. By default this script
+repairs each Luminar cloud by adding header.stamp - min(point_time) to every
+point timestamp, preserving the scan span while making the point timestamps
+full ROS/INS epoch nanoseconds. The script prints a LiDAR-vs-odom timing
 report and writes time_alignment_report.txt. If an external calibration finds
 a fixed LiDAR-INS time delay, pass --lidar-time-offset SECONDS to add that
-offset to LiDAR PointCloud2 header.stamp and rosbag log_time; regenerate
-point-level timestamps upstream when changing the LiDAR time axis.
+offset to LiDAR PointCloud2 header.stamp and rosbag log_time; the point-level
+epoch repair is applied after the header shift.
 
 Run from a local ROS 2 Jazzy shell. Dependencies:
     pip install --user --break-system-packages mcap mcap-ros2-support pyproj numpy rosbags
@@ -88,8 +93,8 @@ except ImportError:
     sys.exit("missing python dep: pip install --user --break-system-packages pyproj")
 
 import rosbag2_py
-from rclpy.serialization import serialize_message
-from sensor_msgs.msg import Imu
+from rclpy.serialization import deserialize_message, serialize_message
+from sensor_msgs.msg import Imu, PointCloud2
 from nav_msgs.msg import Odometry
 
 LIDAR_TOPICS = ["/luminar_front/points", "/luminar_left/points", "/luminar_right/points"]
@@ -169,6 +174,10 @@ def stamp_to_sec(stamp):
     return stamp.sec + stamp.nanosec * 1e-9
 
 
+def stamp_to_ns(stamp):
+    return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+
+
 def set_stamp(stamp, t):
     stamp.sec, stamp.nanosec = to_ros_time(t)
 
@@ -237,6 +246,43 @@ def point_time_minmax(msg):
     }
 
 
+def point_count(msg):
+    return int(msg.width) * int(msg.height)
+
+
+def repair_luminar_point_timestamps(msg):
+    """Shift Luminar UINT8[8] point timestamps so min(point_time)=header.stamp."""
+    field = point_time_field(msg)
+    if field is None:
+        return False, 0, "missing point timestamp field"
+    if int(field.datatype) != PF_UINT8 or int(field.count) != 8:
+        return False, 0, f"unsupported point timestamp field datatype={field.datatype} count={field.count}"
+
+    n = point_count(msg)
+    if n == 0:
+        return False, 0, "empty point cloud"
+
+    point_step = int(msg.point_step)
+    offset = int(field.offset)
+    data = bytearray(msg.data)
+    min_ts = None
+    for i in range(n):
+        raw = struct.unpack_from("<Q", data, i * point_step + offset)[0]
+        min_ts = raw if min_ts is None else min(min_ts, raw)
+
+    shift_ns = stamp_to_ns(msg.header.stamp) - int(min_ts)
+    for i in range(n):
+        pos = i * point_step + offset
+        raw = struct.unpack_from("<Q", data, pos)[0]
+        shifted = int(raw) + shift_ns
+        if shifted < 0:
+            return False, shift_ns, "point timestamp repair would make a timestamp negative"
+        struct.pack_into("<Q", data, pos, shifted)
+
+    msg.data = bytes(data)
+    return True, shift_ns, ""
+
+
 def ms_summary(values):
     if not values:
         return "n=0"
@@ -244,6 +290,15 @@ def ms_summary(values):
     return (f"n={len(arr)} median={np.median(arr):.3f} ms "
             f"p95={np.percentile(arr, 95):.3f} ms "
             f"min={arr.min():.3f} ms max={arr.max():.3f} ms")
+
+
+def sec_summary(values):
+    if not values:
+        return "n=0"
+    arr = np.asarray(values, dtype=float)
+    return (f"n={len(arr)} median={np.median(arr):.6f} s "
+            f"min={arr.min():.6f} s max={arr.max():.6f} s "
+            f"range={(arr.max() - arr.min()):.6f} s")
 
 
 def signed_ms_summary(values):
@@ -274,6 +329,7 @@ def init_lidar_time_diagnostics(p1_to_ros, pose_pairs, samples_per_topic,
                 "header_min_point": [],
                 "header_dt": [],
                 "point_min_dt": [],
+                "point_epoch_shift": [],
                 "nearest_odom_start": [],
                 "nearest_odom_end": [],
                 "last_header": None,
@@ -285,7 +341,7 @@ def init_lidar_time_diagnostics(p1_to_ros, pose_pairs, samples_per_topic,
     }
 
 
-def update_lidar_time_diagnostics(diag, topic, msg, log_time_ns):
+def update_lidar_time_diagnostics(diag, topic, msg, log_time_ns, point_epoch_shift_ns=None):
     samples_per_topic = diag["samples_per_topic"]
     if samples_per_topic <= 0 or topic not in diag["topics"]:
         return
@@ -298,6 +354,8 @@ def update_lidar_time_diagnostics(diag, topic, msg, log_time_ns):
     log_t = log_time_ns * 1e-9
     st["samples"] += 1
     st["header_log"].append(log_t - header_t)
+    if point_epoch_shift_ns is not None:
+        st["point_epoch_shift"].append(point_epoch_shift_ns * 1e-9)
 
     if st["last_header"] is not None:
         st["header_dt"].append(header_t - st["last_header"])
@@ -359,6 +417,8 @@ def format_lidar_time_diagnostics(diag):
         if st["unsupported_time"]:
             lines.append(f"[prep_bag]     WARNING: {st['unsupported_time']} sampled clouds had an unsupported time field")
         lines.append(f"[prep_bag]     bag_log_time - header.stamp: {signed_ms_summary(st['header_log'])}")
+        if st["point_epoch_shift"]:
+            lines.append(f"[prep_bag]     applied point timestamp epoch repair: {sec_summary(st['point_epoch_shift'])}")
         lines.append(f"[prep_bag]     LiDAR header dt: {ms_summary(st['header_dt'])}")
         if st["scan_span"]:
             lines.append(f"[prep_bag]     LiDAR scan span from per-point time: {ms_summary(st['scan_span'])}")
@@ -442,7 +502,10 @@ def main():
     ap.add_argument("--lidar-time-offset", type=float, default=0.0,
                     help="Seconds added to /luminar_* PointCloud2 header.stamp and bag log_time. "
                          "Positive moves LiDAR later on the ROS/INS time axis. Point-level "
-                         "timestamps are left untouched.")
+                         "timestamps are repaired onto the shifted header epoch by default.")
+    ap.add_argument("--no-lidar-point-time-repair", action="store_true",
+                    help="Leave Luminar UINT8[8] point timestamps untouched. Only use this for "
+                         "bags whose point timestamps are already on the same epoch as header.stamp.")
     ap.add_argument("--lidar-time-check-samples", type=int, default=200,
                     help="Number of LiDAR clouds per topic to sample for the timing report; "
                          "set 0 to skip.")
@@ -500,7 +563,14 @@ def main():
     if args.utm_origin:
         utm_origin = tuple(float(v) for v in args.utm_origin.split(","))
     imu_idx = 0
-    counts = {"lidar": 0, "imu": 0, "odom": 0, "rtk": 0, "rtk_rejected": 0}
+    counts = {
+        "lidar": 0,
+        "lidar_point_repaired": 0,
+        "imu": 0,
+        "odom": 0,
+        "rtk": 0,
+        "rtk_rejected": 0,
+    }
     deg2rad_sq = (math.pi / 180.0) ** 2
     lidar_offset_ns = int(round(args.lidar_time_offset * 1e9))
 
@@ -520,28 +590,34 @@ def main():
                         and lidar_diag["topics"][topic]["samples"] < args.lidar_time_check_samples
                     )
                     lidar_msg = None
-                    if lidar_offset_ns != 0 or need_lidar_diag:
-                        decode = decoders.get(schema.id)
-                        if decode is None:
-                            decode = decoder_factory.decoder_for("cdr", schema)
-                            decoders[schema.id] = decode
-                        lidar_msg = decode(message.data)
+                    repair_point_time = not args.no_lidar_point_time_repair
+                    if lidar_offset_ns != 0 or need_lidar_diag or repair_point_time:
+                        lidar_msg = deserialize_message(message.data, PointCloud2)
 
-                    if lidar_offset_ns == 0:
+                    if lidar_offset_ns == 0 and not repair_point_time:
                         if need_lidar_diag:
                             update_lidar_time_diagnostics(lidar_diag, topic, lidar_msg, message.log_time)
                         # passthrough: mcap payload is already CDR — do NOT decode
                         writer.write(topic, message.data, message.log_time)
                     else:
-                        shifted_stamp = stamp_to_sec(lidar_msg.header.stamp) + args.lidar_time_offset
-                        if shifted_stamp < 0.0:
-                            sys.exit(f"LiDAR time offset shifts {topic} header.stamp negative")
-                        set_stamp(lidar_msg.header.stamp, shifted_stamp)
-                        shifted_log_time = message.log_time + lidar_offset_ns
-                        if shifted_log_time < 0:
-                            sys.exit(f"LiDAR time offset shifts {topic} bag log_time negative")
+                        shifted_log_time = message.log_time
+                        if lidar_offset_ns != 0:
+                            shifted_stamp = stamp_to_sec(lidar_msg.header.stamp) + args.lidar_time_offset
+                            if shifted_stamp < 0.0:
+                                sys.exit(f"LiDAR time offset shifts {topic} header.stamp negative")
+                            set_stamp(lidar_msg.header.stamp, shifted_stamp)
+                            shifted_log_time = message.log_time + lidar_offset_ns
+                            if shifted_log_time < 0:
+                                sys.exit(f"LiDAR time offset shifts {topic} bag log_time negative")
+                        point_epoch_shift_ns = None
+                        if repair_point_time:
+                            ok, point_epoch_shift_ns, reason = repair_luminar_point_timestamps(lidar_msg)
+                            if not ok:
+                                sys.exit(f"failed to repair {topic} point timestamps: {reason}")
+                            counts["lidar_point_repaired"] += 1
                         if need_lidar_diag:
-                            update_lidar_time_diagnostics(lidar_diag, topic, lidar_msg, shifted_log_time)
+                            update_lidar_time_diagnostics(
+                                lidar_diag, topic, lidar_msg, shifted_log_time, point_epoch_shift_ns)
                         writer.write(topic, serialize_message(lidar_msg), shifted_log_time)
                     counts["lidar"] += 1
                     continue
@@ -634,7 +710,8 @@ def main():
     for line in time_report_lines:
         print(line)
 
-    print(f"[prep_bag] done: {counts['lidar']} lidar, {counts['imu']} imu, "
+    print(f"[prep_bag] done: {counts['lidar']} lidar "
+          f"({counts['lidar_point_repaired']} point-time repaired), {counts['imu']} imu, "
           f"{counts['odom']} odom ({counts['rtk']} rtk-fixed, {counts['rtk_rejected']} rejected)")
     print(f"[prep_bag] output: {args.output}")
     if counts["rtk"] == 0:

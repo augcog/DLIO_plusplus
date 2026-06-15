@@ -74,7 +74,6 @@
     # solution, header.frame_id="map", child_frame_id="gps_antenna_top") and
     # reports gt_err=[trans,rot,dt] in every SCAN DEBUG line + publishes the
     # deltas on gicp/localization/debug/gt_pos_err_m and .../gt_rot_err_deg.
-    # Diagnostic only -- never feeds back into accept/reject decisions.
     #
     # Frame note: gt_odom's child_frame_id is gps_antenna_top, identical to
     # base_frame and imu_frame, so the cross-check ||cand_p - gt.p|| is exact
@@ -120,6 +119,21 @@
     # dead-reckoning behavior. Setting enable=true forces gt_odom/enable=true.
     localization/gt_recovery/enable: true
     localization/gt_recovery/min_consecutive_failures: 1
+    # If LiDAR messages stop before IMU/GT at the end of a replay, keep the
+    # IMU-rate state anchored to the latest post-RTK-gate GT sample instead of
+    # letting pure IMU propagation drift until rosbag playback ends.
+    localization/gt_recovery/hold_on_lidar_timeout: true
+    localization/gt_recovery/lidar_timeout_sec: 0.5
+
+    # GT divergence rejection. This gate is evaluated only when a time-matched,
+    # post-RTK-gate GT sample is available. It turns a geometrically "accepted"
+    # GICP result into a non-accept if the candidate has already separated from
+    # Atlas by more than the thresholds below, allowing GT recovery to snap back
+    # instead of letting a plausible-looking local minimum reset the failure
+    # streak. Set enable=false or both thresholds <=0 for diagnostic-only mode.
+    localization/gt_rejection/enable: true
+    localization/gt_rejection/max_pos_err_m: 5.0
+    localization/gt_rejection/max_rot_err_deg: 20.0
 
     # Initial pose taken directly from GLIM traj_lidar.txt first row.
     # robot_state_publisher (launched alongside this node from the URDF) provides
