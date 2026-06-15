@@ -15,6 +15,12 @@ if [ $# -lt 4 ]; then
   exit 1
 fi
 BAG="$1"; MAP="$2"; UTM="$3"; OUT="$4"; RVIZ="${5:-false}"
+DESKEW="${DESKEW:-false}"
+CROP_SIZE="${CROP_SIZE:-80.0}"
+SENSOR_TYPE="${SENSOR_TYPE:-luminar}"
+LIDAR_CONCAT_ENABLED="${LIDAR_CONCAT_ENABLED:-true}"
+VERBOSE="${VERBOSE:-false}"
+VERBOSE_SCAN_LOG="${VERBOSE_SCAN_LOG:-false}"
 
 missing_input() {
   local path="$1"
@@ -96,7 +102,13 @@ stdbuf -oL -eL ros2 launch gicp_localization localization_with_tf.launch.py \
     imu_topic:=/gps_p1/imu \
     gt_odom_topic:=/gps_p1/filtered_odom_map \
     map_path:="$MAP" \
-    utm_transform_path:="$UTM" > "$OUT/localization.log" 2>&1 &
+    utm_transform_path:="$UTM" \
+    deskew:="$DESKEW" \
+    crop_size:="$CROP_SIZE" \
+    sensor_type:="$SENSOR_TYPE" \
+    lidar_concat_enabled:="$LIDAR_CONCAT_ENABLED" \
+    verbose:="$VERBOSE" \
+    verbose_scan_log:="$VERBOSE_SCAN_LOG" > "$OUT/localization.log" 2>&1 &
 LOC_PID=$!
 
 echo "[replay] starting UTM->map GT bridge"

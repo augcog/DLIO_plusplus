@@ -73,6 +73,32 @@ PC2_FIELDS = [
     PointField(name="blockage_level",  offset=51, datatype=PointField.UINT8, count=1),
 ]
 POINT_STEP = 56
+TIME_FIELD_NAMES = ("t", "time", "time_stamp", "timestamp")
+
+
+def shift_luminar_point_timestamps(pc2, shift_ns):
+    if not shift_ns:
+        return
+    field = next(
+        (
+            f for f in pc2.fields
+            if f.name in TIME_FIELD_NAMES
+            and f.datatype == PointField.UINT8
+            and int(f.count) == 8
+        ),
+        None,
+    )
+    if field is None:
+        return
+
+    data = bytearray(pc2.data)
+    n = int(pc2.width) * int(pc2.height)
+    for i in range(n):
+        off = i * int(pc2.point_step) + int(field.offset)
+        raw = _s.unpack_from("<Q", data, off)[0]
+        shifted = max(0, int(raw) + int(shift_ns))
+        _s.pack_into("<Q", data, off, shifted)
+    pc2.data = bytes(data)
 
 # ------ MAIN MERGER OBJECTS -------#
 
@@ -532,6 +558,7 @@ class LidarPCAPMerger:
                         scan_unix_ns = int(last_time * 1e9)
                         self.ptp_to_ros_shift_ns = scan_unix_ns - scan_ptp_ns
 
+                shift_luminar_point_timestamps(pc2, self.ptp_to_ros_shift_ns)
                 t_out = scan_ptp_ns + self.ptp_to_ros_shift_ns
                 pc2.header.stamp.sec = t_out // 1_000_000_000
                 pc2.header.stamp.nanosec = t_out % 1_000_000_000
@@ -552,6 +579,7 @@ class LidarPCAPMerger:
             if self.ptp_to_ros_shift_ns is None:
                 self.ptp_to_ros_shift_ns = 0
 
+            shift_luminar_point_timestamps(pc2, self.ptp_to_ros_shift_ns)
             t_out = scan_ptp_ns + self.ptp_to_ros_shift_ns
 
             pc2.header.stamp.sec = t_out // 1_000_000_000

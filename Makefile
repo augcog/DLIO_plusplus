@@ -15,6 +15,7 @@ ROSDEP_SKIP_KEYS ?=
 LOCAL_DEPS_PREFIX ?= $(CURDIR)/.deps
 GTSAM_POINTS_PREFIX ?= /usr/local
 LOCAL_INSTALL_RPATH ?= $(GTSAM_POINTS_PREFIX)/lib;/usr/local/cuda-11.8/lib64
+PYTHON_DEPS    ?= mcap mcap-ros2-support pyproj numpy matplotlib rosbags
 
 BAG_ROOT        ?= /media/roar/data/rosbags/putnam/may_26
 DATA_ROOT       ?= ./dlio_data
@@ -146,6 +147,7 @@ help-vars:  ## Show common variables and current values
 	@printf "  %-20s  %s  (current: %s)\n" "CMAKE_ARGS"          "Extra args after --cmake-args"      "$(CMAKE_ARGS)"
 	@printf "  %-20s  %s  (current: %s)\n" "GTSAM_POINTS_PREFIX" "CUDA gtsam_points install prefix"  "$(GTSAM_POINTS_PREFIX)"
 	@printf "  %-20s  %s  (current: %s)\n" "LOCAL_INSTALL_RPATH" "RPATH for CUDA deps"               "$(LOCAL_INSTALL_RPATH)"
+	@printf "  %-20s  %s  (current: %s)\n" "PYTHON_DEPS"         "pip packages for tools"            "$(PYTHON_DEPS)"
 	@printf "  %-20s  %s  (current: %s)\n" "BAG_ROOT"            "Root containing run_3/run_5 bags"   "$(BAG_ROOT)"
 	@printf "  %-20s  %s  (current: %s)\n" "DATA_ROOT"           "Pipeline artifact directory"        "$(DATA_ROOT)"
 	@printf "  %-20s  %s  (current: %s)\n" "RUN"                 "Current logical run"                "$(RUN)"
@@ -210,7 +212,7 @@ install-deps: install-glim-apt  ## Install apt, GLIM, rosdep, and Python deps fo
 	rosdep update
 	$(call _source)
 	rosdep install --from-paths . --ignore-src -r -y --rosdistro $(ROS_DISTRO) $(ROSDEP_SKIP_ARG)
-	python3 -m pip install --user --break-system-packages mcap mcap-ros2-support pyproj numpy matplotlib
+	python3 -m pip install --user --break-system-packages $(PYTHON_DEPS)
 
 install-glim-apt:  ## Install required GLIM apt deps from Koide PPAs (Iridescence/GTSAM)
 	sudo apt-get update

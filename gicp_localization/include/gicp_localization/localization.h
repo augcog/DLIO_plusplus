@@ -34,6 +34,7 @@
 #include <atomic>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 namespace gicp_localization {
@@ -73,6 +74,7 @@ private:
   bool loadMap();
 
   void callbackPointCloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& pc);
+  void processPointCloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& pc);
   void callbackInitialPose(const geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr& pose);
   void callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu);
   void callbackGtOdom(const nav_msgs::msg::Odometry::ConstSharedPtr msg);
@@ -113,13 +115,16 @@ private:
   bool loadUTMTransform(const std::string& path);
 
   // Multi-LiDAR concatenation: pushes incoming aux scans into per-sensor ring
-  // buffers, then `mergeAuxClouds` (called from the primary callback) finds
-  // the nearest aux scan per sensor, transforms its XYZ into the primary
-  // sensor frame, rebases per-point timestamps onto the primary clock, and
-  // appends the bytes to a copy of the primary PointCloud2.
+  // buffers, optionally delays primary Luminar scans until aux buffers cover
+  // the primary capture time, then `mergeAuxClouds` finds the nearest aux scan
+  // per sensor, transforms its XYZ into the primary sensor frame, preserves
+  // absolute Luminar timestamps, and appends the bytes to a copy of the primary
+  // PointCloud2.
   void callbackAuxPointCloud(int aux_index, sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
   sensor_msgs::msg::PointCloud2::ConstSharedPtr mergeAuxClouds(
       const sensor_msgs::msg::PointCloud2::ConstSharedPtr& primary);
+  void drainDelayedPrimaryClouds();
+  bool delayedPrimaryReady(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& primary);
 
   // Geometric Observer functions
   void propagateState();
@@ -191,6 +196,10 @@ private:
   bool concat_enabled_;
   double concat_time_threshold_;
   size_t concat_buffer_size_;
+  bool concat_delay_primary_until_aux_;
+  std::deque<sensor_msgs::msg::PointCloud2::ConstSharedPtr> delayed_primary_buffer_;
+  mutable std::mutex delayed_primary_mtx_;
+  std::mutex pointcloud_process_mtx_;
 
   // Publishers
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub;

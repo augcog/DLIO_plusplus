@@ -129,9 +129,9 @@ Headline dependencies (per-package READMEs go deeper):
 
 - GTSAM 4.2, gtsam_points (GPU factors), Iridescence, Eigen3, PCL, OpenMP, nlohmann::json, spdlog
 - Optional: CUDA 11.8+ (GPU acceleration), OpenCV
-- Python bag/pipeline tools: `mcap`, `mcap-ros2-support`, `pyproj`, `numpy`, and `matplotlib`.
+- Python bag/pipeline tools: `mcap`, `mcap-ros2-support`, `pyproj`, `numpy`, `matplotlib`, and `rosbags`.
   `make install-deps` installs them with:
-  `python3 -m pip install --user --break-system-packages mcap mcap-ros2-support pyproj numpy matplotlib`
+  `python3 -m pip install --user --break-system-packages mcap mcap-ros2-support pyproj numpy matplotlib rosbags`
 
 If `ros2 pkg prefix glim` does not point inside this workspace's `install/`, an apt-installed `ros-jazzy-glim-*` package is being picked up instead of this fork — re-source `install/setup.bash` **after** `/opt/ros/jazzy/setup.bash`. The same caveat applies to `gicp_localization` if a sibling workspace is also sourced.
 
@@ -186,10 +186,10 @@ Upstream GLIM publishes `glim`, `glim_ext`, and `glim_ros2` as three sibling rep
 
 **Sensor / preprocessing**
 
-- **Multi-LiDAR concatenation (`lidar_concat`).** New module in `glim_ros2` (`include/glim_ros/lidar_concat.hpp`) that subscribes to N aux LiDAR topics, time-aligns each scan to the primary clock, transforms aux points into the primary frame via URDF, **rebases per-point timestamps** so the concatenated cloud has a single monotonic time base, and emits a single merged cloud to the rest of the pipeline. Includes a validation step that **rolls back the aux-merge append** if the merged cloud fails sanity checks, instead of letting a malformed cloud poison odometry (commit `52f88cb`).
+- **Multi-LiDAR concatenation (`lidar_concat`).** New module in `glim_ros2` (`include/glim_ros/lidar_concat.hpp`) that subscribes to N aux LiDAR topics, time-aligns each scan to the primary clock, transforms aux points into the primary frame via URDF, preserves Luminar `UINT8[8]` absolute epoch timestamps, and emits a single merged cloud to the rest of the pipeline. Includes a validation step that **rolls back the aux-merge append** if the merged cloud fails sanity checks, instead of letting a malformed cloud poison odometry (commit `52f88cb`).
 - **URDF-based extrinsic resolution.** Sensor extrinsics (`T_lidar_imu`, inter-LiDAR transforms, IMU↔GNSS) are read from a runtime URDF instead of hand-edited JSON. The relevant configs (`config_sensors.json`) reference *URDF link names*; the loader walks the URDF at startup. Removes the previous hard-coded URDF path.
 - **`flip_points_y` preprocessing** flag (`config_sensors.json` → `glim_ros.cpp`) for mirrored-installed LiDARs.
-- **Per-point timestamp rebasing fix** when merging multi-LiDAR clouds (commit `7f5a6d9`). Without this the merged cloud had a non-monotonic stamp field that broke deskewing.
+- **Per-point timestamp preservation fix** when merging multi-LiDAR Luminar clouds. `UINT8[8]` fields are absolute epoch nanoseconds, so aux clouds keep their native per-ray epochs instead of being shifted onto the primary header time.
 
 **Mapping / odometry**
 
@@ -217,7 +217,7 @@ Upstream GLIM publishes `glim`, `glim_ext`, and `glim_ros2` as three sibling rep
 **Scan-to-map vs. scan-to-submap**
 
 - **Single pre-built PCD map.** No submap stitching at runtime — the map is loaded once and never grows. Trades adaptability for a small, predictable working set.
-- **Multi-LiDAR concatenation** (mirrors the GLIM-side feature). Subscribes to N aux LiDARs, transforms via URDF, concatenates onto the primary cloud's clock.
+- **Multi-LiDAR concatenation** (mirrors the GLIM-side feature). Subscribes to N aux LiDARs, transforms via URDF, and preserves absolute Luminar per-point epochs in the merged cloud.
 
 **Robustness against degenerate geometry**
 

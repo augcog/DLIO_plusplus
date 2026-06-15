@@ -188,9 +188,13 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
     uint8_t time_datatype;
     int time_count;
     if (find_time_field(*match, time_off, time_datatype, time_count)) {
-      double dt = stamp_to_sec(match->header.stamp) - t_primary;
-      shift_cloud_timestamps(data, point_step, time_off, time_datatype, time_count, dt);
-      spdlog::debug("lidar_concat: shifted timestamps for {} by {:.6f}s", aux.topic, dt);
+      if (time_datatype == sensor_msgs::msg::PointField::UINT8 && time_count == 8) {
+        spdlog::debug("lidar_concat: keeping absolute UINT8[8] timestamps for {}", aux.topic);
+      } else {
+        double dt = stamp_to_sec(match->header.stamp) - t_primary;
+        shift_cloud_timestamps(data, point_step, time_off, time_datatype, time_count, dt);
+        spdlog::debug("lidar_concat: shifted timestamps for {} by {:.6f}s", aux.topic, dt);
+      }
     }
 
     merged->data.insert(merged->data.end(), data.begin(), data.end());

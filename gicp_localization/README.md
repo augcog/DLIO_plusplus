@@ -6,7 +6,7 @@ GICP scan-to-map localization with IMU dead-reckoning and optional ground-truth-
 
 - **GICP scan-to-map matching** against a single pre-built PCD map (no submap stitching at runtime).
 - **IMU + LiDAR pipeline**: IMU integrates a motion prior between scans; GICP refines; a geometric observer fuses the two and propagates pose at IMU rate (~100 Hz).
-- **Multi-LiDAR concatenation** (`lidar_concat`): subscribes to N aux LiDARs, time-aligns to the primary, transforms via URDF, and concatenates per-point timestamps onto the primary clock.
+- **Multi-LiDAR concatenation** (`lidar_concat`): subscribes to N aux LiDARs, time-aligns to the primary, transforms via URDF, and preserves Luminar `UINT8[8]` absolute epoch timestamps in the merged cloud.
 - **Layered rejection gates**:
   - Hard fitness reject (`gicp/fitnessRejectThreshold`)
   - Combined geometric-degeneracy gate (`hessianCondMax` AND any of `fitness`/`trans`/`rot` warn floors) — catches optimizer slides on feature-poor corners
@@ -153,7 +153,7 @@ When `gt_recovery/enable=true`, the node caches the `base_frame ← child_frame_
 ### IMU + observer
 
 ```yaml
-dlio/deskew: false                 # Luminar timestamps are collapsed → deskew has no effect
+dlio/deskew: false                 # Conservative default; enable for validated Luminar deskew runs
 dlio/imu/bufferSize: 2000
 dlio/imu/calibTime: 0.5            # initial stationary calibration window
 

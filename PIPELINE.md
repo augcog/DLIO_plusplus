@@ -173,12 +173,12 @@ running and what to change for other conditions):
 - **Deskewing is ON** (`config_sensors.json` → `global_shutter_lidar:
   false`). The Luminar per-point timestamps are valid; never set this back
   to true for moving platforms.
-- **`lidar_concat` is OFF for mapping** (`config_sensors.json`): the three
-  Luminars' clock-to-ROS mapping constants differ by up to ~100 ms, which
-  the concat time-rebasing doesn't model — with deskewing active that would
-  smear the aux points at speed. The front lidar alone sweeps the whole
-  track over a lap. (Localization has its own concat setting and doesn't use
-  point times, so it stays on there.)
+- **`lidar_concat` is OFF for mapping** (`config_sensors.json`): keep the
+  single-front-LiDAR map path as the conservative production default until
+  the Luminar timestamp validation checklist has been run for the exact
+  driver/pcap build. When concat is enabled with Luminar `UINT8[8]` fields,
+  aux clouds keep their absolute per-ray epoch timestamps; they are not
+  shifted onto the primary header time.
 - GNSS anchoring: every submap gets an RTK position prior
   (`glim_ext/config/config_gnss_global.json`, `prior_inf_scale` 1e6/1e6/1e5).
 - To watch the map grow, re-add `"libstandard_viewer.so"` to

@@ -48,16 +48,16 @@ p1_time + OFF, where OFF is the lower envelope of (arrival - p1_time)
 
 LiDAR time alignment: LiDAR PointCloud2 header stamps are left unchanged by
 default and are treated as the scan reference time on the ROS/INS time axis.
-Per-point Luminar timestamps are not used as an absolute INS-time source here;
-they are only checked as an intra-scan clock (timestamp_i - min_timestamp).
-The script prints a LiDAR-vs-odom timing report and writes
-time_alignment_report.txt. If an external calibration finds a fixed LiDAR-INS
-time delay, pass --lidar-time-offset SECONDS to add that offset to LiDAR
-PointCloud2 header.stamp and rosbag log_time. Point-level timestamps are left
-untouched because GLIM uses them only through their per-scan relative offsets.
+Luminar per-point UINT8[8] timestamps are expected to be full epoch
+nanoseconds, so GLIM/GICP can derive both the scan-relative deskew offsets
+and a sane absolute branch decision. The script prints a LiDAR-vs-odom timing
+report and writes time_alignment_report.txt. If an external calibration finds
+a fixed LiDAR-INS time delay, pass --lidar-time-offset SECONDS to add that
+offset to LiDAR PointCloud2 header.stamp and rosbag log_time; regenerate
+point-level timestamps upstream when changing the LiDAR time axis.
 
 Run from a local ROS 2 Jazzy shell. Dependencies:
-    pip install --user --break-system-packages mcap mcap-ros2-support pyproj numpy
+    pip install --user --break-system-packages mcap mcap-ros2-support pyproj numpy rosbags
 
 Usage:
     python3 scripts/prep_bag.py \

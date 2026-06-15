@@ -137,10 +137,11 @@
     localization/initial_pose/yaw: 2.711203   # radians (-0.289 deg)
 
     # Preprocessing Parameters (override defaults for localization)
-    # Crop box filter: keeps points within ±size meters of sensor origin (sensor frame).
-    # NOTE: when dlio/deskew=true, preprocessing runs after deskewing in world frame,
-    # so this crop box acts on world-frame coords. Disable or set very large if using deskew.
-    dlio/preprocessing/cropBoxFilter/size: 80.0  # metres; 160m cube around sensor (sensor frame when deskew=false)
+    # Crop box filter: keeps points within ±size meters of the LiDAR-frame
+    # scan origin. With dlio/deskew=true the cloud is compensated into the
+    # median-time reference LiDAR frame before preprocessing, so the crop still
+    # acts in a local sensor frame.
+    dlio/preprocessing/cropBoxFilter/size: 80.0  # metres; 160m cube around sensor
     dlio/preprocessing/voxelFilter/use: true    # Enabled for full-map localization to reduce correspondence ambiguity
     dlio/preprocessing/voxelFilter/res: 0.75  # keeps the merged 3-lidar scan small enough for <50ms GICP on the full-track map
 
@@ -151,14 +152,18 @@
     # Multi-LiDAR concatenation (mirrors GLIM's lidar_concat). When enabled, the node
     # subscribes to each aux topic, buffers the latest scans, and on every primary
     # scan finds the nearest aux scan in time, transforms its XYZ into the primary
-    # sensor frame via TF (URDF), rebases per-point timestamps onto the primary clock,
-    # and appends the bytes to the primary PointCloud2. Downstream steps see a single
-    # cloud in primary frame with one coherent timebase.
+    # sensor frame via TF (URDF), preserves Luminar UINT8[8] absolute epoch
+    # timestamps, and appends the bytes to the primary PointCloud2. The optional
+    # primary delay waits for aux per-point timestamp coverage, but is kept off
+    # by default because the AV-24 validation bag's async side sensors can widen
+    # the effective sweep enough to hurt GICP fitness.
+    # Downstream steps see a single cloud in primary frame with one coherent timebase.
     localization/lidar_concat/enabled: true
-    localization/lidar_concat/aux_topics: ["/luminar_right/points", "/luminar_left/points"]  
+    localization/lidar_concat/aux_topics: ["/luminar_right/points", "/luminar_left/points"]
     localization/lidar_concat/aux_frames: ["luminar_right", "luminar_left"]
     localization/lidar_concat/time_threshold: 0.05  # seconds; aux scans further than this from primary are dropped
     localization/lidar_concat/buffer_size: 20       # per-aux ring buffer depth
+    localization/lidar_concat/delay_primary_until_aux: false
 
     # LiDAR sensor type for per-point timestamp handling during deskewing
     # Options: ouster, velodyne, hesai, livox, luminar
@@ -168,10 +173,9 @@
     # NOTE: Luminar per-point timestamps are NOT collapsed (verified on the
     # may_26 putnam bags: uint64 ns stamps spanning the full 49 ms scan,
     # ~16k unique values per scan). Deskew stays off here as the conservative
-    # default because the node's deskew path moves preprocessing into the
-    # world frame (see the cropBoxFilter note above — the crop box must be
-    # disabled/enlarged before enabling deskew). At 20 m/s an undeskewed scan
-    # smears ~1 m; consider enabling deskew for high-speed runs.
+    # production default until each deployment has run the validation checklist
+    # against its exact driver/bag path. At 20 m/s an undeskewed scan smears
+    # ~1 m; enable deskew for validated high-speed runs.
     dlio/deskew: false
     dlio/gravity: 9.81  # Gravity magnitude (m/s^2)
     dlio/imu/bufferSize: 2000  # IMU buffer size

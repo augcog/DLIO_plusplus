@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
@@ -39,6 +41,32 @@ using glim_ros::AuxLidarSensor;
 using glim_ros::IrisLidarConfig;
 using glim_ros::IrisPcapConfig;
 using glim_ros::IrisPcapReader;
+
+void shift_luminar_point_timestamps(sensor_msgs::msg::PointCloud2& cloud, int64_t shift_ns) {
+  if (shift_ns == 0) {
+    return;
+  }
+
+  const auto field_it = std::find_if(cloud.fields.begin(), cloud.fields.end(), [](const auto& f) {
+    return (f.name == "t" || f.name == "time" || f.name == "time_stamp" || f.name == "timestamp") &&
+           f.datatype == sensor_msgs::msg::PointField::UINT8 && f.count == 8;
+  });
+  if (field_it == cloud.fields.end()) {
+    return;
+  }
+
+  const size_t n = static_cast<size_t>(cloud.width) * static_cast<size_t>(cloud.height);
+  const size_t off = field_it->offset;
+  const size_t step = cloud.point_step;
+  for (size_t i = 0; i < n; i++) {
+    uint8_t* ptr = cloud.data.data() + i * step + off;
+    uint64_t raw = 0;
+    std::memcpy(&raw, ptr, sizeof(raw));
+    const int64_t shifted = std::max<int64_t>(0, static_cast<int64_t>(raw) + shift_ns);
+    const uint64_t out = static_cast<uint64_t>(shifted);
+    std::memcpy(ptr, &out, sizeof(out));
+  }
+}
 
 IrisPcapConfig load_pcap_config_from_json(const glim::Config& cfg) {
   IrisPcapConfig out;
@@ -290,6 +318,7 @@ int main(int argc, char** argv) {
                    ptp_to_ros_shift_ns, s.wall_clock_first_packet_ns,
                    s.wall_clock_last_packet_ns, scan_ptp_ns);
     }
+    shift_luminar_point_timestamps(*s.cloud, ptp_to_ros_shift_ns);
     int64_t out_ns = static_cast<int64_t>(s.t_ns) + ptp_to_ros_shift_ns;
     if (out_ns < 0) out_ns = 0;
     s.t_ns = static_cast<uint64_t>(out_ns);

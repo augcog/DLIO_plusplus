@@ -42,6 +42,12 @@ def generate_launch_description():
     gt_odom_topic = LaunchConfiguration('gt_odom_topic', default='/gps_p1/filtered_odom_map')
     imu_only = LaunchConfiguration('imu_only', default='false')
     publish_tf = LaunchConfiguration('publish_tf', default='false')
+    deskew = LaunchConfiguration('deskew', default='false')
+    crop_size = LaunchConfiguration('crop_size', default='80.0')
+    sensor_type = LaunchConfiguration('sensor_type', default='luminar')
+    lidar_concat_enabled = LaunchConfiguration('lidar_concat_enabled', default='true')
+    verbose = LaunchConfiguration('verbose', default='false')
+    verbose_scan_log = LaunchConfiguration('verbose_scan_log', default='false')
     urdf_path = LaunchConfiguration(
         'urdf_path',
         default='')
@@ -79,6 +85,24 @@ def generate_launch_description():
     declare_publish_tf_arg = DeclareLaunchArgument(
         'publish_tf', default_value=publish_tf,
         description='If true, publish map -> base_frame TF. Useful for RViz views/displays.')
+    declare_deskew_arg = DeclareLaunchArgument(
+        'deskew', default_value=deskew,
+        description='Override dlio/deskew for validation replays.')
+    declare_crop_size_arg = DeclareLaunchArgument(
+        'crop_size', default_value=crop_size,
+        description='Override dlio/preprocessing/cropBoxFilter/size. Use >=1000 to skip crop.')
+    declare_sensor_type_arg = DeclareLaunchArgument(
+        'sensor_type', default_value=sensor_type,
+        description='Override localization/sensor_type for timestamp handling.')
+    declare_lidar_concat_enabled_arg = DeclareLaunchArgument(
+        'lidar_concat_enabled', default_value=lidar_concat_enabled,
+        description='Override localization/lidar_concat/enabled.')
+    declare_verbose_arg = DeclareLaunchArgument(
+        'verbose', default_value=verbose,
+        description='Override localization/verbose.')
+    declare_verbose_scan_log_arg = DeclareLaunchArgument(
+        'verbose_scan_log', default_value=verbose_scan_log,
+        description='Override localization/debug/verbose_scan_log.')
     declare_urdf_path_arg = DeclareLaunchArgument(
         'urdf_path', default_value=urdf_path,
         description='Absolute path to the vehicle URDF used by robot_state_publisher '
@@ -140,6 +164,12 @@ def generate_launch_description():
             {'localization/lidar_frame': child_frame_value},
             {'localization/imu_only': LaunchConfiguration('imu_only')},
             {'localization/publish_tf': LaunchConfiguration('publish_tf')},
+            {'dlio/deskew': LaunchConfiguration('deskew')},
+            {'dlio/preprocessing/cropBoxFilter/size': LaunchConfiguration('crop_size')},
+            {'localization/sensor_type': LaunchConfiguration('sensor_type')},
+            {'localization/lidar_concat/enabled': LaunchConfiguration('lidar_concat_enabled')},
+            {'localization/verbose': LaunchConfiguration('verbose')},
+            {'localization/debug/verbose_scan_log': LaunchConfiguration('verbose_scan_log')},
         ]
         if map_path_value:
             params.append({'localization/map_path': map_path_value})
@@ -202,6 +232,12 @@ def generate_launch_description():
         declare_gt_odom_topic_arg,
         declare_imu_only_arg,
         declare_publish_tf_arg,
+        declare_deskew_arg,
+        declare_crop_size_arg,
+        declare_sensor_type_arg,
+        declare_lidar_concat_enabled_arg,
+        declare_verbose_arg,
+        declare_verbose_scan_log_arg,
         declare_urdf_path_arg,
         declare_parent_frame_arg,
         declare_child_frame_arg,
