@@ -48,6 +48,7 @@ def generate_launch_description():
     lidar_concat_enabled = LaunchConfiguration('lidar_concat_enabled', default='true')
     gt_recovery_enabled = LaunchConfiguration('gt_recovery_enabled', default='true')
     gt_rejection_enabled = LaunchConfiguration('gt_rejection_enabled', default='true')
+    gt_veto_enabled = LaunchConfiguration('gt_veto_enabled', default='true')
     verbose = LaunchConfiguration('verbose', default='false')
     verbose_scan_log = LaunchConfiguration('verbose_scan_log', default='false')
     urdf_path = LaunchConfiguration(
@@ -105,6 +106,9 @@ def generate_launch_description():
     declare_gt_rejection_enabled_arg = DeclareLaunchArgument(
         'gt_rejection_enabled', default_value=gt_rejection_enabled,
         description='Override localization/gt_rejection/enable.')
+    declare_gt_veto_enabled_arg = DeclareLaunchArgument(
+        'gt_veto_enabled', default_value=gt_veto_enabled,
+        description='Override localization/gt_veto/enable.')
     declare_verbose_arg = DeclareLaunchArgument(
         'verbose', default_value=verbose,
         description='Override localization/verbose.')
@@ -178,6 +182,7 @@ def generate_launch_description():
             {'localization/lidar_concat/enabled': LaunchConfiguration('lidar_concat_enabled')},
             {'localization/gt_recovery/enable': LaunchConfiguration('gt_recovery_enabled')},
             {'localization/gt_rejection/enable': LaunchConfiguration('gt_rejection_enabled')},
+            {'localization/gt_veto/enable': LaunchConfiguration('gt_veto_enabled')},
             {'localization/verbose': LaunchConfiguration('verbose')},
             {'localization/debug/verbose_scan_log': LaunchConfiguration('verbose_scan_log')},
         ]
@@ -248,6 +253,7 @@ def generate_launch_description():
         declare_lidar_concat_enabled_arg,
         declare_gt_recovery_enabled_arg,
         declare_gt_rejection_enabled_arg,
+        declare_gt_veto_enabled_arg,
         declare_verbose_arg,
         declare_verbose_scan_log_arg,
         declare_urdf_path_arg,

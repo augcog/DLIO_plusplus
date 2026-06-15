@@ -77,19 +77,39 @@ class UtmToMapOdom(Node):
         self.declare_parameter("utm_transform_path", "")
         self.declare_parameter("input_topic", "/gps_p1/filtered_odom")
         self.declare_parameter("output_topic", "/gps_p1/filtered_odom_map")
+        # Synthetic RTK denial: inside the given windows (seconds relative to
+        # the first received message stamp) the position covariance is inflated
+        # so the localizer's rtk_gate rejects the samples — emulating Atlas
+        # reporting degraded solution quality while positions stay RTK-true.
+        # Format: "95:135,445:495". Empty = disabled.
+        self.declare_parameter("deny_windows", "")
+        self.declare_parameter("deny_cov_xy", 4.0)   # m^2 (gate is 0.25)
+        self.declare_parameter("deny_cov_z", 16.0)   # m^2 (gate is 1.0)
         path = self.get_parameter("utm_transform_path").value
         if not path:
             raise RuntimeError("utm_transform_path parameter is required")
         T = load_t_world_utm(path)
         self.R = T[:3, :3]
         self.t = T[:3, 3]
+        self.deny = []
+        spec = self.get_parameter("deny_windows").value
+        if spec:
+            for w in spec.split(","):
+                a, b = w.split(":")
+                self.deny.append((float(a), float(b)))
+        self.deny_cov_xy = self.get_parameter("deny_cov_xy").value
+        self.deny_cov_z = self.get_parameter("deny_cov_z").value
+        self.first_stamp = None
+        self.deny_state = False
         in_topic = self.get_parameter("input_topic").value
         out_topic = self.get_parameter("output_topic").value
         self.pub = self.create_publisher(Odometry, out_topic, 50)
         self.sub = self.create_subscription(Odometry, in_topic, self.cb, 50)
         self.get_logger().info(
             f"republishing {in_topic} (utm) -> {out_topic} (map); "
-            f"T_world_utm t=[{self.t[0]:.2f} {self.t[1]:.2f} {self.t[2]:.2f}]")
+            f"T_world_utm t=[{self.t[0]:.2f} {self.t[1]:.2f} {self.t[2]:.2f}]"
+            + (f"; SYNTHETIC RTK DENIAL windows={self.deny} cov_xy={self.deny_cov_xy}"
+               if self.deny else ""))
 
     def cb(self, msg):
         out = Odometry()
@@ -110,6 +130,20 @@ class UtmToMapOdom(Node):
         cov = np.array(msg.pose.covariance).reshape(6, 6)
         cov[:3, :3] = self.R @ cov[:3, :3] @ self.R.T
         cov[3:, 3:] = self.R @ cov[3:, 3:] @ self.R.T
+        if self.deny:
+            stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+            if self.first_stamp is None:
+                self.first_stamp = stamp
+            tr = stamp - self.first_stamp
+            denied = any(a <= tr <= b for a, b in self.deny)
+            if denied:
+                cov[0, :3] = cov[1, :3] = cov[2, :3] = 0.0
+                cov[0, 0] = cov[1, 1] = self.deny_cov_xy
+                cov[2, 2] = self.deny_cov_z
+            if denied != self.deny_state:
+                self.deny_state = denied
+                self.get_logger().warn(
+                    f"SYNTHETIC RTK DENIAL {'ENTER' if denied else 'EXIT'} at t={tr:.1f}s (stamp {stamp:.3f})")
         out.pose.covariance = cov.flatten().tolist()
         out.twist = msg.twist  # body-frame twist is frame-invariant here
         self.pub.publish(out)

@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Fast DDS profile for the AV-24 large-message LiDAR streams.
+
+  Problem this fixes: the Luminar point clouds are ~3 MB/msg at 20 Hz. ROS 2's
+  default datareader socket receive buffer is net.core.rmem_default (208 KB on
+  this box), which holds only ~3 of a scan's ~47 UDP fragments — so a single
+  microburst overflows the socket and the WHOLE scan is lost. An independent
+  `ros2 topic hz` probe measured /luminar_front/points arriving at ~2.6 Hz of
+  20 Hz (whole-scan loss), which is the dominant cause of the "scan starvation"
+  gaps seen in the fusion-timeline analyses.
+
+  Why NOT FASTDDS_BUILTIN_TRANSPORTS=LARGE_DATA: that env switches the builtin
+  transports to SHM+TCP, and on this box (Fast DDS 2.14.6) it breaks endpoint
+  discovery — the localization node comes up but its topics never become
+  discoverable, so the replay readiness gate hangs forever. This profile keeps
+  UDPv4 (multicast discovery intact) and only enlarges the socket buffers.
+
+  Buffers request 64 MB; the kernel silently clamps each socket to
+  net.core.rmem_max / wmem_max. So for the FULL benefit also raise those on the
+  HOST (needs root, one-time):
+      sudo sysctl -w net.core.rmem_max=134217728 net.core.wmem_max=134217728
+      # persist: echo -e "net.core.rmem_max=134217728\nnet.core.wmem_max=134217728" \
+      #            | sudo tee /etc/sysctl.d/10-fastdds-largedata.conf
+  With the stock rmem_max=4 MB the buffer still holds one full scan, which
+  already eliminates the whole-scan loss; raising rmem_max adds headroom for
+  bursts under heavy subscriber load.
+
+  Activate by exporting before launching any node:
+      export FASTRTPS_DEFAULT_PROFILES_FILE=<repo>/gicp_localization/config/fastdds_largedata.xml
+  (run_localization_replay.sh does this automatically.)
+-->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <profiles>
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>large_udp</transport_id>
+        <type>UDPv4</type>
+        <!-- requested SO_SNDBUF / SO_RCVBUF; kernel clamps to w/rmem_max -->
+        <sendBufferSize>67108864</sendBufferSize>
+        <receiveBufferSize>67108864</receiveBufferSize>
+        <maxMessageSize>65500</maxMessageSize>
+      </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="largedata_default" is_default_profile="true">
+      <rtps>
+        <userTransports>
+          <transport_id>large_udp</transport_id>
+        </userTransports>
+        <!-- false = use ONLY the big-buffer UDPv4 above (no SHM/builtin).
+             UDPv4 multicast discovery still works, unlike LARGE_DATA mode. -->
+        <useBuiltinTransports>false</useBuiltinTransports>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>

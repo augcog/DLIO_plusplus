@@ -246,7 +246,8 @@ Verified current GICP path:
   registration, and GICP uses the IMU prior as the `map <- lidar` initial guess.
 
 Pure-GICP high-speed 95-second comparison
-(`GT_RECOVERY_ENABLED=false`, `GT_REJECTION_ENABLED=false`):
+(`GT_RECOVERY_ENABLED=false`, `GT_REJECTION_ENABLED=false`,
+`GT_VETO_ENABLED=false`):
 
 | Metric | Deskew off | Deskew on |
 |---|---:|---:|
@@ -379,14 +380,14 @@ scripts/validate_luminar_timestamps.py "$DATA/run_5_prepped" \
 Pure-GICP deskew ablation:
 
 ```bash
-GT_RECOVERY_ENABLED=false GT_REJECTION_ENABLED=false \
+GT_RECOVERY_ENABLED=false GT_REJECTION_ENABLED=false GT_VETO_ENABLED=false \
   DESKEW=false CROP_SIZE=1001.0 SENSOR_TYPE=luminar LIDAR_CONCAT_ENABLED=false \
   scripts/run_localization_replay.sh \
   dlio_data/luminar_timestamp_validation/run5_corrected_highspeed_95s \
   dlio_data/run_5_map.pcd dlio_data/run_5_dump/T_world_utm.txt \
   "$DATA/gicp_highspeed_off" false
 
-GT_RECOVERY_ENABLED=false GT_REJECTION_ENABLED=false \
+GT_RECOVERY_ENABLED=false GT_REJECTION_ENABLED=false GT_VETO_ENABLED=false \
   DESKEW=true CROP_SIZE=1001.0 SENSOR_TYPE=luminar LIDAR_CONCAT_ENABLED=false \
   scripts/run_localization_replay.sh \
   dlio_data/luminar_timestamp_validation/run5_corrected_highspeed_95s \

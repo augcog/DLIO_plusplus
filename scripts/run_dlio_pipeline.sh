@@ -255,6 +255,21 @@ fi
 source_if_exists "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash"
 source_if_exists "$REPO/install/setup.bash"
 
+prepend_ld_library_path_if_dir() {
+  local dir="$1"
+  [ -d "$dir" ] || return 0
+  case ":${LD_LIBRARY_PATH:-}:" in
+    *":$dir:"*) ;;
+    *) export LD_LIBRARY_PATH="$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+  esac
+}
+
+# Local gtsam_points/CUDA installs on this machine live under /usr/local.
+# When the linker cache is stale, ros2-run'd GLIM binaries can fail to find
+# libgtsam_points_cuda.so.1 unless these paths are visible explicitly.
+prepend_ld_library_path_if_dir "/usr/local/lib"
+prepend_ld_library_path_if_dir "/usr/local/cuda/targets/x86_64-linux/lib"
+
 command -v ros2 >/dev/null 2>&1 || { echo "ros2 not found; source your ROS environment first" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "python3 not found" >&2; exit 1; }
 
@@ -353,6 +368,13 @@ if [ -n "$RAW" ]; then
     "${UTM_ORIGIN_ARGS[@]}"
 else
   echo "[pipeline] step 1/4: using existing prepped bag"
+fi
+
+METADATA_YAML="$PREPPED/metadata.yaml"
+if [ ! -s "$METADATA_YAML" ]; then
+  echo "[pipeline] ERROR: prep output metadata is missing or empty: $METADATA_YAML" >&2
+  echo "[pipeline]        The prepared bag is incomplete. Common cause: output disk ran out of space." >&2
+  exit 1
 fi
 
 if [ "$FULL_PIPELINE" = "true" ]; then

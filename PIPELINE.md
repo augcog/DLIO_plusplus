@@ -305,9 +305,10 @@ Do **not** rerun localization just to inspect the same result again. Once
 Validation-only replay overrides:
 
 - `DESKEW=true|false` switches `dlio/deskew` for Luminar timestamp tests.
-- `GT_RECOVERY_ENABLED=false` and `GT_REJECTION_ENABLED=false` disable the
-  GT recovery/rejection safety rails when measuring raw GICP deskew fitness.
-  Do not use those settings for production-quality localization metrics.
+- `GT_RECOVERY_ENABLED=false`, `GT_REJECTION_ENABLED=false`, and
+  `GT_VETO_ENABLED=false` disable the GT recovery/rejection/veto safety rails
+  when measuring raw GICP deskew fitness. Do not use those settings for
+  production-quality localization metrics.
 - `BAG_PLAY_ARGS="--start-offset S --playback-duration D"` appends rosbag play
   arguments for short regression windows; leave it unset for full pipeline
   runs.
