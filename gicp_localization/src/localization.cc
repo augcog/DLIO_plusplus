@@ -143,6 +143,48 @@ bool findXYZOffsets(const sensor_msgs::msg::PointCloud2& msg, int& x_off, int& y
   return x_off >= 0 && y_off >= 0 && z_off >= 0;
 }
 
+// Full point-field schema comparison, used to decide whether an auxiliary cloud
+// can be byte-appended onto the primary cloud. mergeAuxClouds() transforms aux
+// points using the AUX cloud's own field offsets, but the MERGED cloud keeps the
+// PRIMARY's `fields`, so every downstream reader interprets the appended aux
+// bytes with the primary layout. Appending is therefore only safe when the aux
+// layout is byte-identical to the primary: same point_step, same endianness, and
+// the same ordered set of field {name, offset, datatype, count}. A same-point_step
+// cloud with different offsets/datatypes would otherwise be silently misread.
+// This is O(#fields) (~10-20 per Luminar scan) — negligible next to GICP / voxel
+// filtering / deskew, which run in ms. Returns true on match; on mismatch returns
+// false and sets `reason` to a short human-readable description for logging.
+bool auxSchemaMatchesPrimary(const sensor_msgs::msg::PointCloud2& aux,
+                             const sensor_msgs::msg::PointCloud2& primary,
+                             std::string& reason) {
+  if (aux.point_step != primary.point_step) {
+    reason = "point_step " + std::to_string(aux.point_step) + " vs primary " +
+             std::to_string(primary.point_step);
+    return false;
+  }
+  if (aux.is_bigendian != primary.is_bigendian) {
+    reason = "endianness differs (aux is_bigendian=" + std::to_string(aux.is_bigendian) + ")";
+    return false;
+  }
+  if (aux.fields.size() != primary.fields.size()) {
+    reason = "field count " + std::to_string(aux.fields.size()) + " vs primary " +
+             std::to_string(primary.fields.size());
+    return false;
+  }
+  for (size_t i = 0; i < primary.fields.size(); ++i) {
+    const auto& a = aux.fields[i];
+    const auto& p = primary.fields[i];
+    if (a.name != p.name || a.offset != p.offset || a.datatype != p.datatype || a.count != p.count) {
+      reason = "field[" + std::to_string(i) + "] '" + a.name + "' (offset=" + std::to_string(a.offset) +
+               ",datatype=" + std::to_string(a.datatype) + ",count=" + std::to_string(a.count) +
+               ") differs from primary '" + p.name + "' (offset=" + std::to_string(p.offset) +
+               ",datatype=" + std::to_string(p.datatype) + ",count=" + std::to_string(p.count) + ")";
+      return false;
+    }
+  }
+  return true;
+}
+
 // Apply rigid transform to xyz of `num_points` points starting at `data` (in place).
 // Pointer-based variant — operates on a span within a larger buffer so callers
 // can write aux scans directly into the merged cloud's data without an
@@ -604,15 +646,50 @@ void logLuminarTimestampStats(size_t num_points, const pcl::PointCloud<PointType
   std::fflush(stderr);
 }
 
-// Shift per-point timestamps by `dt` seconds. Relative-time LiDAR formats need
-// this when aux scans are appended to a primary cloud. Luminar UINT8[8] fields
-// are absolute epoch nanoseconds and are intentionally not shifted by callers.
+// Shift per-point timestamps by `dt` seconds to rebase an aux scan's per-point
+// times from its own header.stamp onto the merged cloud's primary header.stamp.
+//
+// Whether to actually shift depends on the underlying encoding:
+//   * SCAN-RELATIVE encodings (FLOAT32/FLOAT64 seconds-since-scan-start,
+//     UINT32 nanoseconds-since-scan-start) -> ADD dt so the value reads as
+//     "seconds since primary scan start".
+//   * ABSOLUTE-EPOCH encodings (Luminar Iris uint64 PTP epoch ns) -> DO NOT
+//     shift. The downstream deskewer subtracts the merged cloud's
+//     header.stamp to get a scan-relative offset, which already gives the
+//     right (T_aux - T_primary + intra-aux-offset) when the value is left
+//     at its absolute capture time. Shifting an absolute time by dt would
+//     double-count the inter-scan offset and corrupt deskew.
+//
+// Luminar timestamp format (Luminar Iris Data Output Specification v1.3.0):
+//   - The sensor does NOT emit a single uint64 epoch-ns field. It carries
+//     48-bit integer epoch SECONDS once per packet header (§2.1, "PTP
+//     Timestamp - seconds", UQ48.0) and a 32-bit SUB-SECOND NANOSECOND
+//     count per ray (§2.2 / §2.6.3, "PTP Timestamp - nanoseconds", UQ32.0)
+//     that wraps every 1 s. All fields are little-endian (§2).
+//   - The uint64 epoch-ns this code reads is the upstream ROS driver's
+//     reconstruction = header_seconds*1e9 + ray_nanoseconds. Correctness
+//     depends on the driver performing that combination; a driver that
+//     forwarded the bare 32-bit ns (sub-second sawtooth) would break deskew
+//     across each 1 s rollover. Verify against the actual Luminar driver,
+//     not the datasheet. (The "epoch time" guidance lives in the PTP
+//     sections of the Product Information Guide, not the data layout.)
+//
+// `luminar_uint64=true` forces the 8 bytes at the time field to be read as
+// uint64 regardless of declared datatype, because Luminar publishes the raw
+// uint64 bits even when the field is mislabelled FLOAT64; generic FP
+// arithmetic on those bits would scramble them.
 void shiftCloudTimestamps(uint8_t* data, size_t num_points, uint32_t point_step,
                           int time_off, uint8_t time_datatype, int time_count,
                           double dt, bool luminar_uint64) {
   if (time_off < 0) return;
 
+  // Absolute-epoch path (Luminar Iris UINT8[8]): leave the per-point values
+  // untouched. Each point already carries its absolute capture time; the
+  // deskewer's t_i - merged_header.stamp computation in preprocessPointCloud
+  // produces the correct intra-scan offset for both primary and aux points
+  // without any rebasing here.
   if (luminar_uint64) {
+    (void)dt;
     return;
   }
 
@@ -642,13 +719,12 @@ void shiftCloudTimestamps(uint8_t* data, size_t num_points, uint32_t point_step,
         break;
       }
       case sensor_msgs::msg::PointField::UINT8: {
-        if (time_count == 8) {
-          uint64_t val;
-          std::memcpy(&val, time_ptr, sizeof(uint64_t));
-          const int64_t shifted = static_cast<int64_t>(val) + static_cast<int64_t>(dt * 1e9);
-          val = static_cast<uint64_t>(std::max<int64_t>(0, shifted));
-          std::memcpy(time_ptr, &val, sizeof(uint64_t));
-        }
+        // UINT8 count=8 == Luminar Iris uint64 PTP epoch nanoseconds
+        // (driver reconstruction of header seconds + per-ray nanoseconds;
+        // see this function's header comment block for the format and the
+        // deskew-correctness argument). Values are absolute capture times --
+        // leave them untouched. For any other UINT8 count (e.g. raw byte
+        // runs that are not timestamps), there is nothing sensible to shift.
         break;
       }
       default:
@@ -1397,6 +1473,23 @@ void gicp_localization::LocalizationNode::getParams() {
   this->get_parameter("odom/geo/abias_max", this->geo_abias_max_);
   this->get_parameter("odom/geo/gbias_max", this->geo_gbias_max_);
 
+  // Observer-correction stability bounds (P2#1).
+  this->declare_parameter<double>("odom/geo/observer_dt_max", 0.15);
+  this->declare_parameter<double>("odom/geo/max_pos_correction", 0.0);
+  this->declare_parameter<double>("odom/geo/max_vel_correction", 0.0);
+  this->get_parameter("odom/geo/observer_dt_max", this->geo_observer_dt_max_);
+  this->get_parameter("odom/geo/max_pos_correction", this->geo_max_pos_correction_);
+  this->get_parameter("odom/geo/max_vel_correction", this->geo_max_vel_correction_);
+  if (this->geo_observer_dt_max_ <= 0.0) {
+    this->geo_observer_dt_max_ = 0.15;  // guard against a non-positive cap disabling all corrections
+  }
+
+  // Time/speed-based dead-reckoning covariance growth (P3).
+  this->declare_parameter<double>("odom/geo/dr_cov_time_rate", 0.5);
+  this->declare_parameter<double>("odom/geo/dr_cov_dist_frac", 0.05);
+  this->get_parameter("odom/geo/dr_cov_time_rate", this->dr_cov_time_rate_);
+  this->get_parameter("odom/geo/dr_cov_dist_frac", this->dr_cov_dist_frac_);
+
   // Debug parameters
   this->declare_parameter<bool>("localization/debug/enable_pub", true);
   this->declare_parameter<bool>("localization/debug/enable_jump_log", true);
@@ -1412,6 +1505,13 @@ void gicp_localization::LocalizationNode::getParams() {
   this->get_parameter("localization/debug/nano_gicp_lm_debug", this->debug_lm_print_);
   this->get_parameter("localization/debug/jump_trans_m", this->debug_jump_trans_m_);
   this->get_parameter("localization/debug/jump_rot_deg", this->debug_jump_rot_deg_);
+
+  // Speed/scan_dt-aware jump-gate scaling (P2#2). 0 reproduces the fixed thresholds.
+  this->declare_parameter<double>("localization/jump/trans_speed_scale", 1.5);
+  this->declare_parameter<double>("localization/jump/rot_dt_scale_deg", 60.0);
+  this->get_parameter("localization/jump/trans_speed_scale", this->jump_trans_speed_scale_);
+  this->get_parameter("localization/jump/rot_dt_scale_deg", this->jump_rot_dt_scale_deg_);
+
   this->get_parameter("localization/verbose", this->verbose_);
 
   // Suppress INFO/DEBUG logs when verbose is off; WARN/ERROR still pass through.
@@ -2185,10 +2285,16 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
                    match ? best_dt : -1.0);
       continue;
     }
-    if (match->point_step != point_step) {
+    // Validate the FULL field schema, not just point_step: the merged cloud
+    // keeps the primary's `fields`, so an aux scan with the same point_step but
+    // different field offsets/datatypes would be silently misread downstream.
+    std::string schema_reason;
+    if (!auxSchemaMatchesPrimary(*match, *primary, schema_reason)) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                           "lidar_concat: skipping '%s' — point_step mismatch (%u vs primary %u)",
-                           aux.topic.c_str(), match->point_step, point_step);
+                           "lidar_concat: skipping '%s' — PointCloud2 schema mismatch vs primary: %s. "
+                           "(Merged cloud uses the primary field layout; appending mismatched aux bytes "
+                           "would misread them. Normalize the aux layout upstream to enable concatenation.)",
+                           aux.topic.c_str(), schema_reason.c_str());
       continue;
     }
 
@@ -2315,10 +2421,14 @@ void gicp_localization::LocalizationNode::deskewPointcloud() {
     extract_point_time_from_point = [](const PointType& pt) { return pt.timestamp * 1e-9; };
     deskew_time_ready = true;
   } else if (this->sensor == dlio::SensorType::LUMINAR) {
-    // Luminar UINT8[8] timestamps are validated as absolute epoch
-    // nanoseconds. GICP deskew only needs intra-scan offsets; subtracting the
-    // scan minimum keeps the absolute epoch from leaking into the IMU query
-    // while preserving the point timing span required by the validation plan.
+    // Per-point value is absolute PTP epoch ns (driver reconstruction of the
+    // packet-header 48-bit seconds + per-ray 32-bit sub-second nanoseconds;
+    // see Luminar Iris Data Output Specification v1.3.0 §2.1 and §2.2/§2.6.3).
+    // We deskew on the relative offset (ts - min_ts) anchored at the header
+    // stamp, so the absolute epoch reference cancels. NOTE: this relies on the
+    // driver supplying full epoch ns; a bare 32-bit ns field (sub-second, wraps
+    // every 1 s) would make (ts - min_ts) jump across a second boundary and
+    // corrupt deskew for scans that straddle the rollover.
     uint64_t min_ts = std::numeric_limits<uint64_t>::max();
     uint64_t max_ts = 0;
     for (const auto& pt : this->original_scan->points) {
@@ -2618,8 +2728,25 @@ void gicp_localization::LocalizationNode::performLocalization() {
     jump_trans = deltaTranslationNorm(this->T_prior, candidate_pose);
     jump_rot_deg = rotationDistanceDeg(this->T_prior, candidate_pose);
   }
+  // Speed/scan_dt-aware jump thresholds (P2#2). The jump is GICP-vs-IMU-prior, so
+  // the legitimate disagreement scales with how far the prior could have drifted:
+  // ~speed*scan_dt for translation and ~scan_dt for rotation (scan_dt here is the
+  // time since the last accepted pose, so it grows during a failure streak). This
+  // loosens the gate after a gap / at high speed so a valid reacquisition is not
+  // rejected, while keeping it tight for slow, short-gap scans. Setting the scales
+  // to 0 reproduces the fixed thresholds.
+  float speed_est = 0.0f;
+  {
+    std::lock_guard<std::mutex> geo_lock(this->geo.mtx);
+    speed_est = this->state.v.lin.w.norm();
+  }
+  const double scan_dt_clamped = std::min(std::max(scan_dt, 0.0), 1.0);
+  const double eff_jump_trans_m = this->debug_jump_trans_m_ +
+      this->jump_trans_speed_scale_ * static_cast<double>(speed_est) * scan_dt_clamped;
+  const double eff_jump_rot_deg = this->debug_jump_rot_deg_ +
+      this->jump_rot_dt_scale_deg_ * scan_dt_clamped;
   const bool large_jump = candidate_pose_valid &&
-                          (jump_trans > this->debug_jump_trans_m_ || jump_rot_deg > this->debug_jump_rot_deg_);
+                          (jump_trans > eff_jump_trans_m || jump_rot_deg > eff_jump_rot_deg);
 
   // Ground-truth divergence cross-check (optional). Compares the scan's accepted-or-candidate
   // pose to a time-matched ground-truth odom sample. Only computes; does NOT influence
@@ -2629,7 +2756,11 @@ void gicp_localization::LocalizationNode::performLocalization() {
   double gt_dt = 0.0;
   if (this->gt_odom_enabled_ && this->gt_odom_received_.load() && candidate_pose_valid) {
     GtSample gt;
-    if (this->getGtPoseAt(this->scan_stamp.seconds(), gt)) {
+    // Cross-check is a CM-LEVEL DIAGNOSTIC -- only meaningful against
+    // RTK-FIXED-quality Atlas samples. Snap-recovery and IMU dead-reckoning
+    // do NOT participate in this gate; they accept Atlas dead-reckoning
+    // quality as the next-best truth.
+    if (this->getGtPoseAt(this->scan_stamp.seconds(), gt) && this->gtSampleIsRtkFixed(gt)) {
       const Eigen::Vector3f cand_p = candidate_pose.block<3, 1>(0, 3);
       const Eigen::Quaternionf cand_q(Eigen::Matrix3f(candidate_pose.block<3, 3>(0, 0)));
       // Bring the GT sample from msg.child_frame_id (gt_body) into base_frame
@@ -2879,8 +3010,10 @@ void gicp_localization::LocalizationNode::performLocalization() {
                 build_scan_debug_log("rejected_hessian").c_str());
   } else if (gicp_rejected_jump) {
     RCLCPP_WARN(this->get_logger(),
-                "GICP REJECTED (jump dT=%.3fm dR=%.2fdeg): %s",
-                jump_trans, jump_rot_deg, build_scan_debug_log("rejected_jump").c_str());
+                "GICP REJECTED (jump dT=%.3fm dR=%.2fdeg > eff thresholds [%.2fm, %.2fdeg] @ speed=%.1fm/s scan_dt=%.3fs): %s",
+                jump_trans, jump_rot_deg, eff_jump_trans_m, eff_jump_rot_deg,
+                static_cast<double>(speed_est), scan_dt_clamped,
+                build_scan_debug_log("rejected_jump").c_str());
   } else if (gicp_rejected_gt) {
     RCLCPP_WARN(this->get_logger(),
                 "GICP REJECTED (GT divergence pos=%.3fm rot=%.2fdeg exceeds %.3fm/%.2fdeg): %s",
@@ -2974,6 +3107,9 @@ void gicp_localization::LocalizationNode::performLocalization() {
     // Reset consecutive-failure counter on any accepted scan so the GT-recovery
     // trigger only fires on sustained losing streaks.
     this->consecutive_failures_ = 0;
+    // Mark this as the last known-good fix; the dead-reckoning covariance growth
+    // (P3) measures elapsed time from here.
+    this->last_accepted_scan_stamp_ = this->scan_stamp.seconds();
 
     // Log pose and correction
     Eigen::Vector3f t_corr = optimizer_solution.block<3, 1>(0, 3);
@@ -3117,39 +3253,20 @@ void gicp_localization::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Od
   s.v_ang_body = Eigen::Vector3f(msg->twist.twist.angular.x,
                                  msg->twist.twist.angular.y,
                                  msg->twist.twist.angular.z);
-
-  // RTK quality gate (P1-native): inspect Atlas-reported pose covariance on
-  // the gt_odom message itself. Drops the entire sample -- no buffer push,
-  // no initial-pose seed, no snap, no cross-check. Runs BEFORE TF caching so
-  // a degraded GNSS sample can't even seed the cache state. Disabled gate is
-  // a pass-through.
-  //
-  // pose.covariance is laid out as a row-major 6x6 (x,y,z,roll,pitch,yaw):
-  //   [0]=cov_xx  [7]=cov_yy  [14]=cov_zz  (position variances in m^2)
-  // Reject if any horizontal variance exceeds max_pose_var_xy OR vertical
-  // variance exceeds max_pose_var_z. Atlas keeps these in the ~5e-5 m^2 band
-  // when RTK-fixed and orders of magnitude higher when degraded.
-  if (this->rtk_gate_enabled_) {
-    const double cov_xx = msg->pose.covariance[0];
-    const double cov_yy = msg->pose.covariance[7];
-    const double cov_zz = msg->pose.covariance[14];
-    const bool xy_bad = (cov_xx > this->rtk_gate_max_pose_var_xy_) ||
-                        (cov_yy > this->rtk_gate_max_pose_var_xy_);
-    const bool z_bad  = (cov_zz > this->rtk_gate_max_pose_var_z_);
-    if (xy_bad || z_bad) {
-      this->rtk_rejected_covariance_++;
-      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                           "RTK gate: dropping gt_odom -- pose covariance "
-                           "exceeds threshold "
-                           "(cov_xx=%.4g cov_yy=%.4g cov_zz=%.4g; "
-                           "max_xy=%.4g max_z=%.4g). Rejected total=%lu.",
-                           cov_xx, cov_yy, cov_zz,
-                           this->rtk_gate_max_pose_var_xy_,
-                           this->rtk_gate_max_pose_var_z_,
-                           this->rtk_rejected_covariance_.load());
-      return;
-    }
-  }
+  // Carry Atlas-reported position covariance per-sample. The RTK quality
+  // gate is no longer applied here -- every sample is pushed into the buffer
+  // regardless of FIXED/FLOAT/dead-reckoning state. The gate now runs at
+  // the CONSUMER side:
+  //   * tryRtkCalibrationStep (init/calibration)  -> require FIXED
+  //   * scan cross-check (gt_pos_err diagnostic)  -> require FIXED
+  //   * maybeSnapPoseToGT (recovery from GICP failure) -> accept ANY sample
+  // Rationale: Atlas's onboard INS already does coupled GNSS+IMU dead-
+  // reckoning with calibrated sensors during RTK loss. When GICP fails to
+  // match the LiDAR scan, the next-best truth is Atlas's pose at whatever
+  // quality it currently has -- not our own software IMU dead-reckoning.
+  s.cov_pos_xx = msg->pose.covariance[0];
+  s.cov_pos_yy = msg->pose.covariance[7];
+  s.cov_pos_zz = msg->pose.covariance[14];
 
   // Cache base_frame ← gt_body_frame TF on the first message (mirrors the IMU
   // extrinsic caching pattern in callbackImu). Required before the snap helper
@@ -3277,6 +3394,15 @@ void gicp_localization::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Od
   }
 }
 
+bool gicp_localization::LocalizationNode::gtSampleIsRtkFixed(const GtSample& s) const {
+  // When the gate is disabled, treat every sample as FIXED -- the operator
+  // has explicitly opted into "trust whatever the upstream publishes".
+  if (!this->rtk_gate_enabled_) return true;
+  return (s.cov_pos_xx <= this->rtk_gate_max_pose_var_xy_) &&
+         (s.cov_pos_yy <= this->rtk_gate_max_pose_var_xy_) &&
+         (s.cov_pos_zz <= this->rtk_gate_max_pose_var_z_);
+}
+
 bool gicp_localization::LocalizationNode::getGtPoseAt(double stamp, GtSample& out) {
   std::lock_guard<std::mutex> lock(this->gt_odom_mtx_);
   if (this->gt_odom_buffer_.size() < 2) {
@@ -3313,6 +3439,15 @@ bool gicp_localization::LocalizationNode::getGtPoseAt(double stamp, GtSample& ou
   out.q = a->q.slerp(u, b->q).normalized();
   out.v_lin_body = (1.0f - u) * a->v_lin_body + u * b->v_lin_body;
   out.v_ang_body = (1.0f - u) * a->v_ang_body + u * b->v_ang_body;
+  // Covariance is not linearly interpolated: carry the conservative (larger)
+  // variance of the two bracketing samples so an interpolated pose can only
+  // pass the RTK gate when BOTH neighbours were RTK-FIXED. Without this the
+  // cov fields would keep their defaults and the gate could mis-classify the
+  // sample. (Endpoint/single-sample branches above copy a real sample whole,
+  // so their covariance is already valid.)
+  out.cov_pos_xx = std::max(a->cov_pos_xx, b->cov_pos_xx);
+  out.cov_pos_yy = std::max(a->cov_pos_yy, b->cov_pos_yy);
+  out.cov_pos_zz = std::max(a->cov_pos_zz, b->cov_pos_zz);
   return true;
 }
 
@@ -3364,7 +3499,11 @@ bool gicp_localization::LocalizationNode::tryRtkCalibrationStep(
     double stamp, const Eigen::Vector3f& measured_gyro,
     const Eigen::Vector3f& measured_accel) {
   GtSample gt;
-  if (!this->getGtPoseAt(stamp, gt)) {
+  // RTK-driven IMU bias calibration needs CM-LEVEL truth -- only consume
+  // RTK-FIXED samples. If only dead-reckoned Atlas poses are available the
+  // init machine will time out (rtk_init/fallback_timeout) and drop into
+  // stationary calibration.
+  if (!this->getGtPoseAt(stamp, gt) || !this->gtSampleIsRtkFixed(gt)) {
     // GT not yet available at this IMU stamp (e.g., IMU briefly ahead of buffer).
     // Don't error — just skip this sample.
     return false;
@@ -3782,8 +3921,26 @@ void gicp_localization::LocalizationNode::callbackImu(const sensor_msgs::msg::Im
   //   RTK_CALIBRATING         — first GT arrived; accumulating IMU residuals against GT truth
   //   STATIONARY_CALIBRATING  — fallback (no GT in time, or RTK init disabled)
   //   DONE                    — biases applied; propagate normally
+  // ----- Initialization / IMU-bias calibration (seed-and-go) -----
+  // Localization output must never stop. We DECOUPLE output from bias
+  // calibration: as soon as a usable state seed exists (initialized with a
+  // pose/orientation from GT odom-init, a param initial pose, or the first
+  // GICP scan), we fall through to propagateState() below and publish
+  // continuously, using the most stable information available at the time.
+  // Bias calibration (RTK-driven or stationary) then runs in the BACKGROUND
+  // and applies its refined bias as a smooth correction when it completes --
+  // no output gap. We suppress output (early return) ONLY while there is
+  // genuinely nothing to propagate from yet, i.e. before any seed exists; in
+  // that unseeded window the original WAITING -> RTK/STATIONARY fallback logic
+  // still applies so we reach a first fix as fast as possible.
   if (!this->imu_calibrated_) {
     InitPhase phase = this->init_phase_.load();
+
+    // True once we have something stable to propagate from. Mirrors the
+    // propagateState() gate below so that "fall through" always yields output.
+    const bool can_propagate_now =
+        this->initialized.load() &&
+        (this->geo.first_opt_done.load() || this->imu_only_mode_);
 
     if (phase == InitPhase::WAITING) {
       if (this->gt_odom_received_.load()) {
@@ -3803,23 +3960,47 @@ void gicp_localization::LocalizationNode::callbackImu(const sensor_msgs::msg::Im
         this->imu_calib_start_stamp_ = stamp;  // reset so the existing window starts now
         phase = InitPhase::STATIONARY_CALIBRATING;
       } else {
-        // Keep waiting. Don't propagate.
         RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
                              "RTK init: waiting for first GT odom (elapsed=%.1f/%.1fs)",
                              stamp - this->first_imu_stamp_, this->rtk_fallback_timeout_sec_);
-        return;
+        // Seed-and-go: only block output if we have no seed yet. With a param
+        // seed we dead-reckon here until GT arrives instead of going dark.
+        if (!can_propagate_now) return;
       }
     }
 
     if (phase == InitPhase::RTK_CALIBRATING) {
+      // Accumulate an RTK-driven bias estimate in the background. It only
+      // completes on RTK-FIXED pairings; with degraded-only Atlas odom it
+      // never finishes -- but that is now BENIGN, because once a seed exists
+      // we keep propagating below rather than stalling, and a later FIXED
+      // sample still completes the calibration opportunistically. We only
+      // force a stationary fallback while still UNSEEDED (output dark), so a
+      // usable estimate is reached promptly in that case (the P1 stall fix).
+      if (!can_propagate_now) {
+        const double rtk_elapsed = stamp - this->rtk_calib_start_stamp_;
+        const double rtk_phase_budget =
+            this->rtk_calib_window_sec_ + this->rtk_fallback_timeout_sec_;
+        if (rtk_elapsed > rtk_phase_budget) {
+          RCLCPP_WARN(this->get_logger(),
+                      "RTK init: %.1fs in RTK_CALIBRATING with no seed and no usable "
+                      "RTK-FIXED GT pairing; falling back to stationary IMU calibration",
+                      rtk_elapsed);
+          this->init_phase_ = InitPhase::STATIONARY_CALIBRATING;
+          this->imu_calib_start_stamp_ = stamp;  // restart window in the stationary path
+          return;  // still unseeded — stationary calibration begins next IMU
+        }
+      }
       if (this->tryRtkCalibrationStep(stamp, ang_vel, lin_accel)) {
         // tryRtkCalibrationStep applied biases + seeded state and set imu_calibrated_.
         this->init_phase_ = InitPhase::DONE;
-      } else if (!this->imu_calibrated_) {
-        return;  // still accumulating — don't propagate
+      } else if (!this->imu_calibrated_ && !can_propagate_now) {
+        return;  // no seed yet — keep output suppressed until we have one
       }
+      // Seeded: fall through and propagate; RTK bias refines opportunistically.
     } else if (phase == InitPhase::STATIONARY_CALIBRATING) {
-      // Original stationary path: assume omega=0 and accel direction = gravity.
+      // Stationary path: assume omega=0 and accel direction = gravity. Used
+      // when no GT seed is available; it provides the initial gravity/orientation.
       if (this->imu_calib_start_stamp_ < 0.0) {
         this->imu_calib_start_stamp_ = stamp;
       }
@@ -3843,7 +4024,12 @@ void gicp_localization::LocalizationNode::callbackImu(const sensor_msgs::msg::Im
             Eigen::Vector3f(0.f, 0.f, -static_cast<float>(this->gravity_)));
         this->state.b.accel = accel_avg - expected_grav_body;
 
-        if (!this->use_param_initial_pose_) {
+        // Only adopt the accel-derived orientation when we have no better one.
+        // If a pose source already seeded orientation (param or GT odom-init),
+        // keep it -- overwriting it here would jerk the already-published
+        // estimate, and the stationary assumption is invalid if that seed came
+        // from a moving vehicle.
+        if (!this->use_param_initial_pose_ && !this->use_odom_init_applied_) {
           std::lock_guard<std::mutex> lock(this->geo.mtx);
           this->state.q = q_init;
           this->geo.prev_q = q_init;
@@ -3858,12 +4044,13 @@ void gicp_localization::LocalizationNode::callbackImu(const sensor_msgs::msg::Im
                     gyro_avg.x(), gyro_avg.y(), gyro_avg.z(),
                     this->state.b.accel.x(), this->state.b.accel.y(), this->state.b.accel.z(),
                     grav_body.x(), grav_body.y(), grav_body.z());
-      } else {
+      } else if (!can_propagate_now) {
         RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
                              "IMU calibrating (stationary)... %.1f/%.1fs (%d samples)",
                              elapsed, this->imu_calib_time_, this->imu_calib_count_);
-        return;
+        return;  // no seed yet — suppress output until gravity/orientation known
       }
+      // Seeded: fall through and propagate while stationary stats accumulate.
     }
   }
 
@@ -4294,13 +4481,13 @@ void gicp_localization::LocalizationNode::propagateState() {
 
   // Pose covariance: diagonal only.
   // When GICP is accepted use sqrt(fitness) as a positional sigma (metres).
-  // When dead-reckoning (consecutive GICP failures) inflate linearly per scan.
+  // When dead-reckoning (consecutive GICP failures) inflate by elapsed time and
+  // distance travelled (speed*time), not by missed-scan count (P3).
   {
     const double kBaseSigmaXY  = 0.05;   // m   — floor for accepted scans
     const double kBaseSigmaZ   = 0.10;   // m   — z less constrained by LiDAR
     const double kBaseSigmaRot = 0.01;   // rad — roll/pitch/yaw floor
     const double kFitnessScale = 1.0;    // sigma_xy = max(base, scale * sqrt(fitness))
-    const double kDeadReckon   = 0.10;   // m per missed scan added to sigma
 
     double s_xy, s_z, s_rot;
     if (this->last_gicp_valid_ && this->last_fitness_score_ >= 0.0) {
@@ -4309,10 +4496,28 @@ void gicp_localization::LocalizationNode::propagateState() {
       s_z   = std::max(kBaseSigmaZ,   2.0 * f_sigma);
       s_rot = std::max(kBaseSigmaRot, 0.1 * f_sigma);
     } else {
-      double drift = kDeadReckon * static_cast<double>(this->consecutive_failures_);
-      s_xy  = kBaseSigmaXY  + drift;
-      s_z   = kBaseSigmaZ   + 2.0 * drift;
-      s_rot = kBaseSigmaRot + 0.05 * drift;
+      s_xy  = kBaseSigmaXY;
+      s_z   = kBaseSigmaZ;
+      s_rot = kBaseSigmaRot;
+    }
+
+    // Dead-reckoning inflation (P3). While GICP is failing the estimate rides on
+    // IMU integration, whose error grows with DISTANCE travelled (speed*time)
+    // plus a slow time term -- not with the raw number of missed scans. At racing
+    // speed N missed scans cover ~4x more ground at 200 mph than at 100 mph, so a
+    // count-based term under-reports uncertainty exactly when it matters. Keyed on
+    // consecutive_failures_ (the real dead-reckon signal) and added on top of the
+    // base/fitness sigma above. dr_cov_time_rate_ = dr_cov_dist_frac_ = 0 disables.
+    if (this->consecutive_failures_ > 0) {
+      const double elapsed_dr = (this->last_accepted_scan_stamp_ > 0.0)
+          ? std::max(0.0, imu_local.stamp - this->last_accepted_scan_stamp_)
+          : 0.0;
+      const double speed = static_cast<double>(new_v_lin_w.norm());
+      const double drift = this->dr_cov_time_rate_ * elapsed_dr +
+                           this->dr_cov_dist_frac_ * speed * elapsed_dr;
+      s_xy  += drift;
+      s_z   += 2.0 * drift;
+      s_rot += 0.05 * drift;
     }
     auto& c = odom_msg.pose.covariance;
     c.fill(0.0);
@@ -4466,6 +4671,13 @@ void gicp_localization::LocalizationNode::updateState() {
     return;  // Skip if dt is too large (probably first update or dropped scans)
   }
 
+  // Bound the effective timestep used for the proportional corrections. The
+  // observer applies dt*K, which is forward-Euler and stable only for dt*K < 2;
+  // at Kv=11.25 that bound is hit at dt≈0.18 s, so a 0.3-0.5 s scan gap (dropped
+  // Luminar frames / high-speed racing) would otherwise inject an unstable
+  // correction from a single GICP residual. At nominal ~10 Hz dt_eff == dt.
+  const double dt_eff = std::min(dt, this->geo_observer_dt_max_);
+
   // Validate inputs
   bool inputs_valid = std::isfinite(pin.x()) && std::isfinite(pin.y()) && std::isfinite(pin.z()) &&
                       std::isfinite(qin.w()) && std::isfinite(qin.x()) && std::isfinite(qin.y()) && std::isfinite(qin.z()) &&
@@ -4507,33 +4719,49 @@ void gicp_localization::LocalizationNode::updateState() {
   // adaptive observer behavior.
   if (this->geo_Kab_ > 0.0) {
     const double abias_max = this->geo_abias_max_;
-    this->state.b.accel -= dt * this->geo_Kab_ * err_body;
+    this->state.b.accel -= dt_eff * this->geo_Kab_ * err_body;
     this->state.b.accel = this->state.b.accel.array().min(abias_max).max(-abias_max);
   }
 
   if (this->geo_Kgb_ > 0.0) {
     const double gbias_max = this->geo_gbias_max_;
-    this->state.b.gyro[0] -= dt * this->geo_Kgb_ * qe.w() * qe.x();
-    this->state.b.gyro[1] -= dt * this->geo_Kgb_ * qe.w() * qe.y();
-    this->state.b.gyro[2] -= dt * this->geo_Kgb_ * qe.w() * qe.z();
+    this->state.b.gyro[0] -= dt_eff * this->geo_Kgb_ * qe.w() * qe.x();
+    this->state.b.gyro[1] -= dt_eff * this->geo_Kgb_ * qe.w() * qe.y();
+    this->state.b.gyro[2] -= dt_eff * this->geo_Kgb_ * qe.w() * qe.z();
     this->state.b.gyro = this->state.b.gyro.array().min(gbias_max).max(-gbias_max);
   }
 
-  // Proportional observer correction (matching upstream DLIO design)
+  // Proportional observer correction (matching upstream DLIO design), using the
+  // bounded dt_eff and optional hard clamps on the per-update correction
+  // magnitude so one GICP residual after a gap can't yank the state.
   // Position correction
-  this->state.p += dt * this->geo_Kp_ * err;
+  Eigen::Vector3f pos_corr = dt_eff * this->geo_Kp_ * err;
+  if (this->geo_max_pos_correction_ > 0.0) {
+    const float n = pos_corr.norm();
+    if (n > this->geo_max_pos_correction_) {
+      pos_corr *= static_cast<float>(this->geo_max_pos_correction_ / n);
+    }
+  }
+  this->state.p += pos_corr;
 
   // Velocity correction
-  this->state.v.lin.w += dt * this->geo_Kv_ * err;
+  Eigen::Vector3f vel_corr = dt_eff * this->geo_Kv_ * err;
+  if (this->geo_max_vel_correction_ > 0.0) {
+    const float n = vel_corr.norm();
+    if (n > this->geo_max_vel_correction_) {
+      vel_corr *= static_cast<float>(this->geo_max_vel_correction_ / n);
+    }
+  }
+  this->state.v.lin.w += vel_corr;
 
   // Ground vehicle constraint: damp vertical velocity toward zero.
   // A ground vehicle's true Z-velocity is ~0; residual gravity miscompensation
   // causes vel_z to drift. Apply exponential decay each update.
-  this->state.v.lin.w[2] *= (1.0f - dt * this->geo_Kz_damping_);
+  this->state.v.lin.w[2] *= (1.0f - dt_eff * this->geo_Kz_damping_);
 
   // Orientation correction
-  this->state.q.w() += dt * this->geo_Kq_ * qcorr.w();
-  this->state.q.vec() += dt * this->geo_Kq_ * qcorr.vec();
+  this->state.q.w() += dt_eff * this->geo_Kq_ * qcorr.w();
+  this->state.q.vec() += dt_eff * this->geo_Kq_ * qcorr.vec();
   this->state.q.normalize();
 
   // Validate updated state

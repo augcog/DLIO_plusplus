@@ -188,6 +188,26 @@ covers the LiDAR scan window. If you switch to LiDAR+IMU odometry, you should
 instead see `estimate initial IMU state` from loose-init followed by GNSS-prior
 factor insertion when a FIXED sample lands.
 
+> ### Two sequenced init conditions — both completed in the park position
+>
+> GLIM init is two-staged. The conditions are **sequenced, not in conflict**: Atlas LG69T's dual-antenna design resolves RTK FIXED and INS attitude at standstill (heading from the antenna baseline), so a single parked phase satisfies both before driving.
+>
+> **🅐 Phase 1 — Stationary calibration completes the GLIM init step.**
+>
+> > **THE VEHICLE MUST REMAIN STATIONARY FOR AT LEAST 5 SECONDS AFTER LAUNCHING GLIM.**
+>
+> The `LOOSE` init in `config_odometry_gpu.json` (`initialization_mode: "LOOSE"`, `initialization_window_size: 5.0`) runs a 5-second batch optimization that **estimates the gravity direction by averaging the IMU specific-force vector** (see `loose_initial_state_estimation.cpp:142-165`). The math assumes `mean(acc_local) ≈ gravity` — exact at standstill. Aggressive accel/braking/cornering during this window tilts the gravity estimate and rotates the resulting map. `fix_imu_bias: true` then **locks** the IMU bias at the init value, so a bad init cannot self-correct — a restart from a stationary state is the only fix.
+>
+> **🅑 Phase 2 — RTK-FIXED required before any map data is integrated.**
+>
+> > **DO NOT BEGIN DRIVING UNTIL `rtk_fixed_odom_filter.py` HAS LOGGED `RTK transition: ... -> FIXED`, AND `gnss_global` HAS LOGGED ITS FIRST PRIOR-FACTOR INSERTION.**
+>
+> The pre-filter forwards Atlas samples to `libgnss_global.so` only while pose covariance indicates RTK-FIXED. The first forwarded sample becomes the first GNSS prior factor — anchoring the global iSAM2 graph to a cm-level absolute pose. **The map's first geo-referenced frame must come from a FIXED-quality Atlas pose, not a degraded RTK-FLOAT or GPS-only fallback.** Driving before this anchor lands means the early trajectory grows in a local odom frame and only retroactively aligns to global when RTK reacquires — iSAM2 will smooth it, but the map no longer starts from cm-level absolute coordinates.
+>
+> Both phases typically complete during the same parked 30 s – 2 min Atlas RTK acquisition window. If Atlas never reaches FIXED while parked, fix the hardware/sky-view condition before driving — don't paper over it by starting GLIM and hoping RTK lands en route.
+>
+> **Safe sequence:** park level with clear sky view → wait for Atlas display to show RTK FIXED + INS aligned → launch `rtk_fixed_odom_filter.py` and GLIM → confirm both `estimate initial IMU state` AND `gnss_global insert ... GNSS prior factors` appear in the log → only then start driving.
+
 **Step 4 — Drive the track:**
 Watch the viewer; with the current INS-driven config the map grows while
 RTK-fixed odometry is available and pauses through gaps. The filter will print
@@ -325,7 +345,7 @@ Each directory contains:
 | IMU stationary accel σ | 3 mm/s² @ 99 Hz | — | density ~3×10⁻⁴ m/s²/√Hz |
 | IMU stationary gyro σ | 7 mrad/s @ 99 Hz | — | density ~7×10⁻⁴ rad/s/√Hz |
 
-The IMU and GNSS noise parameters below sit ~3× looser than these measured values, to leave headroom for transients (vibration spikes, multipath bursts) that the per-message covariance doesn't capture.
+The IMU and GNSS noise parameters below are deliberately conservative — set much looser than these measured stationary values to leave headroom for transients (vibration spikes, multipath bursts) that the per-message covariance doesn't capture. Concretely, `imu_acc_noise = 0.05` is ~170× the measured ~3×10⁻⁴ accel density and `imu_gyro_noise = 0.01` is ~14× the measured ~7×10⁻⁴ gyro density. (Framed against the upstream GLIM defaults of 0.2 / 0.05 instead, these same values are ~4× / ~5× *tighter* — see `config_sensors.json`; the two framings just use different baselines.)
 
 **RTK-FIXED pre-filter** (`gicp_localization/scripts/rtk_fixed_odom_filter.py` params):
 ```yaml
@@ -433,6 +453,12 @@ And saved to the map directory when mapping completes:
 ```
 
 ## Troubleshooting
+
+### Whole map is tilted / rotates the wrong way
+- Almost certainly Phase 1 (stationary calibration) was violated. The `LOOSE` init estimates gravity direction over the first 5 s of IMU samples and assumes mean acceleration ≈ gravity vector; any sustained accel/cornering during those 5 s tilts the estimate. Combined with `fix_imu_bias: true`, the bias is also locked at a wrong value. Stop GLIM, return to a level stationary park, re-launch, wait the 5 s for the first sub-map to appear in the viewer, then drive.
+
+### Map's first frame isn't geo-referenced (jumps when RTK lands)
+- Phase 2 (RTK anchoring) was violated — driving started before the pre-filter reported FIXED. The early trajectory grew in a local odom frame and only got rigidly transformed to the global frame when the first GNSS factor finally landed. iSAM2 will smooth this and the final map is still correct, but the first map frame is no longer cm-aligned. Future sessions: wait for both `estimate initial IMU state` AND `gnss_global insert ... GNSS prior factors` in the log before moving.
 
 ### Pre-filter never reports FIXED
 - Atlas itself hasn't reached FIXED. Check `ros2 topic echo /gps_p1/filtered_odom --once` and inspect `pose.covariance[0]`; it should drop to ~1×10⁻⁴ m² or below.

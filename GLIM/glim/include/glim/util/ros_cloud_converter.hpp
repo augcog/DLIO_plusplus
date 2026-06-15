@@ -164,6 +164,14 @@ static RawPoints::Ptr extract_raw_points(const PointCloud2& points_msg, const st
           break;
         case PointField::UINT8:
           if (time_count == 8) {
+            // Luminar Iris: little-endian uint64 PTP epoch nanoseconds.
+            // Per the Luminar Iris Data Output Specification v1.3.0 the
+            // sensor splits this into 48-bit epoch seconds in the packet
+            // header (§2.1) and a 32-bit sub-second nanosecond count per ray
+            // (§2.2/§2.6.3); the single uint64 epoch-ns read here is the
+            // upstream driver's reconstruction (seconds*1e9 + ns). Divide by
+            // 1e9 to get epoch seconds; deskew uses only relative offsets so
+            // the absolute epoch reference cancels.
             std::uint64_t time_ns = 0;
             std::memcpy(&time_ns, time_ptr, sizeof(std::uint64_t));
             raw_points->times[i] = static_cast<double>(time_ns) / 1e9;

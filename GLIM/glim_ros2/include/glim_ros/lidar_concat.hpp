@@ -44,6 +44,45 @@ inline bool find_xyz_offsets(const sensor_msgs::msg::PointCloud2& msg, int& x_of
   return x_off >= 0 && y_off >= 0 && z_off >= 0;
 }
 
+// Full point-field schema comparison: decides whether an auxiliary cloud can be
+// byte-appended onto the primary. merge_clouds() transforms aux points using the
+// AUX cloud's own field offsets, but the MERGED cloud keeps the PRIMARY's
+// `fields`, so every downstream reader interprets the appended aux bytes with the
+// primary layout. Appending is only safe when the aux layout is byte-identical to
+// the primary: same point_step, same endianness, and the same ordered set of
+// field {name, offset, datatype, count}. A same-point_step cloud with different
+// offsets/datatypes would otherwise be silently misread. O(#fields) (~10-20 per
+// Luminar scan) -- negligible next to deskew / voxelisation / registration.
+// Returns true on match; on mismatch returns false and sets `reason` for logging.
+inline bool schema_matches_primary(const sensor_msgs::msg::PointCloud2& aux,
+                                   const sensor_msgs::msg::PointCloud2& primary,
+                                   std::string& reason) {
+  if (aux.point_step != primary.point_step) {
+    reason = "point_step " + std::to_string(aux.point_step) + " vs primary " + std::to_string(primary.point_step);
+    return false;
+  }
+  if (aux.is_bigendian != primary.is_bigendian) {
+    reason = "endianness differs (aux is_bigendian=" + std::to_string(aux.is_bigendian) + ")";
+    return false;
+  }
+  if (aux.fields.size() != primary.fields.size()) {
+    reason = "field count " + std::to_string(aux.fields.size()) + " vs primary " + std::to_string(primary.fields.size());
+    return false;
+  }
+  for (size_t i = 0; i < primary.fields.size(); i++) {
+    const auto& a = aux.fields[i];
+    const auto& p = primary.fields[i];
+    if (a.name != p.name || a.offset != p.offset || a.datatype != p.datatype || a.count != p.count) {
+      reason = "field[" + std::to_string(i) + "] '" + a.name + "' (offset=" + std::to_string(a.offset) +
+               ",datatype=" + std::to_string(a.datatype) + ",count=" + std::to_string(a.count) +
+               ") differs from primary '" + p.name + "' (offset=" + std::to_string(p.offset) +
+               ",datatype=" + std::to_string(p.datatype) + ",count=" + std::to_string(p.count) + ")";
+      return false;
+    }
+  }
+  return true;
+}
+
 inline void transform_cloud_data(
   std::vector<uint8_t>& data,
   uint32_t point_step,
@@ -100,6 +139,37 @@ inline bool find_time_field(const sensor_msgs::msg::PointCloud2& msg, int& time_
   return false;
 }
 
+// Shift per-point timestamps by `dt` seconds to rebase an aux scan from its
+// own header.stamp onto the merged cloud's primary header.stamp.
+//
+// SCAN-RELATIVE encodings (FLOAT32/FLOAT64 seconds-since-scan-start, UINT32
+// nanoseconds-since-scan-start): add dt so the value reads as "offset since
+// primary scan start" and deskew works.
+//
+// CAVEAT: the FLOAT64 branch ALWAYS adds dt, i.e. it assumes scan-relative
+// seconds. This is correct for every aux LiDAR wired up today, but FLOAT64
+// is also a valid carrier for ABSOLUTE epoch seconds (and GLIM's converter
+// + TimeKeeper interpret large FLOAT64 values as absolute). A future aux
+// sensor emitting FLOAT64 epoch seconds would therefore be double-shifted
+// here, exactly like an unguarded UINT8[8] sensor would be. If such a
+// sensor is added, gate the FLOAT64 shift the same way UINT8[8] is left
+// untouched below (e.g. skip the shift when values look epoch-scaled).
+//
+// ABSOLUTE-EPOCH encodings (Luminar Iris UINT8[8] = uint64 PTP epoch ns):
+// must NOT be shifted. Each point already carries its absolute capture
+// time; the deskewer computes (t_i - merged_header.stamp) and naturally
+// produces the correct (T_aux - T_primary + intra-aux-offset). Adding dt
+// here would double-count the inter-scan offset.
+//
+// Luminar timestamp format (Luminar Iris Data Output Specification v1.3.0):
+// the sensor does NOT emit a single uint64 epoch-ns field -- it carries
+// 48-bit integer epoch SECONDS once per packet header (§2.1, UQ48.0) and a
+// 32-bit SUB-SECOND NANOSECOND count per ray (§2.2/§2.6.3, UQ32.0) that
+// wraps every 1 s; all fields little-endian (§2). The uint64 epoch-ns used
+// here is the upstream ROS driver's reconstruction (seconds*1e9 + ns), so
+// this depends on the driver, not the datasheet -- verify against the
+// actual Luminar driver. (The "epoch time" guidance lives in the PTP
+// sections of the Product Information Guide, not the data layout.)
 inline void shift_cloud_timestamps(
   std::vector<uint8_t>& data,
   uint32_t point_step,
@@ -136,13 +206,13 @@ inline void shift_cloud_timestamps(
         break;
       }
       case sensor_msgs::msg::PointField::UINT8: {
-        if (time_count == 8) {
-          uint64_t val;
-          std::memcpy(&val, time_ptr, sizeof(uint64_t));
-          int64_t shifted = static_cast<int64_t>(val) + static_cast<int64_t>(dt * 1e9);
-          val = static_cast<uint64_t>(std::max<int64_t>(0, shifted));
-          std::memcpy(time_ptr, &val, sizeof(uint64_t));
-        }
+        // UINT8 count=8 == Luminar Iris uint64 PTP epoch nanoseconds
+        // (driver reconstruction of header seconds + per-ray nanoseconds;
+        // see header comment for the format and citation). Absolute
+        // timestamps -- leave untouched.
+        // Any other count is not a recognised timestamp encoding.
+        (void)dt;
+        (void)time_count;
         break;
       }
       default:
@@ -151,8 +221,12 @@ inline void shift_cloud_timestamps(
   }
 }
 
+// `primary` is taken as a ConstSharedPtr so both the offline tools (which hold
+// a mutable SharedPtr) and the live GlimROS points_callback (which receives a
+// ConstSharedPtr) can call this directly. The primary cloud is only read here;
+// the merged output is a fresh copy.
 inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
-  const sensor_msgs::msg::PointCloud2::SharedPtr& primary,
+  const sensor_msgs::msg::PointCloud2::ConstSharedPtr& primary,
   std::vector<AuxLidarSensor>& aux_sensors,
   double time_threshold) {
   const double t_primary = stamp_to_sec(primary->header.stamp);
@@ -173,8 +247,16 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
       spdlog::debug("lidar_concat: no match for {} (t={:.3f})", aux.topic, t_primary);
       continue;
     }
-    if (match->point_step != point_step) {
-      spdlog::warn("lidar_concat: point_step mismatch for {} ({} vs {})", aux.topic, match->point_step, point_step);
+    // Validate the FULL field schema, not just point_step: the merged cloud
+    // keeps the primary's `fields`, so an aux scan with the same point_step but
+    // different field offsets/datatypes would be silently misread downstream.
+    std::string schema_reason;
+    if (!schema_matches_primary(*match, *primary, schema_reason)) {
+      spdlog::warn(
+        "lidar_concat: skipping {} — PointCloud2 schema mismatch vs primary: {} "
+        "(merged cloud uses the primary field layout; appending mismatched aux bytes "
+        "would misread them — normalize the aux layout upstream to enable concatenation)",
+        aux.topic, schema_reason);
       continue;
     }
 

@@ -56,6 +56,42 @@ In low-feature stretches the localizer first falls back to IMU dead-reckoning. I
 
 By default the localizer uses the post-gate Atlas GT odom stream to calibrate gyro/accel biases while the vehicle is moving, and seeds pose+velocity from the first high-quality sample rather than assuming the vehicle is stationary. Falls back to the legacy stationary calibration if no gated GT odom is received within a configurable timeout. With `localization/rtk_gate/enable=true`, the localizer inspects `pose.covariance` on every `/gps_p1/filtered_odom` sample and drops anything that exceeds `max_pose_var_xy` / `max_pose_var_z`. Knobs live under `localization/rtk_init/*` and `localization/rtk_gate/*` in the localization yaml.
 
+### GLIM mapping init — two sequenced conditions, both satisfied in the park position
+
+> The two conditions are **sequenced, not conflicting**. Point One Atlas's
+> dual-antenna LG69T resolves RTK FIXED + INS attitude *at standstill* —
+> heading comes from the antenna baseline, no motion required for either —
+> so a single parked phase satisfies both.
+
+**🅐 PHASE 1 — Stationary calibration of the GLIM odometry estimator.**
+
+> **PARK THE VEHICLE LEVEL. KEEP IT STATIONARY FOR AT LEAST 5 SECONDS AFTER LAUNCHING GLIM.**
+
+GLIM's `LOOSE` init (`config_odometry_gpu.json`: `initialization_mode=LOOSE`, `initialization_window_size=5.0`) collects 5 s of IMU + LiDAR, then runs a batch optimization that estimates the **gravity direction** by averaging the normalized IMU specific-force vector across the window. The math assumes mean acceleration ≈ gravity, which is exact at standstill. The result is locked: `fix_imu_bias: true` freezes the IMU bias at whatever the init optimizer landed on. Aggressive accel during this phase tilts the gravity estimate and rotates the map for the rest of the session — a restart is the only fix.
+
+**🅑 PHASE 2 — RTK-FIXED anchor on the first map frame (no map data is committed before this).**
+
+> **DO NOT BEGIN DRIVING UNTIL `rtk_fixed_odom_filter.py` HAS LOGGED `RTK transition: … -> FIXED` AT LEAST ONCE.**
+
+The pre-filter (`gicp_localization/scripts/rtk_fixed_odom_filter.py`) gates `/gps_p1/filtered_odom` on Atlas's pose covariance and forwards only RTK-FIXED-quality samples to `libgnss_global.so`. The first forwarded message becomes the first GNSS-position prior factor on the iSAM2 graph. **The map's first geo-referenced frame must therefore be anchored to a FIXED Atlas pose — not to a degraded RTK-FLOAT or GPS-only fallback.** Begin driving before that, and the early map segment grows in a local odom frame and only retroactively aligns to global when RTK eventually lands — which iSAM2 will smooth, but the map is no longer guaranteed to start from cm-level absolute coordinates.
+
+**Why the conditions sequence cleanly (and why they don't conflict):**
+
+A single-antenna INS receiver that aligns its heading from motion would create a real conflict with Phase 1's stationary requirement. The dual-antenna Atlas does not: heading is observable from the antenna baseline at standstill, and RTK position fixing depends only on satellite geometry + base-station correction, also fine at standstill with clear sky. In practice the operator parks once, Phase 1 completes during the LOOSE init window, and Phase 2 satisfies itself within 30 s – 2 min as Atlas reaches RTK FIXED.
+
+**Operator sequence:**
+
+1. Park the vehicle level at the intended map origin, with clear sky view.
+2. Power Atlas; wait for its status display to read RTK FIXED + INS aligned.
+3. Launch `rtk_fixed_odom_filter.py`; verify `First INS sample received … -> FIXED` in its log.
+4. Launch GLIM; wait for the 5 s LOOSE init to complete — look for `estimate initial IMU state` and the first sub-map appearing in the viewer.
+5. Confirm `gnss_global` has logged its first prior-factor insertion.
+6. **Only now begin driving.**
+
+Steps 3–5 happen concurrently inside the parked 30 s – 2 min RTK acquisition window; no extra wait is added by Phase 2 in normal operation. If Atlas never reaches FIXED while parked, that's a hardware/sky-view problem to resolve before driving — it should not be papered over by starting GLIM and "hoping" RTK lands later.
+
+Neither phase applies to `gicp_localization` — that pipeline does RTK-driven IMU calibration while the vehicle is moving and snaps from a single RTK-FIXED GT sample. Only GLIM mapping needs the two-phase sequenced startup.
+
 ### Remaining tuning work
 
 - **LiDAR-specific hyperparameter tuning.** Motion-model tuning is in place for race-car dynamics, but the lidar density/range parameters (preprocessing downsample target, voxel-resolution fade horizons) are still close to GLIM's defaults, which were chosen for a lower-density rotary lidar at indoor-to-short-outdoor ranges. Retuning these for Luminar is on the TODO list; current values are workable but not optimal.
@@ -63,6 +99,38 @@ By default the localizer uses the post-gate Atlas GT odom stream to calibrate gy
 ### Diagnostic: silent IMU subscription failures
 
 When the `imu_topic:=` launch arg points at a non-existent topic, the subscription is created but no callback fires and historically there was nothing in the log to explain it. The localizer now runs a periodic health check that warns (every 3 s, until the first IMU arrives) with the resolved topic name and whether 0 publishers exist — surfacing the typo case immediately. The timer self-cancels on first IMU receipt.
+
+### Per-point timestamp formats and motion deskewing
+
+Both GLIM and `gicp_localization` deskew each LiDAR scan to compensate for vehicle motion across the scan duration. Deskewing reads the scan's per-point timestamp field, interpolates the IMU-propagated pose for each point's capture instant, and projects every point into a single common time. At race speeds (30 m/s) this can be the difference between a 30 cm scan-end smear and a clean point.
+
+**Deskewing is now ON in both stacks** (`dlio/deskew: true` in `gicp_localization/cfg/localization.yaml`; `autoconf_perpoint_times: true` + `autoconf_prefer_frame_time: false` in `GLIM/glim/config/config_sensors.json`). Previously both were effectively off because the Luminar Iris per-point timestamp encoding was ambiguous; the Iris Product Information Guide R2.0.7 (sec 7.8.4) confirmed the format and both pipelines were updated.
+
+**`gicp_localization` supports five sensor-type-driven decoders** (`copyPointTimeFromCloud` in `localization.cc`), selected by `localization/sensor_type` in the yaml:
+
+| `localization/sensor_type` | Field encodings handled | Notes |
+|---|---|---|
+| `luminar` | `UINT8[8]` (uint64 PTP epoch ns), `FLOAT64` (raw uint64 bits in a mislabelled FLOAT64 wrapper), `UINT32` (32-bit ns) | Iris PTP-synced output. The PIG-confirmed default is UINT8[8]; the others cover driver-version variants. |
+| `ouster` | `UINT32`, `FLOAT32`, `FLOAT64` (all scan-relative ns or s) | Standard Ouster ROS driver layouts. |
+| `velodyne` | `FLOAT32`, `UINT32` (scan-relative s or ns) | VLP-16/32 and similar. |
+| `hesai` | `FLOAT64`, `FLOAT32` (absolute or relative seconds) | Pandar / XT line. |
+| `livox` | `UINT8[8]`, `UINT32`, `FLOAT64`, `FLOAT32` | MID/HAP/Avia. Both packed uint64 ns and scaled-double conventions. |
+
+That's **5 sensor types × multiple PointField datatypes** per family. Adding a new vendor means extending the `case dlio::SensorType::*` switch with the right `memcpy` and unit conversion — about 10 lines.
+
+**GLIM supports three auto-detected timestamp buckets** (`TimeKeeper::replace_points_stamp` in `glim/src/glim/util/time_keeper.cpp`), one per encoding family:
+
+| Bucket detected from `min/max` per-point time | Source encodings that fall here | What GLIM does |
+|---|---|---|
+| `max_time < 1.0` | Scan-relative FLOAT seconds (Ouster, Velodyne, Hesai, Livox in their FLOAT modes) | Use as-is. |
+| `1.0 ≤ max_time < 1e16` | Absolute wall-clock seconds (Hesai FLOAT64 absolute; rebagged scan-start-relative streams with large stamps) | Rebase to first-point time, treat as relative seconds. |
+| `min_time ≥ 1e16` | Absolute nanoseconds in a 64-bit field — Luminar Iris UINT8[8] PTP ns, Livox FLOAT64 ns | Apply `1e-9` scale; rebase to first-point time. |
+
+The combination of `autoconf_perpoint_times: true` and `autoconf_prefer_frame_time: false` makes GLIM use the *per-point* times for deskew. The earlier "Luminar timestamps look collapsed" symptom was the `autoconf_prefer_frame_time: true` default collapsing each scan to its single header stamp — that has been turned off.
+
+Concatenation note: when multiple LiDARs are merged in `lidar_concat`, both stacks now leave Iris's `UINT8[8]` per-point times **unshifted** (they're already absolute capture times). Other encodings (FLOAT32/FLOAT64 scan-relative seconds, UINT32 scan-relative ns) still get shifted by `dt = T_aux − T_primary` so they rebase onto the primary's header. See the comment block on `shiftCloudTimestamps` in `gicp_localization/src/localization.cc` and `shift_cloud_timestamps` in `GLIM/glim_ros2/include/glim_ros/lidar_concat.hpp`.
+
+If you ever switch sensors and the deskew looks wrong, run the one-shot diagnostic in `gicp_localization` (always-on; emits a `[LUMINAR_TS_DIAG] BEGIN ... END` block on the first PointCloud2 message of each session, see `gicp_localization/docs/luminar_timestamp_diagnostic_guide.pdf`) — it dumps the per-point time field metadata + raw bytes interpreted four ways so you can decide which decoder branch to take.
 
 ## Workflow
 

@@ -51,7 +51,18 @@
     // "init_T_world_imu": [0.0, 0.0, 0.0, -0.005250, 0.011631, 0.947658, 0.319032],
     // "init_v_world_imu": [-7.5108, 5.8182, -0.3548],
     // Optimization params
-    "smoother_lag": 2.0,
+    // smoother_lag bounds how far back iSAM2 can retroactively redistribute
+    // error when a new factor (e.g. a GNSS reacquisition prior after a tunnel)
+    // disagrees with the propagated trajectory. For the AV-24 RTK-tolerant
+    // mapping use case the value must be ≥ the longest expected GNSS-denied
+    // passage duration. Examples at typical mapping speeds:
+    //   * Putnam Park / flat track (rarely denied)          -> 2-5 s is fine
+    //   * Tunnel ≤200 m at 5 m/s mapping speed              -> needs ≥ 40 s
+    //   * Mountain switchback canyon ≤500 m at 5 m/s        -> needs ≥ 100 s
+    // 30.0 s here covers most short-to-moderate dropouts; bump higher if
+    // the route includes longer continuous denials.  Trade-off: larger
+    // smoother_lag = larger active iSAM2 variable set = more CPU per update.
+    "smoother_lag": 30.0,
     "use_isam2_dogleg": false,
     "isam2_relinearize_skip": 1,
     "isam2_relinearize_thresh": 0.1,

@@ -225,17 +225,34 @@
     localization/imu/require_frame_match: true
     dlio/imu/calibTime: 0.5  # Seconds of stationary IMU data for bias/gravity calibration (fallback when RTK init is off/unavailable). With Atlas imu_calibrated input the residual bias is already near-zero, so this estimate captures only mount-level tilt; shortening below ~0.1s is safe.
 
-    # RTK-driven IMU calibration: use the post-gate GT odom buffer as the truth
-    # source for bias estimation. Lets the vehicle calibrate while moving and
-    # seeds pose+velocity from the first RTK-quality sample rather than assuming
-    # stationary. With localization/rtk_gate/enable=true, gt_odom samples are
-    # accepted only when Atlas reports pose covariance within the configured
-    # thresholds, so gt_odom_received_ means "a high-quality RTK sample
-    # arrived." If the gate is disabled for bag-replay diagnostics, this
-    # guarantee is removed and RTK init may seed from whatever the gt_odom
-    # topic publishes. If no accepted GT message arrives within
-    # rtk_init/fallback_timeout seconds of the first IMU sample, the node falls
-    # back to the stationary path above.
+    # RTK-driven IMU calibration: use the GT odom buffer as the truth source
+    # for bias estimation. Lets the vehicle calibrate while moving and seeds
+    # pose+velocity from an RTK-quality sample rather than assuming stationary.
+    #
+    # Gate contract (consumer-side): callbackGtOdom() buffers EVERY gt_odom
+    # message and sets gt_odom_received_ regardless of covariance, so
+    # gt_odom_received_ only means "some Atlas odom arrived" -- NOT that it is
+    # RTK-FIXED quality. The localization/rtk_gate covariance check is applied
+    # per-sample at consumption time (gtSampleIsRtkFixed in tryRtkCalibrationStep
+    # and the cross-check), so only RTK-FIXED samples drive bias/seed; snap
+    # recovery still accepts degraded samples.
+    #
+    # Output continuity (seed-and-go): localization output is DECOUPLED from
+    # bias calibration. As soon as a state seed exists (GT odom-init, a param
+    # initial pose, or the first GICP scan) the node propagates and publishes
+    # continuously; RTK/stationary bias calibration runs in the background and
+    # applies its refined bias as a smooth correction when it completes. Output
+    # is suppressed only while genuinely unseeded (nothing to propagate from).
+    #
+    # Consequences for this calibration:
+    #   - If no GT arrives within fallback_timeout of the first IMU AND we have
+    #     no seed, the node falls back to the stationary path above to obtain
+    #     gravity/orientation (a brief, unavoidable startup blackout).
+    #   - With continuous-but-degraded Atlas odom, RTK calibration simply never
+    #     completes, but a GT odom-init seed keeps output flowing the whole time
+    #     and a later RTK-FIXED sample finishes the calibration opportunistically.
+    #     The (calib_window + fallback_timeout) bound on RTK_CALIBRATING now only
+    #     applies while still unseeded, where it forces the stationary fallback.
     localization/rtk_init/enable: true
     localization/rtk_init/calib_window: 2.0      # seconds of IMU+GT residual accumulation
     localization/rtk_init/fallback_timeout: 5.0  # seconds without GT before stationary fallback
@@ -286,13 +303,45 @@
     odom/geo/abias_max: 0.3    # Max accelerometer bias (m/s^2)
     odom/geo/gbias_max: 0.05   # Max gyroscope bias (rad/s)
 
+    # Observer-correction stability bounds (racing safety, P2#1).
+    # The observer applies dt*K corrections (forward-Euler, stable only for
+    # dt*K < 2). At Kv=11.25 that bound is hit at dt≈0.18 s, so a 0.3-0.5 s scan
+    # gap (dropped Luminar frames / 200 mph) would inject an unstable velocity
+    # correction from one GICP residual. We cap the effective timestep used in
+    # updateState() at observer_dt_max; at nominal ~10 Hz this is a no-op.
+    odom/geo/observer_dt_max: 0.15   # s — cap on dt for observer corrections
+    # Optional hard clamps on the per-update correction magnitude (0 = disabled).
+    # The dt cap above already bounds the gain; enable these only if you also want
+    # an absolute ceiling on how far one scan can move the state.
+    odom/geo/max_pos_correction: 0.0 # m   — clamp per-update position correction
+    odom/geo/max_vel_correction: 0.0 # m/s — clamp per-update velocity correction
+
+    # Dead-reckoning covariance growth (P3). During GICP loss the reported
+    # position sigma grows with elapsed dead-reckon time and distance travelled
+    # (speed*time), not the missed-scan count — so it stays honest at racing
+    # speed, where N missed scans cover ~4x more ground at 200 vs 100 mph.
+    # sigma_xy += time_rate*elapsed + dist_frac*speed*elapsed. Both 0 = no growth.
+    odom/geo/dr_cov_time_rate: 0.5   # m of sigma per second of dead reckoning
+    odom/geo/dr_cov_dist_frac: 0.05  # m of sigma per metre travelled (≈5% of distance)
+
     # Debug / Visualization helpers
     localization/debug/enable_pub: true   # publishes per-scan fitness/elapsed-ms/etc on gicp/localization/debug/*
     localization/debug/enable_jump_log: false
     localization/debug/verbose_scan_log: false
     localization/debug/nano_gicp_lm_debug: false   # Enable only for short controlled replays
-    localization/debug/jump_trans_m: 30.0      # Log/reject if pose jumps > this (meters); 10Hz @ 30m/s = 3m/scan
-    localization/debug/jump_rot_deg: 30.0     # Log/reject if pose jumps > this (degrees)
+    localization/debug/jump_trans_m: 30.0      # Base reject threshold if pose jumps > this (meters)
+    localization/debug/jump_rot_deg: 30.0     # Base reject threshold if pose jumps > this (degrees)
+    # Speed/scan_dt-aware jump-gate scaling (P2#2). The jump is GICP-vs-IMU-prior,
+    # so legitimate disagreement scales with how far the prior could have drifted.
+    # Effective thresholds:
+    #   trans = jump_trans_m + trans_speed_scale * speed[m/s] * scan_dt[s]
+    #   rot   = jump_rot_deg + rot_dt_scale_deg * scan_dt[s]
+    # scan_dt is the time since the last accepted pose (grows during a failure
+    # streak), so the gate loosens after a gap / at high speed to admit a valid
+    # reacquisition, while staying tight for slow, short-gap scans. Set to 0 to
+    # restore the fixed thresholds above.
+    localization/jump/trans_speed_scale: 1.5   # extra metres of threshold per (speed*scan_dt) metre
+    localization/jump/rot_dt_scale_deg: 60.0   # extra degrees of threshold per second of scan_dt
 
     # GICP Registration Parameters
     # Iteration cap. The IMU prior is already close, so convergence happens in

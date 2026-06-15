@@ -77,23 +77,59 @@ Because base_frame, imu_frame, and the gt_odom source all align, the in-code TF 
 
 This design deliberately bypasses race_common's downstream `cg`-frame intermediate (VKS / robot_localization). The trade-off is the localized pose lives at the antenna point rather than the controller-expected `cg` (downstream consumers need an extra `gps_antenna_top → cg` TF lookup, which `robot_state_publisher` already provides). See `docs/GICP_GNSS_IMU_bug_report.pdf` for the architectural alternatives and their trade-offs.
 
-### RTK quality gate (P1 covariance-based)
+### RTK quality gate — consumer-side, with snap-recovery exemption
 
-GICP enforces in-code that every gt_odom sample carries Atlas-reported pose covariance below configured thresholds before it enters the buffer. Replaces the legacy NovAtel BESTGNSSPOS enum gate; the gate is now self-contained in `callbackGtOdom` (no separate status topic).
+GICP uses Atlas's per-sample pose covariance as a quality signal, but the **gate is consumer-specific**. Every `/gps_p1/filtered_odom` message is pushed into the GT buffer unfiltered; the FIXED-quality check is applied where each consumer reads.
 
 ```yaml
-localization/rtk_gate/enable:           true   # inspect msg->pose.covariance
+localization/rtk_gate/enable:           true   # inspect msg->pose.covariance per consumer
 localization/rtk_gate/max_pose_var_xy:  0.25   # m^2 (~0.5 m horizontal std)
 localization/rtk_gate/max_pose_var_z:   1.0    # m^2 (~1.0 m vertical std)
 ```
 
-Mechanism: on every `/gps_p1/filtered_odom` message, the node reads `pose.covariance[0]`, `[7]`, `[14]` (xx, yy, zz position variances). The sample is rejected if any horizontal variance exceeds `max_pose_var_xy` OR the vertical variance exceeds `max_pose_var_z`. Reference covariances from a known-RTK-fixed AV-24 bag: median `cov_xx`≈2.8e-5, `cov_yy`≈4.2e-5, `cov_zz`≈1.0e-4 m². RTK-float typically lives in the 1e-2…1e-1 m² band; GPS-only at 1 m²+.
+| Consumer | Requires FIXED? | Why |
+|---|---|---|
+| **`tryRtkCalibrationStep`** — RTK-driven IMU bias calibration at startup | ✓ Yes | Needs cm-level truth to estimate gyro/accel bias residuals. If only degraded samples are available the init machine times out and falls back to stationary calibration. |
+| **Scan cross-check** — diagnostic `gt_pos_err_m` published on every accepted scan | ✓ Yes | A diagnostic comparing GICP against a sub-cm reference is only meaningful when the reference IS sub-cm. |
+| **`maybeSnapPoseToGT`** — recovery after GICP loses LiDAR features | ✗ **No — accepts any sample** | When GICP can't match the LiDAR scan, the next-best truth is Atlas's pose at whatever quality it currently has — not our own software IMU dead-reckoning. See the next subsection. |
+| **`applyInitialPose` (use_odom_init)** | ✗ No | Falls back to whatever Atlas reports at startup; if RTK FIXED is required for init, set `localization/rtk_init/enable: true` (default) which gates through `tryRtkCalibrationStep`. |
 
-When the gate rejects, GICP runs on IMU dead-reckoning until Atlas's solution recovers. Operator-facing log line (throttled to 5 s):
+Reference Atlas covariance on AV-24 RTK-FIXED: median `cov_xx`≈2.8e-5, `cov_yy`≈4.2e-5, `cov_zz`≈1.0e-4 m². RTK-FLOAT typically 1e-2…1e-1 m². GPS-only ≥ 1 m². The defaults above admit anything down to RTK-FLOAT for the consumers that need FIXED — tighten if you want strict FIXED-only for those paths.
 
-- `RTK gate: dropping gt_odom -- pose covariance exceeds threshold (cov_xx=… cov_yy=… cov_zz=… ; max_xy=… max_z=…). Rejected total=N`
+Setting `rtk_gate/enable: false` makes every consumer (including calibration and cross-check) treat all samples as FIXED — useful only for bag-replay diagnostics.
 
-Set `rtk_gate/enable: false` only for bag-replay diagnostics where the covariance isn't trustworthy — disabling the gate lets snap and init seed state from degraded GNSS.
+### Snap recovery accepts any Atlas pose (the "GNSS is always next-best" policy)
+
+When GICP fails to converge — typically a feature-poor scene (long straight under glass facades, tunnel, fog, sensor occlusion) — the recovery path is:
+
+```
+GICP scan-match fails
+        │
+        ▼
+maybeSnapPoseToGT(): take latest /gps_p1/filtered_odom sample
+   from buffer, regardless of RTK quality, and snap state.{p,q,v}
+        │
+        ▼
+(only if no GT sample available at all)
+software IMU dead-reckoning until GICP recovers
+```
+
+**The snap is intentionally gate-bypassed.** Atlas LG69T is a *tightly integrated RTK+IMU INS*: when RTK degrades, Atlas's internal solution continues to fuse its own calibrated IMU with whatever GNSS quality it has, producing a continuously-valid pose. That solution is strictly better than our software IMU dead-reckoning, which:
+
+- Uses a less-rigorous integrator (DLIO's geometric observer, not a tightly-coupled EKF).
+- Has no GNSS-aided bias correction during the dead-reckoning window.
+- Compounds frame-extrinsic errors that Atlas's firmware already eliminates internally.
+
+So the policy is: **when GICP cannot match the scan, snap to Atlas's pose at whatever quality Atlas currently has — FIXED, FLOAT, or even pure INS dead-reckoning — before falling further back to our own integrator.**
+
+⚠️ **This policy depends on the GNSS source being a tightly integrated RTK+IMU INS.** It is safe for Atlas (which fuses GNSS + onboard IMU and explicitly outputs a continuously-valid INS pose). It would **NOT** be safe for a raw GNSS receiver that publishes nothing during RTK loss, or a loosely-coupled fusion that jumps when satellites lock back. If you ever re-point `gt_odom_topic` at a non-INS source, re-enable the strict consumer-side FIXED check in `maybeSnapPoseToGT` by adding a `gtSampleIsRtkFixed(gt)` guard to its lookup.
+
+Operator-facing log lines:
+
+- `snap fired: GT covariance was [cov_xx=… cov_yy=… cov_zz=…] (FIXED|degraded) — snapped state to gt at t=…` — appears every time the snap fires; the quality label tells you whether Atlas was RTK-FIXED at that moment.
+- `IMU dead-reckoning fallback: no GT sample within max_dt of scan stamp` — only when even Atlas isn't publishing (true GNSS-denied + INS publication gap).
+
+In normal operation on a well-mapped track you should rarely see either: GICP scan-match converges on every scan and `consecutive_failures_` resets to 0. The snap path exists for the edge case where LiDAR briefly cannot disambiguate the local map.
 
 ### Setting an initial pose
 

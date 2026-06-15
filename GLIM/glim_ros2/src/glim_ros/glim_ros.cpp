@@ -91,6 +91,12 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   ring_field = config_sensors.param<std::string>("sensors", "ring_field", "");
   flip_points_y = config_sensors.param<bool>("sensors", "flip_points_y", false);
 
+  // Multi-LiDAR concatenation. Live glim_ros must merge the auxiliary (left /
+  // right) Luminar clouds into the primary luminar_front frame just like the
+  // offline glim_rosbag / glim_pcap_rosbag tools do; otherwise live mapping
+  // would silently use only the front LiDAR.
+  aux_concat = glim_ros::load_aux_sensors_from_config(config_sensors);
+
   // Override T_lidar_imu from URDF if configured
   const std::string urdf_path = config_sensors.param<std::string>("sensors", "urdf_path", "");
   const std::string urdf_lidar_frame = config_sensors.param<std::string>("sensors", "urdf_lidar_frame", "");
@@ -210,7 +216,24 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   imu_sub = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, qos, std::bind(&GlimROS::imu_callback, this, _1));
 
   qos = get_qos_settings(config_ros, "glim_ros", "points_qos");
-  points_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(points_topic, qos, std::bind(&GlimROS::points_callback, this, _1));
+  // Route the primary cloud through points_callback_live() so buffered aux
+  // clouds are merged in before odometry sees the scan (parity with offline).
+  points_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+    points_topic, qos, std::bind(&GlimROS::points_callback_live, this, _1));
+
+  // Subscribe to each auxiliary LiDAR topic and buffer its clouds. They are
+  // merged into the primary scan on arrival of a primary cloud.
+  if (aux_concat.enabled) {
+    auto aux_qos = get_qos_settings(config_ros, "glim_ros", "points_qos");
+    for (size_t i = 0; i < aux_concat.aux_sensors.size(); i++) {
+      const std::string aux_topic = aux_concat.aux_sensors[i].topic;
+      auto sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+        aux_topic, aux_qos,
+        [this, i](const sensor_msgs::msg::PointCloud2::SharedPtr msg) { this->aux_points_callback(msg, i); });
+      aux_points_subs.push_back(sub);
+      spdlog::info("subscribed to auxiliary LiDAR topic: {}", aux_topic);
+    }
+  }
 #ifdef BUILD_WITH_CV_BRIDGE
   qos = get_qos_settings(config_ros, "glim_ros", "image_qos");
   image_sub = image_transport::create_subscription(this, image_topic, std::bind(&GlimROS::image_callback, this, _1), "raw", qos.get_rmw_qos_profile());
@@ -310,6 +333,34 @@ void GlimROS::image_callback(const sensor_msgs::msg::Image::ConstSharedPtr msg) 
   }
 }
 #endif
+
+void GlimROS::aux_points_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg, size_t aux_index) {
+  std::lock_guard<std::mutex> lock(aux_buffers_mutex);
+  if (aux_index >= aux_concat.aux_sensors.size()) {
+    return;
+  }
+  auto& aux = aux_concat.aux_sensors[aux_index];
+  aux.buffer.push_back(msg);
+  while (aux.buffer.size() > aux.buffer_size) {
+    aux.buffer.pop_front();
+  }
+}
+
+void GlimROS::points_callback_live(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+  // Merge buffered auxiliary clouds into the primary scan (front + left + right
+  // -> luminar_front frame), then hand the result to the estimator. The mutex
+  // guards the aux buffers, which merge_clouds() reads via find_nearest().
+  if (aux_concat.enabled && !aux_concat.aux_sensors.empty()) {
+    sensor_msgs::msg::PointCloud2::ConstSharedPtr merged;
+    {
+      std::lock_guard<std::mutex> lock(aux_buffers_mutex);
+      merged = glim_ros::merge_clouds(msg, aux_concat.aux_sensors, aux_concat.time_threshold);
+    }
+    points_callback(merged);
+  } else {
+    points_callback(msg);
+  }
+}
 
 size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
   spdlog::trace("points: {}.{}", msg->header.stamp.sec, msg->header.stamp.nanosec);

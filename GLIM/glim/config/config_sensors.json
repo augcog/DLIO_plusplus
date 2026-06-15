@@ -33,6 +33,30 @@
       0.0,
       1.0
     ],
+    // Per-point timestamp auto-detection -- ENABLED.
+    //
+    // autoconf_perpoint_times=true lets TimeKeeper::replace_points_stamp
+    // inspect the first cloud's min/max times and select the right
+    // encoding automatically:
+    //   * max_time < 1.0           -> scan-relative FLOAT seconds
+    //   * max_time > 1.0           -> absolute, auto-convert to relative
+    //   * min_time > 1e16          -> raw nanosecond timestamps; applies
+    //                                 1e-9 scale
+    // For Luminar Iris (UINT8[8] = uint64 PTP epoch ns; see Luminar Iris
+    // Data Output Specification v1.3.0 §2.1 packet-header seconds + §2.2/
+    // §2.6.3 per-ray nanoseconds, reconstructed to epoch ns by the driver)
+    // the times are ALREADY converted to epoch seconds in
+    // ros_cloud_converter.hpp (UINT8[8] case divides by 1e9), so by the
+    // time TimeKeeper sees them min_time is ~1.7e9, NOT ~1.7e18. It
+    // therefore hits the second branch (max_time > 1.0 -> absolute,
+    // auto-convert to relative), point_time_scale stays 1.0, and the times
+    // are rebased to scan-start; deskew then works correctly. (The
+    // min_time > 1e16 branch would only fire for raw, unconverted
+    // nanosecond timestamps -- which this pipeline never forwards.)
+    //
+    // autoconf_prefer_frame_time=false means we USE the per-point times
+    // for deskewing instead of collapsing each scan to its frame stamp
+    // (which would disable deskewing).
     "autoconf_perpoint_times": true,
     "autoconf_prefer_frame_time": false,
     "distortion_coeffs": [
