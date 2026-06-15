@@ -243,7 +243,7 @@ class LiveGnssErrorMonitor(Node):
         text.color.g = 1.0
         text.color.b = 1.0
         text.color.a = 1.0
-        text.text = f"GICP-GNSS\n2D {e2d:.2f} m\n3D {e3d:.2f} m\n dt {dt:+.3f}s"
+        text.text = f"GICP-GNSS\nerror: {e2d:.2f} m"
 
         gnss_sphere = Marker()
         gnss_sphere.header.frame_id = frame

@@ -23,7 +23,7 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     current_pkg = FindPackageShare('gicp_localization')
 
-    rviz = LaunchConfiguration('rviz', default='false')
+    rviz = LaunchConfiguration('rviz', default='true')
     pointcloud_topic = LaunchConfiguration('pointcloud_topic', default='/luminar_front/points')
     # All-P1 single-source design:
     #   imu_topic     = /gps_p1/imu              (Atlas imu_calibrated)
@@ -41,7 +41,7 @@ def generate_launch_description():
     odom_topic = LaunchConfiguration('odom_topic', default='/odom')
     gt_odom_topic = LaunchConfiguration('gt_odom_topic', default='/gps_p1/filtered_odom_map')
     imu_only = LaunchConfiguration('imu_only', default='false')
-    publish_tf = LaunchConfiguration('publish_tf', default='false')
+    publish_tf = LaunchConfiguration('publish_tf', default='true')
     deskew = LaunchConfiguration('deskew', default='false')
     crop_size = LaunchConfiguration('crop_size', default='80.0')
     sensor_type = LaunchConfiguration('sensor_type', default='luminar')

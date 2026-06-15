@@ -54,12 +54,13 @@ ros2 launch gicp_localization localization_with_tf.launch.py \
 
 | Arg | Default | Purpose |
 |---|---|---|
-| `rviz` | `false` | Launch RViz with the bundled config. |
+| `rviz` | `true` | Launch RViz with the bundled config. |
 | `pointcloud_topic` | `/luminar_front/points` | Primary LiDAR topic (gets remapped to `pointcloud`). |
 | `imu_topic` | `/gps_p1/imu` | Point One Atlas `imu_calibrated` (sensor-calibrated, gravity present, 99 Hz, frame `gps_antenna_top`). **Watch for typos**: it's `imu_topic` (underscore), not `imu-topic`. |
 | `odom_topic` | `/odom` | Pose-init odom topic when `localization/use_odom_init=true` and not bootstrapping from GT. |
 | `gt_odom_topic` | `/gps_p1/filtered_odom` | Atlas FusionEngine INS odometry, at `gps_antenna_top`. Used when `localization/gt_odom/enable=true` and/or `gt_recovery/enable=true`. Same frame as `base_frame`, so no TF correction is needed. |
 | `imu_only` | `false` | Disable GICP and propagate pose from IMU only (debug/sanity check). |
+| `publish_tf` | `true` | Publish `map -> base_frame` TF for RViz views/displays. |
 | `urdf_path` | (auto-found) | Path to the URDF that publishes sensor TFs. |
 | `parent_frame` / `child_frame` | `base_link` / `luminar_front` | Used by the bundled static-TF helper. |
 | `map_path` | (yaml) | Override the yaml `localization/map_path` from the command line. |

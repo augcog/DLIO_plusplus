@@ -275,7 +275,7 @@ class CachedErrorViz(Node):
         text.pose.position = marker_point(gicp[0], gicp[1], gicp[2] + 4.0)
         text.scale.z = 3.0
         text.color.r = text.color.g = text.color.b = text.color.a = 1.0
-        text.text = f"cached GICP-GNSS\n2D {e2d:.2f} m\n3D {e3d:.2f} m"
+        text.text = f"cached GICP-GNSS\nerror: {e2d:.2f} m"
 
         sphere = self.base_marker(stamp, 3, Marker.SPHERE)
         sphere.pose.position = marker_point(*gnss)

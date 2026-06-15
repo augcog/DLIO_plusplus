@@ -330,7 +330,7 @@ Manual version — four processes, four terminals (all local shells, from the
 repo root, with `/opt/ros/jazzy/setup.bash` and `install/setup.bash` sourced):
 
 ```bash
-# T1 — localization node + robot_state_publisher (+ rviz:=true if you want)
+# T1 — localization node + robot_state_publisher + RViz by default
 ros2 launch gicp_localization localization_with_tf.launch.py \
     pointcloud_topic:=/luminar_front/points \
     imu_topic:=/gps_p1/imu \

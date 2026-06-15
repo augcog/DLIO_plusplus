@@ -7,14 +7,14 @@
 # Tears everything down when the replay ends and prints the evaluation.
 #
 # Usage (local ROS 2 Jazzy shell; setup.bash files are sourced when found):
-#   scripts/run_localization_replay.sh <prepped_bag_dir> <map.pcd> <T_world_utm.txt> <out_dir> [rviz]
+#   scripts/run_localization_replay.sh <prepped_bag_dir> <map.pcd> <T_world_utm.txt> <out_dir> [rviz=true|false]
 set -u
 
 if [ $# -lt 4 ]; then
-  echo "usage: $0 <prepped_bag_dir> <map.pcd> <T_world_utm.txt> <out_dir> [rviz]" >&2
+  echo "usage: $0 <prepped_bag_dir> <map.pcd> <T_world_utm.txt> <out_dir> [rviz=true|false]" >&2
   exit 1
 fi
-BAG="$1"; MAP="$2"; UTM="$3"; OUT="$4"; RVIZ="${5:-false}"
+BAG="$1"; MAP="$2"; UTM="$3"; OUT="$4"; RVIZ="${5:-true}"
 DESKEW="${DESKEW:-false}"
 CROP_SIZE="${CROP_SIZE:-80.0}"
 SENSOR_TYPE="${SENSOR_TYPE:-luminar}"
