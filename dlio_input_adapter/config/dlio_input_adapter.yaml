@@ -1,0 +1,44 @@
+/**:
+  ros__parameters:
+    use_sim_time: true
+
+    pose_input_topic: "/atlas/pose_filtered"
+    imu_input_topic: "/atlas/imu_calibrated"
+    pose_input_reliability: "reliable"
+    pose_input_qos_depth: 100
+
+    # auto: P1-like IMU stamps use the P1 clock mapper; ROS-epoch arrival
+    # stamps use the bounded burst retimer.
+    imu_stamp_mode: "auto"
+    p1_like_threshold_sec: 100000000.0
+    nominal_imu_period_sec: 0.01
+    imu_arrival_retime_lookahead: 128
+    imu_flush_timeout_sec: 0.5
+    imu_input_reliability: "best_effort"
+    imu_input_qos_depth: 100
+    p1_clock_bin_seconds: 60.0
+
+    imu_frame_id: "gps_antenna_top"
+    body_frame_id: "gps_antenna_top"
+    odom_frame_id: "utm"
+
+    utm_zone: 0
+    utm_origin: ""
+    utm_origin_output_path: ""
+    T_world_utm_path: ""
+    summary_output_path: ""
+
+    rtk_max_var_xy: 0.001
+    rtk_max_var_z: 0.005
+
+    luminar_front_input_topic: "/dlio_raw/luminar_front/points"
+    luminar_left_input_topic: "/dlio_raw/luminar_left/points"
+    luminar_right_input_topic: "/dlio_raw/luminar_right/points"
+    luminar_front_output_topic: "/luminar_front/points"
+    luminar_left_output_topic: "/luminar_left/points"
+    luminar_right_output_topic: "/luminar_right/points"
+    lidar_time_offset: 0.0
+    lidar_input_reliability: "best_effort"
+    lidar_input_qos_depth: 5
+    repair_luminar_point_time: true
+    strict_luminar_schema: true

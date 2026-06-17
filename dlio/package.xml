@@ -10,6 +10,7 @@
   <license>LGPLv3</license>
 
   <depend>gicp_localization</depend>
+  <depend>dlio_input_adapter</depend>
   <depend>glim</depend>
   <depend>glim_ext</depend>
   <depend>glim_ros</depend>

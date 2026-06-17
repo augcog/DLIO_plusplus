@@ -9,7 +9,6 @@ configs reference `av24.urdf` relative to the working directory).
 # From anywhere inside this checkout:
 cd "$(git rev-parse --show-toplevel)"
 source /opt/ros/jazzy/setup.bash
-[ -f install/setup.bash ] && source install/setup.bash
 
 # Set once per workstation. Raw bags are not stored in this repository.
 cp dlio.env.example dlio.env
@@ -17,6 +16,8 @@ ${EDITOR:-nano} dlio.env
 
 # Load local values for the manual snippets below.
 [ -f dlio.env ] && source dlio.env
+[ -n "${DLIO_RACE_COMMON_SETUP:-}" ] && source "$DLIO_RACE_COMMON_SETUP"
+[ -f install/setup.bash ] && source install/setup.bash
 DATA="${DLIO_DATA_ROOT:-./dlio_data}"
 RUN="${DLIO_RUN:-run_5}"
 MAP_RUN="${DLIO_MAP_RUN:-$RUN}"
@@ -36,6 +37,8 @@ Minimum config for the Putnam-style examples:
 DLIO_ROSBAG_ROOT="/path/to/rosbags"
 DLIO_DATA_ROOT="./dlio_data"
 DLIO_RUN="run_5"
+# Required when building/running the live adapter against race_common messages.
+DLIO_RACE_COMMON_SETUP="/path/to/race_common/install/setup.bash"
 ```
 
 If your raw bag is not laid out as
@@ -82,6 +85,10 @@ paths with your own dataset.
 The raw bag must contain `/atlas/imu_calibrated`, `/atlas/pose_filtered`, and
 `/luminar_front|left|right/points`.
 
+`run_5` and `run_3` are logical session names. A "raw bag" is the actual
+rosbag2 directory for that session, for example
+`$DLIO_ROSBAG_ROOT/putnam/may_26/run_5/filtered/all`.
+
 Example runs:
 
 ```bash
@@ -123,8 +130,21 @@ make install-deps
 # Build a local CUDA-enabled gtsam_points into .deps/ and rebuild the workspace
 # with the right CMAKE_PREFIX_PATH/RPATH.
 make install-gtsam-points-cuda
-make build
+make build-all DLIO_RACE_COMMON_SETUP="$DLIO_RACE_COMMON_SETUP"
 source install/setup.bash
+```
+
+If you are testing the live adapter, build the selected race_common packages
+first in that workspace, then source it before this checkout:
+
+```bash
+(cd /path/to/race_common && \
+  source /opt/ros/jazzy/setup.bash && \
+  colcon build --symlink-install --packages-up-to fusion_engine_driver pointonenav_interface)
+
+source "$DLIO_RACE_COMMON_SETUP"
+make build-all DLIO_RACE_COMMON_SETUP="$DLIO_RACE_COMMON_SETUP"
+make check-env DLIO_RACE_COMMON_SETUP="$DLIO_RACE_COMMON_SETUP"
 ```
 
 ## 1. Prep the bag (`/atlas/*` → `/gps_p1/*`)
@@ -165,6 +185,190 @@ python3 -u scripts/prep_bag.py --input ... --output ... \
 ```
 
 `--utm-zone N` similarly pins the UTM zone (auto = zone of the first fix).
+
+### 1b. Live adapter path: raw/hardware → normalized topics
+
+`dlio_input_adapter` is the online equivalent of the input-normalization part
+of `prep_bag.py`. GLIM/GICP still subscribe only to normalized topics:
+`/gps_p1/imu`, `/gps_p1/filtered_odom`,
+`/gps_p1/filtered_odom_rtk_fixed`, `/gps_p1/filtered_odom_map` when a map
+transform is configured, and `/luminar_*`.
+
+Hardware mode should launch race_common drivers first. For Atlas IMU, set
+`fusion_engine_driver` parameter `imu_output_stamp_source:=p1_time`; the
+adapter maps that P1 monotonic sample time onto the ROS epoch using
+`/atlas/pose_filtered.p1_time`.
+
+Raw rosbag replay mode remaps Luminar inputs into `/dlio_raw/*` so the adapter
+does not subscribe and publish the same `/luminar_*` topic:
+
+```bash
+# Terminal 1: adapter.
+ros2 run dlio_input_adapter dlio_input_adapter_node --ros-args \
+  -p use_sim_time:=true \
+  -p utm_origin_output_path:="$DATA/${RUN}_adapter_utm_origin.txt"
+
+# Terminal 2: raw replay through adapter.
+ros2 bag play "$RAW_BAG" --clock 100 --disable-keyboard-controls \
+  --topics /atlas/imu_calibrated /atlas/pose_filtered \
+           /luminar_front/points /luminar_left/points /luminar_right/points \
+  --remap /luminar_front/points:=/dlio_raw/luminar_front/points \
+          /luminar_left/points:=/dlio_raw/luminar_left/points \
+          /luminar_right/points:=/dlio_raw/luminar_right/points
+```
+
+The wrapper can run the same path without writing a prepped bag:
+
+```bash
+scripts/run_dlio_pipeline.sh --raw-live \
+  --raw "$RAW_BAG" \
+  --data-root "$DATA" \
+  --run "$RUN"
+```
+
+For raw-live localization against a map from another run, pass or configure
+the map run and UTM origin:
+
+```bash
+scripts/run_dlio_pipeline.sh --raw-live \
+  --raw "${DLIO_ROSBAG_ROOT:-../rosbags}/putnam/may_26/run_3/filtered/all" \
+  --data-root "$DATA" \
+  --run run_3 \
+  --map-run run_5 \
+  --adapter-utm-origin "$(tail -n 1 "$DATA/run_5_adapter/utm_origin.txt")" \
+  --rviz true
+```
+
+For localization against an existing map, reuse that map's UTM origin and
+provide `T_world_utm.txt` so the adapter also publishes
+`/gps_p1/filtered_odom_map`:
+
+```bash
+ros2 run dlio_input_adapter dlio_input_adapter_node --ros-args \
+  -p use_sim_time:=true \
+  -p utm_origin:="$(tail -n 1 "$DATA/${MAP_RUN}_prepped/utm_origin.txt")" \
+  -p T_world_utm_path:="$DATA/${MAP_RUN}_dump/T_world_utm.txt"
+```
+
+Legacy Putnam raw bags have arrival-stamped `/atlas/imu_calibrated`; the
+adapter falls back to bounded arrival retiming. This is good enough for live
+raw-bag smoke tests, but it necessarily adds wall-time latency proportional to
+`imu_arrival_retime_lookahead`. Hardware P1-time mode avoids that latency.
+
+For live hardware smoke, bring up the race_common Atlas and Luminar drivers
+first. Configure the FusionEngine driver with
+`imu_output_stamp_source:=p1_time`, remap the raw Luminar driver outputs into
+`/dlio_raw/luminar_front|left|right/points`, then run:
+
+```bash
+scripts/run_live_adapter_smoke.sh \
+  --duration 60 \
+  --start-adapter \
+  --expect-raw-imu-p1 \
+  --ptp-lock-confirmed \
+  --require-rtk-fixed
+```
+
+If validating localization with an existing map, also require map-frame odom
+and pass the map transform/origin through to the adapter:
+
+```bash
+scripts/run_live_adapter_smoke.sh \
+  --duration 60 \
+  --start-adapter \
+  --expect-raw-imu-p1 \
+  --ptp-lock-confirmed \
+  --require-rtk-fixed \
+  --require-map-odom \
+  -- \
+  -p T_world_utm_path:="$DATA/${MAP_RUN}_dump/T_world_utm.txt" \
+  -p utm_origin:="$(tail -n 1 "$DATA/${MAP_RUN}_prepped/utm_origin.txt")"
+```
+
+The smoke report is written under `dlio_data/live_adapter_smoke_*` by default
+and checks raw Atlas presence, P1-like raw IMU stamps, ROS-epoch normalized
+IMU/odom stamps, monotonicity, IMU period stability, RTK output, optional
+map-frame odom, and normalized Luminar point timestamp epoch/alignment.
+
+For strict raw-bag equivalence tests where every raw IMU, pose, and Luminar
+message must be counted, override the raw replay QoS to reliable and tell the
+adapter to request reliable input:
+
+```bash
+cat > "$DATA/reliable_adapter_qos.yaml" <<'EOF'
+/atlas/imu_calibrated:
+  history: keep_all
+  reliability: reliable
+  durability: volatile
+/atlas/pose_filtered:
+  history: keep_all
+  reliability: reliable
+  durability: volatile
+/luminar_front/points:
+  history: keep_last
+  depth: 100
+  reliability: reliable
+  durability: volatile
+/luminar_left/points:
+  history: keep_last
+  depth: 100
+  reliability: reliable
+  durability: volatile
+/luminar_right/points:
+  history: keep_last
+  depth: 100
+  reliability: reliable
+  durability: volatile
+/dlio_raw/luminar_front/points:
+  history: keep_last
+  depth: 100
+  reliability: reliable
+  durability: volatile
+/dlio_raw/luminar_left/points:
+  history: keep_last
+  depth: 100
+  reliability: reliable
+  durability: volatile
+/dlio_raw/luminar_right/points:
+  history: keep_last
+  depth: 100
+  reliability: reliable
+  durability: volatile
+EOF
+
+scripts/run_dlio_pipeline.sh --raw-live \
+  --raw "$RAW_BAG" \
+  --data-root "$DATA" \
+  --run "$RUN" \
+  --adapter-pose-reliability reliable \
+  --adapter-pose-qos-depth 0 \
+  --adapter-imu-reliability reliable \
+  --adapter-imu-qos-depth 0 \
+  --adapter-lidar-reliability reliable \
+  --adapter-lidar-qos-depth 100 \
+  --adapter-play-delay 30 \
+  --bag-qos-overrides "$DATA/reliable_adapter_qos.yaml"
+```
+
+For the adapter QoS depth flags, `0` means DDS `keep_all`; use it only for
+bounded offline equivalence gates, not as the default live-sensor setting.
+
+The normal live/hardware default remains `best_effort`, matching the recorded
+driver QoS. Use reliable mode only for lossless offline equivalence gates or
+when the live publisher is configured to offer reliable QoS.
+
+To summarize the prepared-reference timing/span metrics without writing another
+large bag, use:
+
+```bash
+python3 scripts/summarize_normalized_bag.py \
+  --bag "$DATA/${RUN}_prepped" \
+  --max-read-messages 120000 \
+  --json-out "$DATA/${RUN}_prepped_metrics.json"
+```
+
+`metadata.yaml` supplies the full topic counts and bag duration; the bounded
+sample supplies IMU/odom dt statistics and Luminar per-point timestamp spans.
 
 ## 2. Build the map with GLIM
 
@@ -429,10 +633,10 @@ Two latency rules worth knowing before re-tuning:
 - **Localizer logs `RTK gate: dropping gt_odom`** — Atlas covariance degraded;
   the node free-runs on IMU+GICP until quality returns (expected behavior).
 - **Localizer keeps warning `No IMU received on /gps_p1/imu (0 publishers)`
-  during replay** — you played a raw bag (it only has `/atlas/*` topics);
-  play the prepped bag. (Remapping `imu_topic` at a raw Atlas topic instead
-  trips the startup allowlist hard-guard and the node exits — the prepped
-  bag is the supported path either way.)
+  during replay** — you played a raw bag directly. Either play the prepped
+  bag, or run `dlio_input_adapter` and remap raw Luminar topics into
+  `/dlio_raw/luminar_*` as shown in section 1b. Do not point GICP/GLIM
+  directly at `/atlas/*`; the normalized `/gps_p1/*` contract is intentional.
 - **No `T_world_utm.txt` in the dump** — no RTK-fixed GNSS factor ever
   initialized (see the prep-script RTK warning). The map is usable but only
   in its local frame: localization init/GT features and the UTM mirrors won't

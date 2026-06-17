@@ -16,6 +16,7 @@ LOCAL_DEPS_PREFIX ?= $(CURDIR)/.deps
 GTSAM_POINTS_PREFIX ?= /usr/local
 LOCAL_INSTALL_RPATH ?= $(GTSAM_POINTS_PREFIX)/lib;/usr/local/cuda-11.8/lib64
 PYTHON_DEPS    ?= mcap mcap-ros2-support pyproj numpy matplotlib rosbags
+DLIO_RACE_COMMON_SETUP ?=
 
 BAG_ROOT        ?= /media/roar/data/rosbags/putnam/may_26
 DATA_ROOT       ?= ./dlio_data
@@ -37,10 +38,11 @@ MAX_POINTS      ?= 127000000
 ROS_SETUP       := /opt/ros/$(ROS_DISTRO)/setup.bash
 
 PKG_CORE          := dlio
+PKG_ADAPTER       := dlio_input_adapter
 PKG_GLIM          := glim_ros
 PKG_LOCALIZATION  := gicp_localization
 PKG_TO_TEST       := dlio
-PKG_ALL           := $(PKG_CORE) $(PKG_GLIM) $(PKG_LOCALIZATION)
+PKG_ALL           := $(PKG_CORE) $(PKG_ADAPTER) $(PKG_GLIM) $(PKG_LOCALIZATION)
 
 PREPPED         = $(DATA_ROOT)/$(RUN)_prepped
 DUMP            = $(DATA_ROOT)/$(RUN)_dump
@@ -65,6 +67,13 @@ define _source
 	if [ -f "$(GTSAM_POINTS_PREFIX)/lib/cmake/gtsam_points/gtsam_points-config.cmake" ]; then \
 		export CMAKE_PREFIX_PATH="$(GTSAM_POINTS_PREFIX):$${CMAKE_PREFIX_PATH:-}"; \
 		export LD_LIBRARY_PATH="$(GTSAM_POINTS_PREFIX)/lib:$${LD_LIBRARY_PATH:-}"; \
+	fi
+	if [ -n "$(DLIO_RACE_COMMON_SETUP)" ]; then \
+		if [ ! -f "$(DLIO_RACE_COMMON_SETUP)" ]; then \
+			echo "DLIO_RACE_COMMON_SETUP not found: $(DLIO_RACE_COMMON_SETUP)" >&2; \
+			exit 1; \
+		fi; \
+		source "$(DLIO_RACE_COMMON_SETUP)"; \
 	fi
 endef
 
@@ -148,6 +157,7 @@ help-vars:  ## Show common variables and current values
 	@printf "  %-20s  %s  (current: %s)\n" "GTSAM_POINTS_PREFIX" "CUDA gtsam_points install prefix"  "$(GTSAM_POINTS_PREFIX)"
 	@printf "  %-20s  %s  (current: %s)\n" "LOCAL_INSTALL_RPATH" "RPATH for CUDA deps"               "$(LOCAL_INSTALL_RPATH)"
 	@printf "  %-20s  %s  (current: %s)\n" "PYTHON_DEPS"         "pip packages for tools"            "$(PYTHON_DEPS)"
+	@printf "  %-20s  %s  (current: %s)\n" "DLIO_RACE_COMMON_SETUP" "Optional race_common setup.bash" "$(DLIO_RACE_COMMON_SETUP)"
 	@printf "  %-20s  %s  (current: %s)\n" "BAG_ROOT"            "Root containing run_3/run_5 bags"   "$(BAG_ROOT)"
 	@printf "  %-20s  %s  (current: %s)\n" "DATA_ROOT"           "Pipeline artifact directory"        "$(DATA_ROOT)"
 	@printf "  %-20s  %s  (current: %s)\n" "RUN"                 "Current logical run"                "$(RUN)"
@@ -172,7 +182,7 @@ check-env:  ## Print local ROS/workspace/package status
 	echo
 	if [ -f install/setup.bash ]; then \
 		echo "workspace overlay: install/setup.bash"; \
-		for pkg in glim glim_ext glim_ros gicp_localization dlio; do \
+		for pkg in fusion_engine_msgs fusion_engine_driver pointonenav_interface dlio_input_adapter glim glim_ext glim_ros gicp_localization dlio; do \
 			ros2 pkg prefix "$$pkg" 2>/dev/null || true; \
 		done; \
 	else \

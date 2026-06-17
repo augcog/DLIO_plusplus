@@ -8,10 +8,92 @@
 #
 # Usage (local ROS 2 Jazzy shell; setup.bash files are sourced when found):
 #   scripts/run_localization_replay.sh <prepped_bag_dir> <map.pcd> <T_world_utm.txt> <out_dir> [rviz=true|false]
+#   scripts/run_localization_replay.sh --raw-live --utm-origin E,N <raw_bag_dir> <map.pcd> <T_world_utm.txt> <out_dir> [rviz=true|false]
 set -u
 
+RAW_LIVE="${DLIO_USE_ADAPTER:-false}"
+ADAPTER_UTM_ORIGIN="${DLIO_ADAPTER_UTM_ORIGIN:-}"
+ADAPTER_IMU_STAMP_MODE="${DLIO_ADAPTER_IMU_STAMP_MODE:-auto}"
+ADAPTER_LOOKAHEAD="${DLIO_ADAPTER_IMU_LOOKAHEAD:-16}"
+ADAPTER_POSE_RELIABILITY="${DLIO_ADAPTER_POSE_RELIABILITY:-reliable}"
+ADAPTER_POSE_QOS_DEPTH="${DLIO_ADAPTER_POSE_QOS_DEPTH:-100}"
+ADAPTER_IMU_RELIABILITY="${DLIO_ADAPTER_IMU_RELIABILITY:-best_effort}"
+ADAPTER_IMU_QOS_DEPTH="${DLIO_ADAPTER_IMU_QOS_DEPTH:-100}"
+ADAPTER_PLAY_RATE="${DLIO_ADAPTER_PLAY_RATE:-}"
+ADAPTER_PLAY_DELAY="${DLIO_ADAPTER_PLAY_DELAY:-}"
+ADAPTER_LIDAR_RELIABILITY="${DLIO_ADAPTER_LIDAR_RELIABILITY:-best_effort}"
+ADAPTER_LIDAR_QOS_DEPTH="${DLIO_ADAPTER_LIDAR_QOS_DEPTH:-5}"
+BAG_QOS_OVERRIDES="${DLIO_BAG_QOS_OVERRIDES:-${BAG_QOS_OVERRIDES:-}}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --raw-live|--live-adapter)
+      RAW_LIVE="true"
+      shift
+      ;;
+    --utm-origin)
+      ADAPTER_UTM_ORIGIN="${2:-}"
+      shift 2
+      ;;
+    --adapter-imu-stamp-mode)
+      ADAPTER_IMU_STAMP_MODE="${2:-}"
+      shift 2
+      ;;
+    --adapter-lookahead)
+      ADAPTER_LOOKAHEAD="${2:-}"
+      shift 2
+      ;;
+    --adapter-pose-reliability)
+      ADAPTER_POSE_RELIABILITY="${2:-}"
+      shift 2
+      ;;
+    --adapter-pose-qos-depth)
+      ADAPTER_POSE_QOS_DEPTH="${2:-}"
+      shift 2
+      ;;
+    --adapter-imu-reliability)
+      ADAPTER_IMU_RELIABILITY="${2:-}"
+      shift 2
+      ;;
+    --adapter-imu-qos-depth)
+      ADAPTER_IMU_QOS_DEPTH="${2:-}"
+      shift 2
+      ;;
+    --adapter-play-rate)
+      ADAPTER_PLAY_RATE="${2:-}"
+      shift 2
+      ;;
+    --adapter-play-delay)
+      ADAPTER_PLAY_DELAY="${2:-}"
+      shift 2
+      ;;
+    --adapter-lidar-reliability)
+      ADAPTER_LIDAR_RELIABILITY="${2:-}"
+      shift 2
+      ;;
+    --adapter-lidar-qos-depth)
+      ADAPTER_LIDAR_QOS_DEPTH="${2:-}"
+      shift 2
+      ;;
+    --bag-qos-overrides)
+      BAG_QOS_OVERRIDES="${2:-}"
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "unknown option: $1" >&2
+      exit 1
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
 if [ $# -lt 4 ]; then
-  echo "usage: $0 <prepped_bag_dir> <map.pcd> <T_world_utm.txt> <out_dir> [rviz=true|false]" >&2
+  echo "usage: $0 [--raw-live --utm-origin E,N] <bag_dir> <map.pcd> <T_world_utm.txt> <out_dir> [rviz=true|false]" >&2
   exit 1
 fi
 BAG="$1"; MAP="$2"; UTM="$3"; OUT="$4"; RVIZ="${5:-false}"
@@ -25,6 +107,15 @@ GT_VETO_ENABLED="${GT_VETO_ENABLED:-true}"
 VERBOSE="${VERBOSE:-false}"
 VERBOSE_SCAN_LOG="${VERBOSE_SCAN_LOG:-false}"
 BAG_PLAY_ARGS="${BAG_PLAY_ARGS:-}"
+
+case "${RAW_LIVE,,}" in
+  true|1|yes|on) RAW_LIVE="true" ;;
+  *) RAW_LIVE="false" ;;
+esac
+if [ "$RAW_LIVE" = "true" ] && [ -z "$ADAPTER_UTM_ORIGIN" ]; then
+  echo "--raw-live requires --utm-origin E,N or DLIO_ADAPTER_UTM_ORIGIN" >&2
+  exit 1
+fi
 
 missing_input() {
   local path="$1"
@@ -56,6 +147,13 @@ source_if_exists() {
 }
 
 source_if_exists "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash"
+if [ -n "${DLIO_RACE_COMMON_SETUP:-}" ]; then
+  if [ ! -f "$DLIO_RACE_COMMON_SETUP" ]; then
+    echo "DLIO_RACE_COMMON_SETUP not found: $DLIO_RACE_COMMON_SETUP" >&2
+    exit 1
+  fi
+  source_if_exists "$DLIO_RACE_COMMON_SETUP"
+fi
 source_if_exists "$REPO/install/setup.bash"
 
 prepend_ld_library_path_if_dir() {
@@ -114,9 +212,11 @@ cleanup() {
   kill_if_running "${REC_PID:-}"
   kill_if_running "${ERR_PID:-}"
   kill_if_running "${BRIDGE_PID:-}"
+  kill_if_running "${ADAPTER_PID:-}"
   kill_if_running "${LOC_PID:-}"
   sleep 3
   pkill -9 -f gicp_localization_node 2>/dev/null
+  pkill -9 -f dlio_input_adapter_node 2>/dev/null
   pkill -9 -f utm_to_map_odom 2>/dev/null
   pkill -9 -f live_gnss_error_monitor.py 2>/dev/null
   pkill -9 -f "ros2 bag record" 2>/dev/null
@@ -153,16 +253,35 @@ stdbuf -oL -eL ros2 launch gicp_localization localization_with_tf.launch.py \
     verbose_scan_log:="$VERBOSE_SCAN_LOG" > "$OUT/localization.log" 2>&1 &
 LOC_PID=$!
 
-# Optional synthetic RTK denial (env): DENY_WINDOWS="95:135,445:495" makes the
-# bridge inflate GT covariance inside those windows (seconds from bag start) so
-# the localizer's rtk_gate drops the samples. DENY_COV_XY/_Z override variances.
-echo "[replay] starting UTM->map GT bridge${DENY_WINDOWS:+ (RTK denial: $DENY_WINDOWS)}"
-python3 "$REPO/gicp_localization/scripts/utm_to_map_odom.py" --ros-args \
-    -p utm_transform_path:="$UTM" \
-    ${DENY_WINDOWS:+-p deny_windows:="$DENY_WINDOWS"} \
-    ${DENY_COV_XY:+-p deny_cov_xy:="$DENY_COV_XY"} \
-    ${DENY_COV_Z:+-p deny_cov_z:="$DENY_COV_Z"} > "$OUT/utm_bridge.log" 2>&1 &
-BRIDGE_PID=$!
+if [ "$RAW_LIVE" = "true" ]; then
+  echo "[replay] starting DLIO input adapter (raw-live)"
+  ADAPTER_BIN="$(ros2 pkg prefix dlio_input_adapter)/lib/dlio_input_adapter/dlio_input_adapter_node"
+  "$ADAPTER_BIN" --ros-args \
+      -p use_sim_time:=true \
+      -p utm_origin:="$ADAPTER_UTM_ORIGIN" \
+      -p T_world_utm_path:="$UTM" \
+      -p imu_stamp_mode:="$ADAPTER_IMU_STAMP_MODE" \
+      -p imu_arrival_retime_lookahead:="$ADAPTER_LOOKAHEAD" \
+      -p pose_input_reliability:="$ADAPTER_POSE_RELIABILITY" \
+      -p pose_input_qos_depth:="$ADAPTER_POSE_QOS_DEPTH" \
+      -p imu_input_reliability:="$ADAPTER_IMU_RELIABILITY" \
+      -p imu_input_qos_depth:="$ADAPTER_IMU_QOS_DEPTH" \
+      -p lidar_input_reliability:="$ADAPTER_LIDAR_RELIABILITY" \
+      -p lidar_input_qos_depth:="$ADAPTER_LIDAR_QOS_DEPTH" \
+      > "$OUT/input_adapter.log" 2>&1 &
+  ADAPTER_PID=$!
+else
+  # Optional synthetic RTK denial (env): DENY_WINDOWS="95:135,445:495" makes the
+  # bridge inflate GT covariance inside those windows (seconds from bag start) so
+  # the localizer's rtk_gate drops the samples. DENY_COV_XY/_Z override variances.
+  echo "[replay] starting UTM->map GT bridge${DENY_WINDOWS:+ (RTK denial: $DENY_WINDOWS)}"
+  python3 "$REPO/gicp_localization/scripts/utm_to_map_odom.py" --ros-args \
+      -p utm_transform_path:="$UTM" \
+      ${DENY_WINDOWS:+-p deny_windows:="$DENY_WINDOWS"} \
+      ${DENY_COV_XY:+-p deny_cov_xy:="$DENY_COV_XY"} \
+      ${DENY_COV_Z:+-p deny_cov_z:="$DENY_COV_Z"} > "$OUT/utm_bridge.log" 2>&1 &
+  BRIDGE_PID=$!
+fi
 
 echo "[replay] starting live GNSS/GICP error monitor"
 python3 "$REPO/scripts/live_gnss_error_monitor.py" --ros-args \
@@ -215,7 +334,32 @@ sleep 3
 echo "[replay] playing bag (realtime, with /clock)"
 # shellcheck disable=SC2206
 EXTRA_BAG_PLAY_ARGS=($BAG_PLAY_ARGS)
-ros2 bag play "$BAG" --clock 100 "${EXTRA_BAG_PLAY_ARGS[@]}" > "$OUT/play.log" 2>&1 &
+PLAY_CMD=(ros2 bag play "$BAG" --clock 100)
+if [ -n "$ADAPTER_PLAY_RATE" ]; then
+  PLAY_CMD+=(-r "$ADAPTER_PLAY_RATE")
+fi
+if [ -n "$ADAPTER_PLAY_DELAY" ]; then
+  PLAY_CMD+=(--delay "$ADAPTER_PLAY_DELAY")
+fi
+PLAY_CMD+=("${EXTRA_BAG_PLAY_ARGS[@]}")
+if [ "$RAW_LIVE" = "true" ]; then
+  PLAY_CMD+=(
+    --topics
+    /atlas/imu_calibrated
+    /atlas/pose_filtered
+    /luminar_front/points
+    /luminar_left/points
+    /luminar_right/points
+    --remap
+    /luminar_front/points:=/dlio_raw/luminar_front/points
+    /luminar_left/points:=/dlio_raw/luminar_left/points
+    /luminar_right/points:=/dlio_raw/luminar_right/points
+  )
+  if [ -n "$BAG_QOS_OVERRIDES" ]; then
+    PLAY_CMD+=(--qos-profile-overrides-path "$BAG_QOS_OVERRIDES")
+  fi
+fi
+"${PLAY_CMD[@]}" > "$OUT/play.log" 2>&1 &
 PLAY_PID=$!
 wait "$PLAY_PID"
 echo "[replay] bag finished; letting the pipeline drain"
