@@ -42,13 +42,16 @@ def generate_launch_description():
     gt_odom_topic = LaunchConfiguration('gt_odom_topic', default='/gps_p1/filtered_odom_map')
     imu_only = LaunchConfiguration('imu_only', default='false')
     publish_tf = LaunchConfiguration('publish_tf', default='true')
-    deskew = LaunchConfiguration('deskew', default='false')
+    deskew = LaunchConfiguration('deskew', default='true')
     crop_size = LaunchConfiguration('crop_size', default='80.0')
     sensor_type = LaunchConfiguration('sensor_type', default='luminar')
     lidar_concat_enabled = LaunchConfiguration('lidar_concat_enabled', default='true')
     gt_recovery_enabled = LaunchConfiguration('gt_recovery_enabled', default='true')
+    gt_recovery_min_consecutive_failures = LaunchConfiguration(
+        'gt_recovery_min_consecutive_failures', default='4')
     gt_rejection_enabled = LaunchConfiguration('gt_rejection_enabled', default='true')
     gt_veto_enabled = LaunchConfiguration('gt_veto_enabled', default='true')
+    gt_veto_dist = LaunchConfiguration('gt_veto_dist', default='3.0')
     verbose = LaunchConfiguration('verbose', default='false')
     verbose_scan_log = LaunchConfiguration('verbose_scan_log', default='false')
     urdf_path = LaunchConfiguration(
@@ -103,12 +106,19 @@ def generate_launch_description():
     declare_gt_recovery_enabled_arg = DeclareLaunchArgument(
         'gt_recovery_enabled', default_value=gt_recovery_enabled,
         description='Override localization/gt_recovery/enable.')
+    declare_gt_recovery_min_consecutive_failures_arg = DeclareLaunchArgument(
+        'gt_recovery_min_consecutive_failures',
+        default_value=gt_recovery_min_consecutive_failures,
+        description='Override localization/gt_recovery/min_consecutive_failures.')
     declare_gt_rejection_enabled_arg = DeclareLaunchArgument(
         'gt_rejection_enabled', default_value=gt_rejection_enabled,
         description='Override localization/gt_rejection/enable.')
     declare_gt_veto_enabled_arg = DeclareLaunchArgument(
         'gt_veto_enabled', default_value=gt_veto_enabled,
         description='Override localization/gt_veto/enable.')
+    declare_gt_veto_dist_arg = DeclareLaunchArgument(
+        'gt_veto_dist', default_value=gt_veto_dist,
+        description='Override localization/gt_veto/dist_m.')
     declare_verbose_arg = DeclareLaunchArgument(
         'verbose', default_value=verbose,
         description='Override localization/verbose.')
@@ -181,8 +191,11 @@ def generate_launch_description():
             {'localization/sensor_type': LaunchConfiguration('sensor_type')},
             {'localization/lidar_concat/enabled': LaunchConfiguration('lidar_concat_enabled')},
             {'localization/gt_recovery/enable': LaunchConfiguration('gt_recovery_enabled')},
+            {'localization/gt_recovery/min_consecutive_failures':
+             LaunchConfiguration('gt_recovery_min_consecutive_failures')},
             {'localization/gt_rejection/enable': LaunchConfiguration('gt_rejection_enabled')},
             {'localization/gt_veto/enable': LaunchConfiguration('gt_veto_enabled')},
+            {'localization/gt_veto/dist_m': LaunchConfiguration('gt_veto_dist')},
             {'localization/verbose': LaunchConfiguration('verbose')},
             {'localization/debug/verbose_scan_log': LaunchConfiguration('verbose_scan_log')},
         ]
@@ -252,8 +265,10 @@ def generate_launch_description():
         declare_sensor_type_arg,
         declare_lidar_concat_enabled_arg,
         declare_gt_recovery_enabled_arg,
+        declare_gt_recovery_min_consecutive_failures_arg,
         declare_gt_rejection_enabled_arg,
         declare_gt_veto_enabled_arg,
+        declare_gt_veto_dist_arg,
         declare_verbose_arg,
         declare_verbose_scan_log_arg,
         declare_urdf_path_arg,

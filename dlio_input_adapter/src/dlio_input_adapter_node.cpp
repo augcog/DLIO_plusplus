@@ -5,6 +5,7 @@
 #include <deque>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -62,6 +63,13 @@ public:
     lidar_input_qos_depth_ = declare_parameter("lidar_input_qos_depth", 5);
     t_world_utm_path_ = declare_parameter("T_world_utm_path", "");
     summary_output_path_ = declare_parameter("summary_output_path", "");
+    imu_p1_sidecar_path_ = declare_parameter("imu_p1_sidecar_path", "");
+    imu_p1_sidecar_match_tolerance_sec_ =
+      declare_parameter("imu_p1_sidecar_match_tolerance_sec", 0.02);
+
+    if (!imu_p1_sidecar_path_.empty()) {
+      loadImuP1Sidecar(imu_p1_sidecar_path_);
+    }
 
     double origin_e = 0.0;
     double origin_n = 0.0;
@@ -146,7 +154,13 @@ public:
         << " rtk_out=" << rtk_out_count_
         << " map_odom_out=" << map_odom_out_count_
         << " imu_in=" << imu_in_count_
-        << " imu_out=" << imu_out_count_ << "\n";
+        << " imu_out=" << imu_out_count_;
+    if (!imu_p1_sidecar_.empty()) {
+      out << " imu_p1_sidecar_match=" << imu_p1_sidecar_match_count_
+          << " imu_p1_sidecar_miss=" << imu_p1_sidecar_miss_count_
+          << " imu_p1_sidecar_skip=" << imu_p1_sidecar_skip_count_;
+    }
+    out << "\n";
     for (const auto& item : lidar_in_count_by_output_) {
       const auto out_it = lidar_out_count_by_output_.find(item.first);
       const uint64_t out_count = out_it == lidar_out_count_by_output_.end() ? 0 : out_it->second;
@@ -170,6 +184,101 @@ private:
     double arrival = 0.0;
     double p1 = 0.0;
   };
+
+  struct ImuP1SidecarSample {
+    double capture_ros = 0.0;
+    double p1_time = 0.0;
+  };
+
+  static std::vector<std::string> splitCsvLine(const std::string& line)
+  {
+    std::vector<std::string> cells;
+    std::stringstream ss(line);
+    std::string cell;
+    while (std::getline(ss, cell, ',')) {
+      cells.push_back(cell);
+    }
+    return cells;
+  }
+
+  void loadImuP1Sidecar(const std::string& path)
+  {
+    std::ifstream in(path);
+    if (!in) {
+      throw std::runtime_error("failed to open imu_p1_sidecar_path: " + path);
+    }
+
+    std::string line;
+    while (std::getline(in, line)) {
+      if (line.empty() || line[0] == '#') {
+        continue;
+      }
+      const auto cells = splitCsvLine(line);
+      if (cells.size() < 2) {
+        continue;
+      }
+      try {
+        const double capture_ros = std::stod(cells[0]);
+        const double p1_time = std::stod(cells[1]);
+        if (std::isfinite(capture_ros) && std::isfinite(p1_time) &&
+            capture_ros > 0.0 && p1_time > 0.0) {
+          imu_p1_sidecar_.push_back({capture_ros, p1_time});
+        }
+      } catch (const std::exception&) {
+        // Header or malformed line.
+      }
+    }
+
+    std::sort(
+      imu_p1_sidecar_.begin(), imu_p1_sidecar_.end(),
+      [](const auto& a, const auto& b) { return a.capture_ros < b.capture_ros; });
+    if (imu_p1_sidecar_.empty()) {
+      throw std::runtime_error("imu_p1_sidecar_path contained no usable samples: " + path);
+    }
+    RCLCPP_INFO(
+      get_logger(),
+      "Loaded IMU P1 sidecar: %zu samples from %s (match_tolerance=%.3f ms)",
+      imu_p1_sidecar_.size(), path.c_str(), imu_p1_sidecar_match_tolerance_sec_ * 1e3);
+  }
+
+  bool lookupSidecarP1(double capture_ros, double& p1_time)
+  {
+    if (imu_p1_sidecar_.empty()) {
+      return false;
+    }
+
+    const double tol = std::max(0.0, imu_p1_sidecar_match_tolerance_sec_);
+    while (imu_p1_sidecar_index_ < imu_p1_sidecar_.size() &&
+           imu_p1_sidecar_[imu_p1_sidecar_index_].capture_ros < capture_ros - tol) {
+      ++imu_p1_sidecar_index_;
+      ++imu_p1_sidecar_skip_count_;
+    }
+
+    size_t best = imu_p1_sidecar_.size();
+    double best_abs_dt = std::numeric_limits<double>::infinity();
+    const size_t begin = imu_p1_sidecar_index_ > 0 ? imu_p1_sidecar_index_ - 1 : 0;
+    const size_t end = std::min(imu_p1_sidecar_.size(), imu_p1_sidecar_index_ + 3);
+    for (size_t i = begin; i < end; ++i) {
+      const double abs_dt = std::abs(imu_p1_sidecar_[i].capture_ros - capture_ros);
+      if (abs_dt <= tol && abs_dt < best_abs_dt) {
+        best = i;
+        best_abs_dt = abs_dt;
+      }
+    }
+
+    if (best == imu_p1_sidecar_.size()) {
+      ++imu_p1_sidecar_miss_count_;
+      return false;
+    }
+
+    p1_time = imu_p1_sidecar_[best].p1_time;
+    if (best >= imu_p1_sidecar_index_) {
+      imu_p1_sidecar_skip_count_ += best - imu_p1_sidecar_index_;
+    }
+    imu_p1_sidecar_index_ = best + 1;
+    ++imu_p1_sidecar_match_count_;
+    return true;
+  }
 
   void addLidarBridge(const std::string& input_topic, const std::string& output_topic)
   {
@@ -327,6 +436,22 @@ private:
     ++imu_in_count_;
     last_imu_wall_time_ = std::chrono::steady_clock::now();
     const double stamp = stampToSec(msg->header.stamp);
+    if (!imu_p1_sidecar_.empty()) {
+      double sidecar_p1 = 0.0;
+      if (lookupSidecarP1(stamp, sidecar_p1)) {
+        QueuedImu queued;
+        queued.msg = *msg;
+        queued.p1 = sidecar_p1;
+        p1_imu_queue_.push_back(std::move(queued));
+        flushP1ImuQueue();
+        return;
+      }
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "No IMU P1 sidecar match for capture stamp %.6f; falling back to imu_stamp_mode=%s.",
+        stamp, imu_stamp_mode_.c_str());
+    }
+
     const bool p1_like = stamp > 0.0 && stamp < p1_like_threshold_sec_;
     const bool use_p1 = imu_stamp_mode_ == "p1" || (imu_stamp_mode_ == "auto" && p1_like);
 
@@ -491,9 +616,11 @@ private:
   std::string pose_input_reliability_;
   std::string imu_input_reliability_;
   std::string lidar_input_reliability_;
+  std::string imu_p1_sidecar_path_;
 
   P1ClockMapper clock_mapper_;
   double p1_like_threshold_sec_ = 100000000.0;
+  double imu_p1_sidecar_match_tolerance_sec_ = 0.02;
   size_t imu_lookahead_ = 128;
   double imu_flush_timeout_sec_ = 0.5;
   double nominal_imu_period_sec_ = 0.01;
@@ -520,6 +647,8 @@ private:
   std::vector<double> imu_period_samples_;
   std::deque<QueuedImu> arrival_imu_queue_;
   std::deque<QueuedImu> p1_imu_queue_;
+  std::vector<ImuP1SidecarSample> imu_p1_sidecar_;
+  size_t imu_p1_sidecar_index_ = 0;
   std::map<std::string, double> last_stamp_by_topic_;
 
   rclcpp::CallbackGroup::SharedPtr pose_group_;
@@ -545,6 +674,9 @@ private:
   uint64_t map_odom_out_count_ = 0;
   uint64_t imu_in_count_ = 0;
   uint64_t imu_out_count_ = 0;
+  uint64_t imu_p1_sidecar_match_count_ = 0;
+  uint64_t imu_p1_sidecar_miss_count_ = 0;
+  uint64_t imu_p1_sidecar_skip_count_ = 0;
   std::map<std::string, uint64_t> lidar_in_count_by_output_;
   std::map<std::string, uint64_t> lidar_out_count_by_output_;
 

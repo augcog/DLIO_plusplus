@@ -16,6 +16,8 @@ def generate_launch_description():
     utm_origin_output_path = LaunchConfiguration("utm_origin_output_path")
     t_world_utm_path = LaunchConfiguration("T_world_utm_path")
     imu_stamp_mode = LaunchConfiguration("imu_stamp_mode")
+    imu_p1_sidecar_path = LaunchConfiguration("imu_p1_sidecar_path")
+    imu_p1_sidecar_match_tolerance_sec = LaunchConfiguration("imu_p1_sidecar_match_tolerance_sec")
 
     return LaunchDescription([
         DeclareLaunchArgument("params_file", default_value=default_params),
@@ -24,6 +26,8 @@ def generate_launch_description():
         DeclareLaunchArgument("utm_origin_output_path", default_value=""),
         DeclareLaunchArgument("T_world_utm_path", default_value=""),
         DeclareLaunchArgument("imu_stamp_mode", default_value="auto"),
+        DeclareLaunchArgument("imu_p1_sidecar_path", default_value=""),
+        DeclareLaunchArgument("imu_p1_sidecar_match_tolerance_sec", default_value="0.02"),
         Node(
             package="dlio_input_adapter",
             executable="dlio_input_adapter_node",
@@ -37,6 +41,8 @@ def generate_launch_description():
                     "utm_origin_output_path": utm_origin_output_path,
                     "T_world_utm_path": t_world_utm_path,
                     "imu_stamp_mode": imu_stamp_mode,
+                    "imu_p1_sidecar_path": imu_p1_sidecar_path,
+                    "imu_p1_sidecar_match_tolerance_sec": imu_p1_sidecar_match_tolerance_sec,
                 },
             ],
         ),

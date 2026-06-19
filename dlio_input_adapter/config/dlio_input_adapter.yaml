@@ -17,6 +17,8 @@
     imu_input_reliability: "best_effort"
     imu_input_qos_depth: 100
     p1_clock_bin_seconds: 60.0
+    imu_p1_sidecar_path: ""
+    imu_p1_sidecar_match_tolerance_sec: 0.02
 
     imu_frame_id: "gps_antenna_top"
     body_frame_id: "gps_antenna_top"

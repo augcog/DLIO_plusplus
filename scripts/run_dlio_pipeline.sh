@@ -134,6 +134,10 @@ optional:
                           Adapter input QoS for raw-live IMU replay.
   --adapter-imu-qos-depth <n>
                           Adapter input QoS depth for raw-live IMU replay; 0 means keep_all.
+  --adapter-imu-p1-pcap <f>
+                          Decode Point One IMU_OUTPUT online from this PCAP in
+                          raw-live mode instead of replaying /atlas/imu_calibrated
+                          from the raw bag.
   --adapter-play-rate <r> Optional ros2 bag play rate for raw-live mode.
   --adapter-play-delay <s>
                           Optional ros2 bag play startup delay in seconds.
@@ -146,6 +150,9 @@ optional:
                           Explicit UTM origin for raw-live localization.
   --adapter-t-world-utm <f>
                           Override T_world_utm.txt for raw-live localization.
+  --gt-recovery-min-consecutive-failures <n>
+                          Override GICP GT recovery trigger count. Default: 4.
+  --gt-veto-dist <m>      Override GICP GT veto distance in meters. Default: 3.0.
   --dry-run               Validate config, paths, and output choices, then exit
                           before prep/mapping/localization starts.
   -h, --help              Show this help
@@ -206,6 +213,7 @@ ADAPTER_POSE_RELIABILITY="${DLIO_ADAPTER_POSE_RELIABILITY:-${ADAPTER_POSE_RELIAB
 ADAPTER_POSE_QOS_DEPTH="${DLIO_ADAPTER_POSE_QOS_DEPTH:-${ADAPTER_POSE_QOS_DEPTH:-100}}"
 ADAPTER_IMU_RELIABILITY="${DLIO_ADAPTER_IMU_RELIABILITY:-${ADAPTER_IMU_RELIABILITY:-best_effort}}"
 ADAPTER_IMU_QOS_DEPTH="${DLIO_ADAPTER_IMU_QOS_DEPTH:-${ADAPTER_IMU_QOS_DEPTH:-100}}"
+ADAPTER_IMU_P1_PCAP="${DLIO_ADAPTER_IMU_P1_PCAP:-${ADAPTER_IMU_P1_PCAP:-}}"
 ADAPTER_PLAY_RATE="${DLIO_ADAPTER_PLAY_RATE:-${ADAPTER_PLAY_RATE:-}}"
 ADAPTER_PLAY_DELAY="${DLIO_ADAPTER_PLAY_DELAY:-${ADAPTER_PLAY_DELAY:-}}"
 ADAPTER_LIDAR_RELIABILITY="${DLIO_ADAPTER_LIDAR_RELIABILITY:-${ADAPTER_LIDAR_RELIABILITY:-best_effort}}"
@@ -213,6 +221,8 @@ ADAPTER_LIDAR_QOS_DEPTH="${DLIO_ADAPTER_LIDAR_QOS_DEPTH:-${ADAPTER_LIDAR_QOS_DEP
 BAG_QOS_OVERRIDES="${DLIO_BAG_QOS_OVERRIDES:-${BAG_QOS_OVERRIDES:-}}"
 ADAPTER_UTM_ORIGIN="${DLIO_ADAPTER_UTM_ORIGIN:-${ADAPTER_UTM_ORIGIN:-}}"
 ADAPTER_T_WORLD_UTM="${DLIO_ADAPTER_T_WORLD_UTM:-${ADAPTER_T_WORLD_UTM:-}}"
+GT_RECOVERY_MIN_CONSECUTIVE_FAILURES="${DLIO_GT_RECOVERY_MIN_CONSECUTIVE_FAILURES:-${GT_RECOVERY_MIN_CONSECUTIVE_FAILURES:-4}}"
+GT_VETO_DIST="${DLIO_GT_VETO_DIST:-${GT_VETO_DIST:-3.0}}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -278,6 +288,10 @@ while [ $# -gt 0 ]; do
       ADAPTER_IMU_QOS_DEPTH="${2:-}"
       shift 2
       ;;
+    --adapter-imu-p1-pcap)
+      ADAPTER_IMU_P1_PCAP="${2:-}"
+      shift 2
+      ;;
     --adapter-play-rate)
       ADAPTER_PLAY_RATE="${2:-}"
       shift 2
@@ -304,6 +318,14 @@ while [ $# -gt 0 ]; do
       ;;
     --adapter-t-world-utm)
       ADAPTER_T_WORLD_UTM="${2:-}"
+      shift 2
+      ;;
+    --gt-recovery-min-consecutive-failures)
+      GT_RECOVERY_MIN_CONSECUTIVE_FAILURES="${2:-}"
+      shift 2
+      ;;
+    --gt-veto-dist)
+      GT_VETO_DIST="${2:-}"
       shift 2
       ;;
     --dry-run)
@@ -366,6 +388,10 @@ if [ "$USE_ADAPTER" = "true" ] && [ -n "$PREPPED_INPUT" ]; then
   echo "--raw-live/--live-adapter requires --raw; --prepped is already normalized" >&2
   exit 1
 fi
+if [ -n "$ADAPTER_IMU_P1_PCAP" ] && [ "$ADAPTER_IMU_STAMP_MODE" = "arrival_retime" ]; then
+  echo "--adapter-imu-p1-pcap requires --adapter-imu-stamp-mode auto or p1" >&2
+  exit 1
+fi
 
 source_if_exists "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash"
 if [ -n "${DLIO_RACE_COMMON_SETUP:-}" ]; then
@@ -414,6 +440,10 @@ if [ -n "$RAW" ] && [ ! -e "$RAW" ]; then
 fi
 if [ -n "$PREPPED_INPUT" ] && [ ! -e "$PREPPED_INPUT" ]; then
   echo "prepped input does not exist: $PREPPED_INPUT" >&2
+  exit 1
+fi
+if [ -n "$ADAPTER_IMU_P1_PCAP" ] && [ ! -e "$ADAPTER_IMU_P1_PCAP" ]; then
+  echo "adapter IMU PCAP does not exist: $ADAPTER_IMU_P1_PCAP" >&2
   exit 1
 fi
 mkdir -p "$DATA_ROOT"
@@ -500,6 +530,11 @@ fi
 if [ "$USE_ADAPTER" = "true" ] && [ -n "$ADAPTER_UTM_ORIGIN" ]; then
   echo "[pipeline] adapter UTM origin: $ADAPTER_UTM_ORIGIN"
 fi
+if [ "$USE_ADAPTER" = "true" ] && [ -n "$ADAPTER_IMU_P1_PCAP" ]; then
+  echo "[pipeline] adapter IMU PCAP: $ADAPTER_IMU_P1_PCAP"
+fi
+echo "[pipeline] GT recovery min consecutive failures: $GT_RECOVERY_MIN_CONSECUTIVE_FAILURES"
+echo "[pipeline] GT veto distance: $GT_VETO_DIST"
 
 if [ "$DRY_RUN" = "true" ]; then
   echo "[pipeline] dry run complete; exiting before prep/mapping/localization"
@@ -555,23 +590,24 @@ run_raw_live_mapping() {
   if [ -n "$ADAPTER_PLAY_DELAY" ]; then
     play_cmd+=(--delay "$ADAPTER_PLAY_DELAY")
   fi
+  local raw_topics=(/atlas/pose_filtered /luminar_front/points /luminar_left/points /luminar_right/points)
+  if [ -z "$ADAPTER_IMU_P1_PCAP" ]; then
+    raw_topics=(/atlas/imu_calibrated "${raw_topics[@]}")
+  fi
   play_cmd+=(
     --topics
-    /atlas/imu_calibrated
-    /atlas/pose_filtered
-    /luminar_front/points
-    /luminar_left/points
-    /luminar_right/points
+    "${raw_topics[@]}"
     --remap
     /luminar_front/points:=/dlio_raw/luminar_front/points
-          /luminar_left/points:=/dlio_raw/luminar_left/points
-          /luminar_right/points:=/dlio_raw/luminar_right/points
+    /luminar_left/points:=/dlio_raw/luminar_left/points
+    /luminar_right/points:=/dlio_raw/luminar_right/points
   )
   if [ -n "$BAG_QOS_OVERRIDES" ]; then
     play_cmd+=(--qos-profile-overrides-path "$BAG_QOS_OVERRIDES")
   fi
 
   local ADAPTER_PID=""
+  local PCAP_IMU_PID=""
   local GLIM_PID=""
   local REC_PID=""
   local PLAY_PID=""
@@ -579,12 +615,24 @@ run_raw_live_mapping() {
     stop_process "$PLAY_PID" 20
     stop_process "$REC_PID" 30
     stop_process "$GLIM_PID" 180
+    stop_process "$PCAP_IMU_PID" 20
     stop_process "$ADAPTER_PID" 20
   }
   trap cleanup_raw_live_mapping EXIT INT TERM
 
   "${adapter_args[@]}" > "$ADAPTER_OUT/adapter.log" 2>&1 &
   ADAPTER_PID=$!
+  if [ -n "$ADAPTER_IMU_P1_PCAP" ]; then
+    local pcap_imu_bin
+    pcap_imu_bin="$(ros2 pkg prefix dlio_input_adapter)/lib/dlio_input_adapter/p1_imu_pcap_replay_node.py"
+    "$pcap_imu_bin" --ros-args \
+      -p use_sim_time:=true \
+      -p pcap_path:="$ADAPTER_IMU_P1_PCAP" \
+      -p output_topic:=/atlas/imu_calibrated \
+      -p pace_mode:=clock \
+      > "$ADAPTER_OUT/p1_imu_pcap_replay.log" 2>&1 &
+    PCAP_IMU_PID=$!
+  fi
   sleep 3
 
   ros2 run glim_ros glim_rosnode --ros-args -p dump_path:="$DUMP" \
@@ -680,12 +728,17 @@ if [ "$USE_ADAPTER" = "true" ]; then
     --adapter-imu-qos-depth "$ADAPTER_IMU_QOS_DEPTH"
     --adapter-lidar-reliability "$ADAPTER_LIDAR_RELIABILITY"
     --adapter-lidar-qos-depth "$ADAPTER_LIDAR_QOS_DEPTH"
+    --gt-recovery-min-consecutive-failures "$GT_RECOVERY_MIN_CONSECUTIVE_FAILURES"
+    --gt-veto-dist "$GT_VETO_DIST"
   )
   if [ -n "$ADAPTER_PLAY_RATE" ]; then
     LOC_REPLAY_CMD+=(--adapter-play-rate "$ADAPTER_PLAY_RATE")
   fi
   if [ -n "$ADAPTER_PLAY_DELAY" ]; then
     LOC_REPLAY_CMD+=(--adapter-play-delay "$ADAPTER_PLAY_DELAY")
+  fi
+  if [ -n "$ADAPTER_IMU_P1_PCAP" ]; then
+    LOC_REPLAY_CMD+=(--adapter-imu-p1-pcap "$ADAPTER_IMU_P1_PCAP")
   fi
   if [ -n "$BAG_QOS_OVERRIDES" ]; then
     LOC_REPLAY_CMD+=(--bag-qos-overrides "$BAG_QOS_OVERRIDES")
@@ -700,6 +753,8 @@ if [ "$USE_ADAPTER" = "true" ]; then
   "${LOC_REPLAY_CMD[@]}"
 else
   "$REPO/scripts/run_localization_replay.sh" \
+    --gt-recovery-min-consecutive-failures "$GT_RECOVERY_MIN_CONSECUTIVE_FAILURES" \
+    --gt-veto-dist "$GT_VETO_DIST" \
     "$PREPPED" \
     "$REF_MAP" \
     "$REF_UTM" \

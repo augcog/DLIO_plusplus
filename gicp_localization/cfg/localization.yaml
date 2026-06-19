@@ -206,12 +206,11 @@
 
     # IMU and Deskewing Parameters
     # NOTE: Luminar per-point timestamps are NOT collapsed (verified on the
-    # may_26 putnam bags: uint64 ns stamps spanning the full 49 ms scan,
-    # ~16k unique values per scan). Deskew stays off here as the conservative
-    # production default until each deployment has run the validation checklist
-    # against its exact driver/bag path. At 20 m/s an undeskewed scan smears
-    # ~1 m; enable deskew for validated high-speed runs.
-    dlio/deskew: false
+    # may_26 Putnam bags: uint64 ns stamps spanning the full 49 ms scan,
+    # ~16k unique values per scan). Deskew is enabled by default so high-speed
+    # runs compensate intra-scan motion using the validated per-point time field.
+    # Set false only for controlled timestamp/fitness A/B tests.
+    dlio/deskew: true
     dlio/gravity: 9.81  # Gravity magnitude (m/s^2)
     dlio/imu/bufferSize: 2000  # IMU buffer size
     # Hard guard on IMU topic remap. When true, node startup fails unless the

@@ -51,6 +51,11 @@ install(TARGETS dlio_input_adapter_utils dlio_input_adapter_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
+install(PROGRAMS
+  scripts/p1_imu_pcap_replay_node.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 install(DIRECTORY include/
   DESTINATION include
 )

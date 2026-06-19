@@ -156,6 +156,39 @@ prepared-bag overrides there. `scripts/run_dlio_pipeline.sh` reads it
 automatically, and any CLI flag you pass still overrides the file for that
 one run.
 
+### Online Raw Replay
+
+For on-vehicle-style replay, use the raw-live adapter path instead of writing a
+prepared bag. The MCAP replay supplies Atlas pose and Luminar clouds; when a
+Point One INS PCAP is provided, `p1_imu_pcap_replay_node.py` decodes
+FusionEngine `IMU_OUTPUT` sequentially as the replay clock advances and
+publishes `/atlas/imu_calibrated` stamped from `IMUOutput.p1_time`.
+`dlio_input_adapter` then publishes the normalized `/gps_p1/*` and
+`/luminar_*` topics consumed by GICP. This runtime path does not require a
+pre-scanned sidecar or CSV.
+
+```bash
+RAW_BAG="${RAW_BAG:-/path/to/raw/rosbag2_dir}"
+P1_INS_PCAP="${P1_INS_PCAP:-/path/to/pointone_ins.pcap}"
+DATA="${DATA:-./dlio_data}"
+RUN="${RUN:-run_3}"
+MAP_RUN="${MAP_RUN:-run_5}"
+
+scripts/run_dlio_pipeline.sh --raw-live \
+  --raw "$RAW_BAG" \
+  --data-root "$DATA" \
+  --run "$RUN" \
+  --map-run "$MAP_RUN" \
+  --adapter-imu-p1-pcap "$P1_INS_PCAP" \
+  --gt-recovery-min-consecutive-failures 1 \
+  --gt-veto-dist 1.0 \
+  --rviz true
+```
+
+When `--adapter-imu-p1-pcap` is set, the wrapper intentionally does not replay
+the MCAP `/atlas/imu_calibrated` topic. Pose, LiDAR, and `/clock` still come
+from the raw bag; IMU comes directly from the Point One PCAP.
+
 1. **Record** a bag containing IMU + LiDAR + GNSS topics during a driving session.
 1b. **Prep** the bag with `scripts/prep_bag.py` (topic conversion, IMU/GNSS
    re-stamping, UTM odometry — see PIPELINE.md §1).

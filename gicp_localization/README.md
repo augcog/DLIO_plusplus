@@ -190,7 +190,7 @@ When `gt_recovery/enable=true`, the node caches the `base_frame ← child_frame_
 ### IMU + observer
 
 ```yaml
-dlio/deskew: false                 # Conservative default; enable for validated Luminar deskew runs
+dlio/deskew: true                  # Default-on Luminar per-point motion compensation
 dlio/imu/bufferSize: 2000
 dlio/imu/calibTime: 0.5            # initial stationary calibration window
 

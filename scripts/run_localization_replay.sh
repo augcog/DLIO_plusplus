@@ -8,7 +8,8 @@
 #
 # Usage (local ROS 2 Jazzy shell; setup.bash files are sourced when found):
 #   scripts/run_localization_replay.sh <prepped_bag_dir> <map.pcd> <T_world_utm.txt> <out_dir> [rviz=true|false]
-#   scripts/run_localization_replay.sh --raw-live --utm-origin E,N <raw_bag_dir> <map.pcd> <T_world_utm.txt> <out_dir> [rviz=true|false]
+#   scripts/run_localization_replay.sh --raw-live --utm-origin E,N \
+#     [--adapter-imu-p1-pcap ins.pcap] <raw_bag_dir> <map.pcd> <T_world_utm.txt> <out_dir> [rviz=true|false]
 set -u
 
 RAW_LIVE="${DLIO_USE_ADAPTER:-false}"
@@ -19,6 +20,9 @@ ADAPTER_POSE_RELIABILITY="${DLIO_ADAPTER_POSE_RELIABILITY:-reliable}"
 ADAPTER_POSE_QOS_DEPTH="${DLIO_ADAPTER_POSE_QOS_DEPTH:-100}"
 ADAPTER_IMU_RELIABILITY="${DLIO_ADAPTER_IMU_RELIABILITY:-best_effort}"
 ADAPTER_IMU_QOS_DEPTH="${DLIO_ADAPTER_IMU_QOS_DEPTH:-100}"
+ADAPTER_IMU_P1_SIDECAR="${DLIO_ADAPTER_IMU_P1_SIDECAR:-}"
+ADAPTER_IMU_P1_SIDECAR_TOLERANCE="${DLIO_ADAPTER_IMU_P1_SIDECAR_TOLERANCE:-0.02}"
+ADAPTER_IMU_P1_PCAP="${DLIO_ADAPTER_IMU_P1_PCAP:-}"
 ADAPTER_PLAY_RATE="${DLIO_ADAPTER_PLAY_RATE:-}"
 ADAPTER_PLAY_DELAY="${DLIO_ADAPTER_PLAY_DELAY:-}"
 ADAPTER_LIDAR_RELIABILITY="${DLIO_ADAPTER_LIDAR_RELIABILITY:-best_effort}"
@@ -58,6 +62,26 @@ while [ $# -gt 0 ]; do
       ADAPTER_IMU_QOS_DEPTH="${2:-}"
       shift 2
       ;;
+    --adapter-imu-p1-sidecar)
+      ADAPTER_IMU_P1_SIDECAR="${2:-}"
+      shift 2
+      ;;
+    --adapter-imu-p1-sidecar-tolerance)
+      ADAPTER_IMU_P1_SIDECAR_TOLERANCE="${2:-}"
+      shift 2
+      ;;
+    --adapter-imu-p1-pcap)
+      ADAPTER_IMU_P1_PCAP="${2:-}"
+      shift 2
+      ;;
+    --gt-recovery-min-consecutive-failures)
+      GT_RECOVERY_MIN_CONSECUTIVE_FAILURES="${2:-}"
+      shift 2
+      ;;
+    --gt-veto-dist)
+      GT_VETO_DIST="${2:-}"
+      shift 2
+      ;;
     --adapter-play-rate)
       ADAPTER_PLAY_RATE="${2:-}"
       shift 2
@@ -93,17 +117,19 @@ while [ $# -gt 0 ]; do
 done
 
 if [ $# -lt 4 ]; then
-  echo "usage: $0 [--raw-live --utm-origin E,N] <bag_dir> <map.pcd> <T_world_utm.txt> <out_dir> [rviz=true|false]" >&2
+  echo "usage: $0 [--raw-live --utm-origin E,N] [--adapter-imu-p1-pcap ins.pcap] <bag_dir> <map.pcd> <T_world_utm.txt> <out_dir> [rviz=true|false]" >&2
   exit 1
 fi
 BAG="$1"; MAP="$2"; UTM="$3"; OUT="$4"; RVIZ="${5:-false}"
-DESKEW="${DESKEW:-false}"
+DESKEW="${DESKEW:-true}"
 CROP_SIZE="${CROP_SIZE:-80.0}"
 SENSOR_TYPE="${SENSOR_TYPE:-luminar}"
 LIDAR_CONCAT_ENABLED="${LIDAR_CONCAT_ENABLED:-true}"
 GT_RECOVERY_ENABLED="${GT_RECOVERY_ENABLED:-true}"
+GT_RECOVERY_MIN_CONSECUTIVE_FAILURES="${GT_RECOVERY_MIN_CONSECUTIVE_FAILURES:-4}"
 GT_REJECTION_ENABLED="${GT_REJECTION_ENABLED:-true}"
 GT_VETO_ENABLED="${GT_VETO_ENABLED:-true}"
+GT_VETO_DIST="${GT_VETO_DIST:-3.0}"
 VERBOSE="${VERBOSE:-false}"
 VERBOSE_SCAN_LOG="${VERBOSE_SCAN_LOG:-false}"
 BAG_PLAY_ARGS="${BAG_PLAY_ARGS:-}"
@@ -114,6 +140,14 @@ case "${RAW_LIVE,,}" in
 esac
 if [ "$RAW_LIVE" = "true" ] && [ -z "$ADAPTER_UTM_ORIGIN" ]; then
   echo "--raw-live requires --utm-origin E,N or DLIO_ADAPTER_UTM_ORIGIN" >&2
+  exit 1
+fi
+if [ -n "$ADAPTER_IMU_P1_PCAP" ] && [ -n "$ADAPTER_IMU_P1_SIDECAR" ]; then
+  echo "--adapter-imu-p1-pcap and --adapter-imu-p1-sidecar are mutually exclusive" >&2
+  exit 1
+fi
+if [ -n "$ADAPTER_IMU_P1_PCAP" ] && [ "$ADAPTER_IMU_STAMP_MODE" = "arrival_retime" ]; then
+  echo "--adapter-imu-p1-pcap requires --adapter-imu-stamp-mode auto or p1" >&2
   exit 1
 fi
 
@@ -203,6 +237,9 @@ kill_if_running() {
 for f in "$BAG" "$MAP" "$UTM"; do
   [ -e "$f" ] || missing_input "$f"
 done
+if [ -n "$ADAPTER_IMU_P1_PCAP" ]; then
+  [ -e "$ADAPTER_IMU_P1_PCAP" ] || missing_input "$ADAPTER_IMU_P1_PCAP"
+fi
 mkdir -p "$OUT"
 [ -e "$OUT/loc_eval" ] && { echo "$OUT/loc_eval already exists — choose a fresh out_dir" >&2; exit 1; }
 
@@ -213,10 +250,12 @@ cleanup() {
   kill_if_running "${ERR_PID:-}"
   kill_if_running "${BRIDGE_PID:-}"
   kill_if_running "${ADAPTER_PID:-}"
+  kill_if_running "${PCAP_IMU_PID:-}"
   kill_if_running "${LOC_PID:-}"
   sleep 3
   pkill -9 -f gicp_localization_node 2>/dev/null
   pkill -9 -f dlio_input_adapter_node 2>/dev/null
+  pkill -9 -f p1_imu_pcap_replay_node.py 2>/dev/null
   pkill -9 -f utm_to_map_odom 2>/dev/null
   pkill -9 -f live_gnss_error_monitor.py 2>/dev/null
   pkill -9 -f "ros2 bag record" 2>/dev/null
@@ -247,8 +286,10 @@ stdbuf -oL -eL ros2 launch gicp_localization localization_with_tf.launch.py \
     sensor_type:="$SENSOR_TYPE" \
     lidar_concat_enabled:="$LIDAR_CONCAT_ENABLED" \
     gt_recovery_enabled:="$GT_RECOVERY_ENABLED" \
+    gt_recovery_min_consecutive_failures:="$GT_RECOVERY_MIN_CONSECUTIVE_FAILURES" \
     gt_rejection_enabled:="$GT_REJECTION_ENABLED" \
     gt_veto_enabled:="$GT_VETO_ENABLED" \
+    gt_veto_dist:="$GT_VETO_DIST" \
     verbose:="$VERBOSE" \
     verbose_scan_log:="$VERBOSE_SCAN_LOG" > "$OUT/localization.log" 2>&1 &
 LOC_PID=$!
@@ -256,20 +297,39 @@ LOC_PID=$!
 if [ "$RAW_LIVE" = "true" ]; then
   echo "[replay] starting DLIO input adapter (raw-live)"
   ADAPTER_BIN="$(ros2 pkg prefix dlio_input_adapter)/lib/dlio_input_adapter/dlio_input_adapter_node"
-  "$ADAPTER_BIN" --ros-args \
-      -p use_sim_time:=true \
-      -p utm_origin:="$ADAPTER_UTM_ORIGIN" \
-      -p T_world_utm_path:="$UTM" \
-      -p imu_stamp_mode:="$ADAPTER_IMU_STAMP_MODE" \
-      -p imu_arrival_retime_lookahead:="$ADAPTER_LOOKAHEAD" \
-      -p pose_input_reliability:="$ADAPTER_POSE_RELIABILITY" \
-      -p pose_input_qos_depth:="$ADAPTER_POSE_QOS_DEPTH" \
-      -p imu_input_reliability:="$ADAPTER_IMU_RELIABILITY" \
-      -p imu_input_qos_depth:="$ADAPTER_IMU_QOS_DEPTH" \
-      -p lidar_input_reliability:="$ADAPTER_LIDAR_RELIABILITY" \
-      -p lidar_input_qos_depth:="$ADAPTER_LIDAR_QOS_DEPTH" \
-      > "$OUT/input_adapter.log" 2>&1 &
+  ADAPTER_CMD=(
+    "$ADAPTER_BIN" --ros-args
+    -p use_sim_time:=true
+    -p utm_origin:="$ADAPTER_UTM_ORIGIN"
+    -p T_world_utm_path:="$UTM"
+    -p imu_stamp_mode:="$ADAPTER_IMU_STAMP_MODE"
+    -p imu_arrival_retime_lookahead:="$ADAPTER_LOOKAHEAD"
+    -p pose_input_reliability:="$ADAPTER_POSE_RELIABILITY"
+    -p pose_input_qos_depth:="$ADAPTER_POSE_QOS_DEPTH"
+    -p imu_input_reliability:="$ADAPTER_IMU_RELIABILITY"
+    -p imu_input_qos_depth:="$ADAPTER_IMU_QOS_DEPTH"
+    -p lidar_input_reliability:="$ADAPTER_LIDAR_RELIABILITY"
+    -p lidar_input_qos_depth:="$ADAPTER_LIDAR_QOS_DEPTH"
+  )
+  if [ -n "$ADAPTER_IMU_P1_SIDECAR" ]; then
+    ADAPTER_CMD+=(
+      -p imu_p1_sidecar_path:="$ADAPTER_IMU_P1_SIDECAR"
+      -p imu_p1_sidecar_match_tolerance_sec:="$ADAPTER_IMU_P1_SIDECAR_TOLERANCE"
+    )
+  fi
+  "${ADAPTER_CMD[@]}" > "$OUT/input_adapter.log" 2>&1 &
   ADAPTER_PID=$!
+  if [ -n "$ADAPTER_IMU_P1_PCAP" ]; then
+    echo "[replay] starting Point One PCAP IMU source: $ADAPTER_IMU_P1_PCAP"
+    PCAP_IMU_BIN="$(ros2 pkg prefix dlio_input_adapter)/lib/dlio_input_adapter/p1_imu_pcap_replay_node.py"
+    "$PCAP_IMU_BIN" --ros-args \
+        -p use_sim_time:=true \
+        -p pcap_path:="$ADAPTER_IMU_P1_PCAP" \
+        -p output_topic:=/atlas/imu_calibrated \
+        -p pace_mode:=clock \
+        > "$OUT/p1_imu_pcap_replay.log" 2>&1 &
+    PCAP_IMU_PID=$!
+  fi
 else
   # Optional synthetic RTK denial (env): DENY_WINDOWS="95:135,445:495" makes the
   # bridge inflate GT covariance inside those windows (seconds from bag start) so
@@ -343,13 +403,13 @@ if [ -n "$ADAPTER_PLAY_DELAY" ]; then
 fi
 PLAY_CMD+=("${EXTRA_BAG_PLAY_ARGS[@]}")
 if [ "$RAW_LIVE" = "true" ]; then
+  RAW_TOPICS=(/atlas/pose_filtered /luminar_front/points /luminar_left/points /luminar_right/points)
+  if [ -z "$ADAPTER_IMU_P1_PCAP" ]; then
+    RAW_TOPICS=(/atlas/imu_calibrated "${RAW_TOPICS[@]}")
+  fi
   PLAY_CMD+=(
     --topics
-    /atlas/imu_calibrated
-    /atlas/pose_filtered
-    /luminar_front/points
-    /luminar_left/points
-    /luminar_right/points
+    "${RAW_TOPICS[@]}"
     --remap
     /luminar_front/points:=/dlio_raw/luminar_front/points
     /luminar_left/points:=/dlio_raw/luminar_left/points

@@ -186,21 +186,24 @@ python3 -u scripts/prep_bag.py --input ... --output ... \
 
 `--utm-zone N` similarly pins the UTM zone (auto = zone of the first fix).
 
-### 1b. Live adapter path: raw/hardware → normalized topics
+### 1b. Live input path: raw/hardware → normalized topics
 
-`dlio_input_adapter` is the online equivalent of the input-normalization part
-of `prep_bag.py`. GLIM/GICP still subscribe only to normalized topics:
+GLIM/GICP still subscribe only to normalized topics:
 `/gps_p1/imu`, `/gps_p1/filtered_odom`,
 `/gps_p1/filtered_odom_rtk_fixed`, `/gps_p1/filtered_odom_map` when a map
 transform is configured, and `/luminar_*`.
 
-Hardware mode should launch race_common drivers first. For Atlas IMU, set
-`fusion_engine_driver` parameter `imu_output_stamp_source:=p1_time`; the
-adapter maps that P1 monotonic sample time onto the ROS epoch using
-`/atlas/pose_filtered.p1_time`.
+On live hardware, `race_common`'s GPS launch starts both `fusion_engine_driver`
+and `pointonenav_interface`. Set the FusionEngine driver parameter
+`imu_output_stamp_source:=p1_time`; `pointonenav_interface` maps Atlas
+`p1_time` onto the ROS epoch online and publishes `/gps_p1/imu` plus
+`/gps_p1/filtered_odom`. Do not run another Atlas normalizer that publishes
+the same `/gps_p1/*` topics at the same time.
 
-Raw rosbag replay mode remaps Luminar inputs into `/dlio_raw/*` so the adapter
-does not subscribe and publish the same `/luminar_*` topic:
+For raw bag replay, `dlio_input_adapter` is the online equivalent of the
+input-normalization part of `prep_bag.py`. Raw rosbag replay mode remaps
+Luminar inputs into `/dlio_raw/*` so the adapter does not subscribe and
+publish the same `/luminar_*` topic:
 
 ```bash
 # Terminal 1: adapter.
@@ -225,6 +228,29 @@ scripts/run_dlio_pipeline.sh --raw-live \
   --data-root "$DATA" \
   --run "$RUN"
 ```
+
+For Point One INS PCAP replay, use the direct PCAP IMU source. It decodes
+FusionEngine `IMU_OUTPUT` online from the original PCAP, publishes
+`/atlas/imu_calibrated` with the real `IMUOutput.p1_time`, and leaves Pose and
+LiDAR to the MCAP replay. In this mode the wrapper does not replay the raw
+MCAP `/atlas/imu_calibrated` topic:
+
+```bash
+P1_INS_PCAP="/path/to/pointone_ins.pcap"
+scripts/run_dlio_pipeline.sh --raw-live \
+  --raw "$RAW_BAG" \
+  --data-root "$DATA" \
+  --run "$RUN" \
+  --adapter-imu-p1-pcap "$P1_INS_PCAP" \
+  --gt-recovery-min-consecutive-failures 1 \
+  --gt-veto-dist 1.0
+```
+
+The last two options make the online replay GNSS-primary when GICP leaves the
+GNSS corridor: the node can recover after one bad localization update, and a
+1 m GT veto keeps LiDAR-only drift from running ahead of the Point One INS
+solution. The conservative defaults remain available for non-GNSS-primary
+experiments.
 
 For raw-live localization against a map from another run, pass or configure
 the map run and UTM origin:
@@ -255,22 +281,23 @@ adapter falls back to bounded arrival retiming. This is good enough for live
 raw-bag smoke tests, but it necessarily adds wall-time latency proportional to
 `imu_arrival_retime_lookahead`. Hardware P1-time mode avoids that latency.
 
-For live hardware smoke, bring up the race_common Atlas and Luminar drivers
-first. Configure the FusionEngine driver with
-`imu_output_stamp_source:=p1_time`, remap the raw Luminar driver outputs into
-`/dlio_raw/luminar_front|left|right/points`, then run:
+For live hardware P1 timestamp smoke, bring up the race_common Atlas and
+Luminar drivers first. Configure the FusionEngine driver with
+`imu_output_stamp_source:=p1_time`; Atlas `/gps_p1/imu` and
+`/gps_p1/filtered_odom` should already be published by `pointonenav_interface`:
 
 ```bash
 scripts/run_live_adapter_smoke.sh \
   --duration 60 \
-  --start-adapter \
   --expect-raw-imu-p1 \
-  --ptp-lock-confirmed \
-  --require-rtk-fixed
+  --ptp-lock-confirmed
 ```
 
-If validating localization with an existing map, also require map-frame odom
-and pass the map transform/origin through to the adapter:
+If validating the DLIO input adapter itself from raw `/atlas/*` topics, start
+it only in a topology where it is the sole publisher of the normalized
+`/gps_p1/*` outputs, or remap its outputs to non-conflicting names. If
+validating localization with an existing map through the adapter, also require
+map-frame odom and pass the map transform/origin through to the adapter:
 
 ```bash
 scripts/run_live_adapter_smoke.sh \
@@ -508,7 +535,7 @@ Do **not** rerun localization just to inspect the same result again. Once
 
 Validation-only replay overrides:
 
-- `DESKEW=true|false` switches `dlio/deskew` for Luminar timestamp tests.
+- `DESKEW=true|false` overrides default-on `dlio/deskew` for Luminar timestamp tests.
 - `GT_RECOVERY_ENABLED=false`, `GT_REJECTION_ENABLED=false`, and
   `GT_VETO_ENABLED=false` disable the GT recovery/rejection/veto safety rails
   when measuring raw GICP deskew fitness. Do not use those settings for
