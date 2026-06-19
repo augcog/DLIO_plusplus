@@ -170,6 +170,62 @@ one run.
 3. **Convert** submaps into a single PCD map. Scripted route (used by the automated pipeline): `ros2 run glim_ros glim_dump_to_pcd "$DUMP_DIR" "$DATA/run_5_map.pcd"`. QA route (recommended before freezing a production map): open the dump in `glim_ros offline_viewer`, inspect/re-optimize/close loops, export PLY, then `gicp_localization/scripts/convert_ply_to_pcd.py` — see "Why the offline_viewer step is manual" below for what the GUI pass buys you.
 4. **Localize** online against that PCD map with `gicp_localization`. Point the launch file at the PCD and (optionally) the matching `T_world_utm.txt`.
 
+### Map quality viewer
+
+`scripts/export_map_quality_views.py` writes a shareable static QA bundle for
+one GLIM mapping run. It overlays the GLIM trajectory and RTK trajectory on a
+top-down map image, computes trajectory error statistics, and exports a
+draggable Three.js view where vertical cylinders encode horizontal GLIM-vs-RTK
+error.
+
+The script expects a PCD map, the matching GLIM dump directory
+(`traj_imu.txt` + `T_world_utm.txt`), and a prepared bag containing the RTK
+reference odometry topic. Repeat with `RUN=run_3` and `RUN=run_5` when
+exporting both sessions.
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+
+QA_ROOT="${QA_ROOT:-./dlio_data/map_quality}"
+RUN="${RUN:-run_5}"
+
+python3 scripts/export_map_quality_views.py \
+    --run-name "$RUN" \
+    --map "$QA_ROOT/$RUN/model/map.pcd" \
+    --dump "$QA_ROOT/$RUN/model/glim_dump" \
+    --bag "$QA_ROOT/$RUN/model/prepped_bag" \
+    --out "$QA_ROOT/$RUN/views"
+```
+
+Open the generated frontend through a small HTTP server so the browser can
+fetch `meta.json` and `points.bin`; opening `index.html` directly from the
+filesystem usually blocks those fetches.
+
+```bash
+QA_ROOT="${QA_ROOT:-./dlio_data/map_quality}"
+PORT="${PORT:-8765}"
+python3 -m http.server "$PORT" -d "$QA_ROOT"
+```
+
+Local URLs with the default `PORT=8765`:
+
+```text
+http://127.0.0.1:8765/run_3/views/interactive_error_3d/
+http://127.0.0.1:8765/run_5/views/interactive_error_3d/
+```
+
+To share on the same LAN or VPN, get the host address and replace
+`127.0.0.1` with that IP:
+
+```bash
+hostname -I | awk '{print $1}'
+```
+
+The static bundle is self-contained except for the Three.js CDN import in
+`index.html`; if the viewer must work offline, vendor those JS files or serve
+them from an internal mirror.
+
 ### Why the offline_viewer step is manual
 
 A reviewer reasonably asks: why not auto-merge the per-submap directories into a single PCD with a script? Because the viewer pass is the QA stage for the mapping output, and skipping it would silently push bad maps into the localizer:
