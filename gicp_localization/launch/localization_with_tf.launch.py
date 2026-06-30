@@ -41,6 +41,11 @@ def generate_launch_description():
     odom_topic = LaunchConfiguration('odom_topic', default='/odom')
     gt_odom_topic = LaunchConfiguration('gt_odom_topic', default='/gps_p1/filtered_odom')
     imu_only = LaunchConfiguration('imu_only', default='false')
+    publish_tf = LaunchConfiguration('publish_tf', default='false')
+    deskew = LaunchConfiguration('deskew', default='true')
+    debug_pub = LaunchConfiguration('debug_pub', default='false')
+    verbose_scan_log = LaunchConfiguration('verbose_scan_log', default='false')
+    verbose = LaunchConfiguration('verbose', default='false')
     urdf_path = LaunchConfiguration(
         'urdf_path',
         default='')
@@ -72,6 +77,21 @@ def generate_launch_description():
     declare_imu_only_arg = DeclareLaunchArgument(
         'imu_only', default_value=imu_only,
         description='If true, disable GICP and run IMU-only propagation')
+    declare_publish_tf_arg = DeclareLaunchArgument(
+        'publish_tf', default_value='false',
+        description='Override localization/publish_tf')
+    declare_deskew_arg = DeclareLaunchArgument(
+        'deskew', default_value='true',
+        description='Override dlio/deskew')
+    declare_debug_pub_arg = DeclareLaunchArgument(
+        'debug_pub', default_value='false',
+        description='Override localization/debug/enable_pub')
+    declare_verbose_scan_log_arg = DeclareLaunchArgument(
+        'verbose_scan_log', default_value='false',
+        description='Override localization/debug/verbose_scan_log')
+    declare_verbose_arg = DeclareLaunchArgument(
+        'verbose', default_value='false',
+        description='Override localization/verbose')
     declare_urdf_path_arg = DeclareLaunchArgument(
         'urdf_path', default_value=urdf_path,
         description='Absolute path to the vehicle URDF used by robot_state_publisher '
@@ -137,6 +157,11 @@ def generate_launch_description():
             localization_yaml_path,
             {'localization/lidar_frame': child_frame_value},
             {'localization/imu_only': LaunchConfiguration('imu_only')},
+            {'localization/publish_tf': publish_tf},
+            {'dlio/deskew': deskew},
+            {'localization/debug/enable_pub': debug_pub},
+            {'localization/debug/verbose_scan_log': verbose_scan_log},
+            {'localization/verbose': verbose},
             {'localization/lidar_concat/urdf_path': urdf_file},
         ]
         if map_path_value:
@@ -197,6 +222,11 @@ def generate_launch_description():
         declare_odom_topic_arg,
         declare_gt_odom_topic_arg,
         declare_imu_only_arg,
+        declare_publish_tf_arg,
+        declare_deskew_arg,
+        declare_debug_pub_arg,
+        declare_verbose_scan_log_arg,
+        declare_verbose_arg,
         declare_urdf_path_arg,
         declare_parent_frame_arg,
         declare_child_frame_arg,

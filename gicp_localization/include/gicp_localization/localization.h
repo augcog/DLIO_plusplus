@@ -219,9 +219,9 @@ private:
   // then a static per-aux matrix from yaml, then live TF as a last resort.
   std::string concat_primary_frame_;            // URDF link name of the primary LiDAR
   std::string concat_urdf_path_;                // path to av24.urdf ("" = skip URDF)
-  // Strict merge guard: error out if a required multi-LiDAR merge stays incomplete.
+  // Strict merge guard: skip scans whose required multi-LiDAR merge is incomplete.
   bool concat_require_all_aux_ = true;          // require every configured aux per scan
-  int concat_max_consec_fail_ = 10;             // tolerated consecutive incomplete merges (0 = immediate)
+  int concat_max_consec_fail_ = 10;             // consecutive incomplete merges before louder throttled warning
   int concat_consec_fail_ = 0;                  // running counter of consecutive incomplete merges
   // Resolve every aux's T_primary_aux without live TF; returns the count resolved.
   void resolveAuxExtrinsicsOffline(const std::vector<std::vector<double>>& static_transforms);

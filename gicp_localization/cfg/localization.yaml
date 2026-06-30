@@ -177,12 +177,11 @@
     localization/lidar_concat/time_threshold: 0.05  # seconds; aux scans further than this from primary are dropped
     localization/lidar_concat/buffer_size: 20       # per-aux ring buffer depth
 
-    # Strict merge guard: when the multi-LiDAR merge is required, do NOT silently
-    # localize on fewer LiDARs if an aux fails to merge (missing topic/extrinsic,
-    # schema mismatch, timing). The node tolerates this many CONSECUTIVE incomplete
-    # merges (transient warmup/dropouts) and then errors out and shuts down.
+    # Strict all-aux mode for GICP: do not feed degraded primary/partial-LiDAR
+    # clouds into registration. If an aux scan is missing or late, skip that
+    # primary scan and continue propagation instead of aborting the node.
     localization/lidar_concat/require_all_aux: true
-    localization/lidar_concat/max_consecutive_aux_merge_failures: 10  # 0 = fail on first incomplete scan
+    localization/lidar_concat/max_consecutive_aux_merge_failures: 10  # warn louder after this many skipped incomplete scans
 
     # Aux-LiDAR extrinsic resolution (NO live TF required) -- resolved once at startup,
     # so the merge works in offline replay without robot_state_publisher / /tf_static.

@@ -1810,6 +1810,11 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
   // are preserved.
   const sensor_msgs::msg::PointCloud2::ConstSharedPtr pc =
       this->concat_enabled_ ? this->mergeAuxClouds(pc_in) : pc_in;
+  if (!pc) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                         "lidar_concat: strict all-aux merge incomplete; skipping this scan and keeping propagation state");
+    return;
+  }
 
   // Cache base_link -> lidar extrinsic from TF once. With
   // robot_state_publisher providing the URDF TF tree, this is the true
@@ -2206,27 +2211,23 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
   if (this->aux_lidars_.empty()) return primary;
 
   // Strict-merge failure handler: route EVERY "required merge can't complete" path
-  // through one counter+throw -- incomplete aux merge AND primary-precondition
-  // failures (missing XYZ, non-tight/padded primary) that bail before the aux loop.
-  // Otherwise those early returns would silently localize a degraded (primary-only)
-  // scan despite require_all_aux=true. No-op when require_all_aux is false. Tolerates
-  // brief transients via the consecutive-failure budget, then stops the node.
+  // through one counter and return nullptr to skip this primary scan. This keeps
+  // GICP from registering degraded primary/partial-LiDAR clouds without killing
+  // the localization node; propagation continues until a complete merged scan arrives.
   auto note_required_failure = [this](size_t got, const char* reason) {
-    if (!this->concat_require_all_aux_) return;
     ++this->concat_consec_fail_;
-    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+    const bool over_budget =
+        this->concat_max_consec_fail_ >= 0 && this->concat_consec_fail_ > this->concat_max_consec_fail_;
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                           "lidar_concat: REQUIRED merge incomplete (%zu/%zu aux): %s for %d consecutive scan(s) "
-                          "(budget %d). Check primary cloud, aux topics, extrinsics, schema, and timing.",
+                          "(warning budget %d). Skipping scan; check primary cloud, aux topics, schema, and timing.",
                           got, this->aux_lidars_.size(), reason,
                           this->concat_consec_fail_, this->concat_max_consec_fail_);
-    if (this->concat_consec_fail_ > this->concat_max_consec_fail_) {
-      RCLCPP_FATAL(this->get_logger(),
-                   "lidar_concat: multi-LiDAR merge REQUIRED but could not complete (%s) for %d consecutive "
-                   "scans; refusing to localize on a degraded cloud. Set "
-                   "localization/lidar_concat/require_all_aux=false to allow degraded merging. Shutting down.",
-                   reason, this->concat_consec_fail_);
-      rclcpp::shutdown();
-      throw std::runtime_error("lidar_concat: required multi-LiDAR merge failed");
+    if (over_budget) {
+      RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                            "lidar_concat: strict all-aux merge has been incomplete for %d consecutive scan(s); "
+                            "continuing to skip degraded scans instead of aborting",
+                            this->concat_consec_fail_);
     }
   };
 
@@ -2273,7 +2274,10 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                          "lidar_concat: cannot find xyz fields in primary cloud (frame='%s')",
                          primary_frame.c_str());
-    note_required_failure(0, "primary cloud missing xyz fields");
+    if (this->concat_require_all_aux_) {
+      note_required_failure(0, "primary cloud missing xyz fields");
+      return nullptr;
+    }
     return primary;
   }
 
@@ -2289,7 +2293,10 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
                          "lidar_concat: primary cloud is organized/padded (data=%zu, width=%u, height=%u, step=%u); "
                          "skipping concat (only tight clouds can be byte-appended)",
                          primary->data.size(), primary->width, primary->height, point_step);
-    note_required_failure(0, "primary cloud organized/padded (non-tight)");
+    if (this->concat_require_all_aux_) {
+      note_required_failure(0, "primary cloud organized/padded (non-tight)");
+      return nullptr;
+    }
     return primary;
   }
 
@@ -2435,11 +2442,11 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
                        merged_aux_count, this->aux_lidars_.size(), total_points);
 
   // Strict guard: a REQUIRED multi-LiDAR merge that stays incomplete must not be
-  // silently localized on fewer LiDARs (the run_5 "merged 0/2" failure mode). The
-  // primary-precondition bail-outs above route through the same handler, so every
-  // degraded-merge path is enforced uniformly. A fully merged scan resets the budget.
-  if (merged_aux_count < this->aux_lidars_.size()) {
+  // silently localized on fewer LiDARs. In strict mode, skip this scan and keep
+  // propagation alive; in degraded mode, return the partial merged cloud.
+  if (this->concat_require_all_aux_ && merged_aux_count < this->aux_lidars_.size()) {
     note_required_failure(merged_aux_count, "incomplete aux merge");
+    return nullptr;
   } else {
     this->concat_consec_fail_ = 0;
   }
@@ -2790,9 +2797,10 @@ void gicp_localization::LocalizationNode::performLocalization() {
   // in map<-lidar, then convert the optimizer output back to map<-base.
   const Eigen::Matrix4f T_base_lidar = this->extrinsics.baselink2lidar_T;
   const Eigen::Matrix4f T_lidar_base = T_base_lidar.inverse();
-  Eigen::Matrix4f initial_guess = this->deskew_
-      ? Eigen::Matrix4f::Identity()
-      : (this->T_prior * T_base_lidar);
+  Eigen::Matrix4f initial_guess = Eigen::Matrix4f::Identity();
+  if (!this->deskew_) {
+    initial_guess = this->T_prior * T_base_lidar;
+  }
   Eigen::Matrix4f guess_pose_map = this->T_prior;
 
   double guess_from_last_trans = 0.0;
