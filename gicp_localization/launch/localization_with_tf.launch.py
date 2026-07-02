@@ -44,6 +44,8 @@ def generate_launch_description():
     odom_topic = LaunchConfiguration('odom_topic', default='/odom')
     gt_odom_topic = LaunchConfiguration('gt_odom_topic', default='/gps_p1/filtered_odom')
     imu_only = LaunchConfiguration('imu_only', default='false')
+    debug_pub = LaunchConfiguration('debug_pub', default='false')
+    verbose_scan_log = LaunchConfiguration('verbose_scan_log', default='false')
     urdf_path = LaunchConfiguration(
         'urdf_path',
         default='')
@@ -75,6 +77,12 @@ def generate_launch_description():
     declare_imu_only_arg = DeclareLaunchArgument(
         'imu_only', default_value=imu_only,
         description='If true, disable GICP and run IMU-only propagation')
+    declare_debug_pub_arg = DeclareLaunchArgument(
+        'debug_pub', default_value=debug_pub,
+        description='If true, publish debug topics including localized_path and RViz comparison paths')
+    declare_verbose_scan_log_arg = DeclareLaunchArgument(
+        'verbose_scan_log', default_value=verbose_scan_log,
+        description='If true, log per-scan GICP accept/reject diagnostics')
     declare_urdf_path_arg = DeclareLaunchArgument(
         'urdf_path', default_value=urdf_path,
         description='Absolute path to the vehicle URDF used by robot_state_publisher '
@@ -140,6 +148,8 @@ def generate_launch_description():
             localization_yaml_path,
             {'localization/lidar_frame': child_frame_value},
             {'localization/imu_only': LaunchConfiguration('imu_only')},
+            {'localization/debug/enable_pub': LaunchConfiguration('debug_pub')},
+            {'localization/debug/verbose_scan_log': LaunchConfiguration('verbose_scan_log')},
             {'localization/lidar_concat/urdf_path': urdf_file},
         ]
         if map_path_value:
@@ -200,6 +210,8 @@ def generate_launch_description():
         declare_odom_topic_arg,
         declare_gt_odom_topic_arg,
         declare_imu_only_arg,
+        declare_debug_pub_arg,
+        declare_verbose_scan_log_arg,
         declare_urdf_path_arg,
         declare_parent_frame_arg,
         declare_child_frame_arg,

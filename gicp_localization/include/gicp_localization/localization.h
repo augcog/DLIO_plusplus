@@ -246,6 +246,9 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr localized_odom_pub;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr gt_ins_path_pub;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr gicp_only_path_pub;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr gicp_only_segments_pub;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr utm_pose_pub;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr utm_odom_pub;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr utm_path_pub;
@@ -310,6 +313,7 @@ private:
   Eigen::Matrix4f last_gicp_pose_;
   rclcpp::Time last_gicp_stamp_;
   bool last_gicp_valid_;
+  bool last_scan_gicp_accepted_{false};
   double last_fitness_score_{-1.0};  // -1 = no scan yet
   double last_accepted_scan_stamp_{-1.0};  // s — stamp of last accepted GICP scan (P3 dead-reckon cov)
 
@@ -318,6 +322,13 @@ private:
   // subscribers, so we don't pay an O(N) DDS serialize on every scan.
   nav_msgs::msg::Path path_msg;
   std::deque<geometry_msgs::msg::PoseStamped> path_buffer_;
+  nav_msgs::msg::Path gt_ins_path_msg_;
+  std::deque<geometry_msgs::msg::PoseStamped> gt_ins_path_buffer_;
+  nav_msgs::msg::Path gicp_only_path_msg_;
+  std::deque<geometry_msgs::msg::PoseStamped> gicp_only_path_buffer_;
+  visualization_msgs::msg::MarkerArray gicp_only_segments_msg_;
+  bool gicp_only_segment_active_{false};
+  int gicp_only_segment_next_id_{0};
 
   // IMU data structures
   boost::circular_buffer<ImuMeas> imu_buffer;

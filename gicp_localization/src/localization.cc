@@ -984,6 +984,11 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
 
   if (this->debug_pub_enabled_) {
     this->path_pub = this->create_publisher<nav_msgs::msg::Path>("localized_path", 10);
+    this->gt_ins_path_pub = this->create_publisher<nav_msgs::msg::Path>("/gt_ins", 10);
+    this->gicp_only_path_pub =
+        this->create_publisher<nav_msgs::msg::Path>("gicp/localization/gicp_only_path", 10);
+    this->gicp_only_segments_pub =
+        this->create_publisher<visualization_msgs::msg::MarkerArray>("gicp/localization/gicp_only_segments", 10);
     this->gt_snap_pub = this->create_publisher<geometry_msgs::msg::PoseStamped>("gicp/localization/gt_snap", 10);
     this->dbg_initial_guess_pose_pub =
         this->create_publisher<geometry_msgs::msg::PoseStamped>("gicp/localization/debug/initial_guess_pose", 10);
@@ -1725,6 +1730,19 @@ void gicp_localization::LocalizationNode::applyInitialPoseFromParams() {
   this->path_msg.poses.clear();
   this->path_msg.header.frame_id = this->map_frame;
   this->path_msg.header.stamp = this->now();
+  this->path_buffer_.clear();
+  this->gt_ins_path_msg_.poses.clear();
+  this->gt_ins_path_msg_.header.frame_id = this->map_frame;
+  this->gt_ins_path_msg_.header.stamp = this->path_msg.header.stamp;
+  this->gt_ins_path_buffer_.clear();
+  this->gicp_only_path_msg_.poses.clear();
+  this->gicp_only_path_msg_.header.frame_id = this->map_frame;
+  this->gicp_only_path_msg_.header.stamp = this->path_msg.header.stamp;
+  this->gicp_only_path_buffer_.clear();
+  this->gicp_only_segments_msg_.markers.clear();
+  this->gicp_only_segment_active_ = false;
+  this->gicp_only_segment_next_id_ = 0;
+  this->last_scan_gicp_accepted_ = false;
 
   RCLCPP_INFO(this->get_logger(),
               "Initial pose loaded from parameters at [%.2f, %.2f, %.2f] m with RPY [%.2f, %.2f, %.2f] rad",
@@ -1780,6 +1798,19 @@ void gicp_localization::LocalizationNode::applyInitialPose(const Eigen::Vector3f
   this->path_msg.poses.clear();
   this->path_msg.header.frame_id = this->map_frame;
   this->path_msg.header.stamp = stamp.nanoseconds() > 0 ? stamp : this->now();
+  this->path_buffer_.clear();
+  this->gt_ins_path_msg_.poses.clear();
+  this->gt_ins_path_msg_.header.frame_id = this->map_frame;
+  this->gt_ins_path_msg_.header.stamp = this->path_msg.header.stamp;
+  this->gt_ins_path_buffer_.clear();
+  this->gicp_only_path_msg_.poses.clear();
+  this->gicp_only_path_msg_.header.frame_id = this->map_frame;
+  this->gicp_only_path_msg_.header.stamp = this->path_msg.header.stamp;
+  this->gicp_only_path_buffer_.clear();
+  this->gicp_only_segments_msg_.markers.clear();
+  this->gicp_only_segment_active_ = false;
+  this->gicp_only_segment_next_id_ = 0;
+  this->last_scan_gicp_accepted_ = false;
 
   RCLCPP_INFO(this->get_logger(), "Received initial pose (%s) at [%.2f, %.2f, %.2f]",
               source.c_str(), p.x(), p.y(), p.z());
@@ -2802,6 +2833,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
   RCLCPP_DEBUG(this->get_logger(), "performLocalization: Acquiring mutex lock...");
   std::lock_guard<std::mutex> lock(this->pose_mutex);
   RCLCPP_DEBUG(this->get_logger(), "performLocalization: Mutex acquired");
+  this->last_scan_gicp_accepted_ = false;
 
   // Set source cloud
   RCLCPP_DEBUG(this->get_logger(), "performLocalization: Setting input source (%lu points)...",
@@ -2820,9 +2852,10 @@ void gicp_localization::LocalizationNode::performLocalization() {
   // in map<-lidar, then convert the optimizer output back to map<-base.
   const Eigen::Matrix4f T_base_lidar = this->extrinsics.baselink2lidar_T;
   const Eigen::Matrix4f T_lidar_base = T_base_lidar.inverse();
-  Eigen::Matrix4f initial_guess = this->deskew_
-      ? Eigen::Matrix4f::Identity()
-      : (this->T_prior * T_base_lidar);
+  Eigen::Matrix4f initial_guess = Eigen::Matrix4f::Identity();
+  if (!this->deskew_) {
+    initial_guess = this->T_prior * T_base_lidar;
+  }
   Eigen::Matrix4f guess_pose_map = this->T_prior;
 
   double guess_from_last_trans = 0.0;
@@ -3152,6 +3185,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
 
   if (gicp_accepted) {
     this->current_pose = candidate_pose;
+    this->last_scan_gicp_accepted_ = true;
 
     // Update lidar pose for next iteration
     Eigen::Vector3f new_p = this->current_pose.block<3, 1>(0, 3);
@@ -3312,6 +3346,100 @@ void gicp_localization::LocalizationNode::publishPose() {
     this->path_msg.header.frame_id = this->map_frame;
     this->path_msg.poses.assign(this->path_buffer_.begin(), this->path_buffer_.end());
     this->path_pub->publish(this->path_msg);
+  }
+
+  // Publish a scan-time-aligned INS/GT reference path. Each point is sampled at
+  // the same scan_stamp used by localized_path, so RViz playback compares both
+  // paths on the same timeline.
+  if (this->gt_ins_path_pub && this->gt_odom_enabled_ && this->gt_odom_received_.load()) {
+    GtSample gt;
+    if (this->getGtPoseAt(this->scan_stamp.seconds(), gt)) {
+      Eigen::Vector3f gt_position;
+      Eigen::Quaternionf gt_orientation;
+      if (!this->composeGtPoseInBase(gt, gt_position, gt_orientation)) {
+        gt_position = gt.p;
+        gt_orientation = gt.q;
+      }
+      gt_orientation.normalize();
+
+      geometry_msgs::msg::PoseStamped gt_pose_msg;
+      gt_pose_msg.header.stamp = this->scan_stamp;
+      gt_pose_msg.header.frame_id = this->map_frame;
+      gt_pose_msg.pose.position.x = gt_position.x();
+      gt_pose_msg.pose.position.y = gt_position.y();
+      gt_pose_msg.pose.position.z = gt_position.z();
+      gt_pose_msg.pose.orientation.w = gt_orientation.w();
+      gt_pose_msg.pose.orientation.x = gt_orientation.x();
+      gt_pose_msg.pose.orientation.y = gt_orientation.y();
+      gt_pose_msg.pose.orientation.z = gt_orientation.z();
+
+      if (this->gt_ins_path_buffer_.size() >= 10000) this->gt_ins_path_buffer_.pop_front();
+      this->gt_ins_path_buffer_.push_back(gt_pose_msg);
+      if (this->gt_ins_path_pub->get_subscription_count() > 0) {
+        this->gt_ins_path_msg_.header.stamp = this->scan_stamp;
+        this->gt_ins_path_msg_.header.frame_id = this->map_frame;
+        this->gt_ins_path_msg_.poses.assign(this->gt_ins_path_buffer_.begin(), this->gt_ins_path_buffer_.end());
+        this->gt_ins_path_pub->publish(this->gt_ins_path_msg_);
+      }
+    }
+  }
+
+  auto publish_gicp_only_path = [&]() {
+    if (this->gicp_only_path_pub && this->gicp_only_path_pub->get_subscription_count() > 0) {
+      this->gicp_only_path_msg_.header.stamp = this->scan_stamp;
+      this->gicp_only_path_msg_.header.frame_id = this->map_frame;
+      this->gicp_only_path_msg_.poses.assign(
+          this->gicp_only_path_buffer_.begin(), this->gicp_only_path_buffer_.end());
+      this->gicp_only_path_pub->publish(this->gicp_only_path_msg_);
+    }
+  };
+
+  auto publish_gicp_only_segments = [&]() {
+    if (this->gicp_only_segments_pub && this->gicp_only_segments_pub->get_subscription_count() > 0) {
+      for (auto& marker : this->gicp_only_segments_msg_.markers) {
+        marker.header.stamp = this->scan_stamp;
+      }
+      this->gicp_only_segments_pub->publish(this->gicp_only_segments_msg_);
+    }
+  };
+
+  if (this->last_scan_gicp_accepted_) {
+    if (!this->gicp_only_segment_active_) {
+      this->gicp_only_path_buffer_.clear();
+
+      visualization_msgs::msg::Marker segment;
+      segment.header.stamp = this->scan_stamp;
+      segment.header.frame_id = this->map_frame;
+      segment.ns = "gicp_only_segments";
+      segment.id = this->gicp_only_segment_next_id_++;
+      segment.type = visualization_msgs::msg::Marker::LINE_STRIP;
+      segment.action = visualization_msgs::msg::Marker::ADD;
+      segment.pose.orientation.w = 1.0;
+      segment.scale.x = 0.18;
+      segment.color.a = 1.0f;
+      segment.color.r = 1.0f;
+      segment.color.g = 0.55f;
+      segment.color.b = 0.0f;
+      this->gicp_only_segments_msg_.markers.push_back(segment);
+      this->gicp_only_segment_active_ = true;
+    }
+
+    if (this->gicp_only_path_buffer_.size() >= 10000) this->gicp_only_path_buffer_.pop_front();
+    this->gicp_only_path_buffer_.push_back(pose_msg);
+    publish_gicp_only_path();
+
+    if (!this->gicp_only_segments_msg_.markers.empty()) {
+      geometry_msgs::msg::Point point;
+      point.x = pose_msg.pose.position.x;
+      point.y = pose_msg.pose.position.y;
+      point.z = pose_msg.pose.position.z;
+      this->gicp_only_segments_msg_.markers.back().points.push_back(point);
+    }
+    publish_gicp_only_segments();
+  } else if (this->gicp_only_segment_active_ || !this->gicp_only_path_buffer_.empty()) {
+    this->gicp_only_segment_active_ = false;
+    this->gicp_only_path_buffer_.clear();
+    publish_gicp_only_path();
   }
 
   // Publish UTM-frame pose/path

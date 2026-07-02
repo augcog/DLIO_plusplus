@@ -279,11 +279,25 @@ correct negative offset.
 |---|---|---|
 | `localized_pose` (`gicp/localization/pose`) | `geometry_msgs/PoseStamped` | Localized pose (scan rate). |
 | `localized_odom` (`gicp/localization/odom`) | `nav_msgs/Odometry` | Localized odom propagated at IMU rate (~100 Hz). |
-| `localized_path` (`gicp/localization/path`) | `nav_msgs/Path` | Trajectory history. |
+| `localized_path` (`gicp/localization/path`) | `nav_msgs/Path` | Final adopted localization trajectory history. |
+| `gt_ins` (`/gt_ins`) | `nav_msgs/Path` | RViz/debug GT/INS reference path, sampled at the same LiDAR scan stamps as `localized_path`. |
+| `gicp/localization/gicp_only_path` | `nav_msgs/Path` | RViz/debug current accepted-GICP-only segment; clears when the node falls back to IMU/GT recovery. |
+| `gicp/localization/gicp_only_segments` | `visualization_msgs/MarkerArray` | RViz/debug accepted-GICP-only history as broken orange line segments, preserving gaps across fallback/recovery. |
 | `gicp/localization/pose_utm` / `odom_utm` / `path_utm` | (same types) | Optional legacy UTM-frame mirrors, only when `utm_transform_path` is set (the primary `map`-frame outputs above are already local ENU with the adapter). |
 | `aligned_cloud` (`gicp/localization/aligned_cloud`) | `sensor_msgs/PointCloud2` | Aligned scan in `map`. |
 | `map` (`gicp/localization/map`) | `sensor_msgs/PointCloud2` | Downsampled visualization map. |
 | TF: `map → base_frame` | | Published when `publish_tf=true`. |
+
+### RViz path colors
+
+The default `launch/localization.rviz` config uses fixed colors for the path
+overlays:
+
+| Color | Display | Topic | Meaning |
+|---|---|---|---|
+| Green | Trajectory Path | `/gicp/localization/path` | Final adopted localization trajectory, including accepted GICP, IMU dead-reckoning fallback, and GT recovery snaps. |
+| Orange | GICP-only Segments | `/gicp/localization/gicp_only_segments` | Accepted-GICP-only trajectory segments. The line breaks while the node is on IMU fallback or GT recovery. |
+| Blue | GT INS Reference | `/gt_ins` | GT/INS reference path sampled at the same LiDAR scan timestamps as the final path. |
 
 ### Debug topics (require `localization/debug/enable_pub: true`)
 
