@@ -435,6 +435,12 @@
     # settling, so fitness spikes to 1.2–1.4 on correct geometry; a 0.3 threshold rejects
     # those and the node gets stuck at initial pose with no GICP updates to recover from.
     gicp/fitnessRejectThreshold: 1.0   # Reject GICP if fitness score exceeds this value
+    # hasConverged()==false is allowed through only as a bounded "max iterations
+    # but already close" case. Larger low-fitness corrections are a wrong-basin
+    # signature; run5-on-run3 failed from 3.27 m / 11.2 deg and 9.21 m / 10.7 deg
+    # non-converged accepts. Set either value <=0 to disable that specific bound.
+    gicp/nonConvergedFitnessOkMaxTransM: 3.0
+    gicp/nonConvergedFitnessOkMaxRotDeg: 5.0
     gicp/rejectLargeJumps: true        # Hard-reject results that exceed the jump thresholds below
 
     # ========== P1 gating rework (docs/action_plan_turn_error_20260704.md) ==========

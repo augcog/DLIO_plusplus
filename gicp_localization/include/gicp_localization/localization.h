@@ -498,6 +498,8 @@ private:
   double gicp_transformation_epsilon_;
   double gicp_rotation_epsilon_;
   double gicp_fitness_reject_threshold_;
+  double gicp_nonconverged_fitness_ok_max_trans_m_;
+  double gicp_nonconverged_fitness_ok_max_rot_deg_;
   bool gicp_reject_large_jumps_;
   double gicp_hessian_cond_max_;
   double gicp_hessian_fitness_warn_;

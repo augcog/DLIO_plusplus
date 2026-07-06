@@ -1421,6 +1421,10 @@ void gicp_localization::LocalizationNode::getParams() {
   this->declare_parameter<double>("gicp/transformationEpsilon", 0.0001);
   this->declare_parameter<double>("gicp/rotationEpsilon", 0.0001);
   this->declare_parameter<double>("gicp/fitnessRejectThreshold", 1.0);
+  // Allow a non-converged, low-fitness solution only when it barely moved from
+  // the IMU prior. Larger corrections are the observed wrong-basin signature.
+  this->declare_parameter<double>("gicp/nonConvergedFitnessOkMaxTransM", 3.0);
+  this->declare_parameter<double>("gicp/nonConvergedFitnessOkMaxRotDeg", 5.0);
   this->declare_parameter<bool>("gicp/rejectLargeJumps", true);
   // Reject scans whose Hessian condition number proxy exceeds this threshold.
   // Straights typically run ~1e4; feature-poor corners spike to 1e8-1e9 and the
@@ -1478,6 +1482,10 @@ void gicp_localization::LocalizationNode::getParams() {
   this->get_parameter("gicp/transformationEpsilon", this->gicp_transformation_epsilon_);
   this->get_parameter("gicp/rotationEpsilon", this->gicp_rotation_epsilon_);
   this->get_parameter("gicp/fitnessRejectThreshold", this->gicp_fitness_reject_threshold_);
+  this->get_parameter("gicp/nonConvergedFitnessOkMaxTransM",
+                      this->gicp_nonconverged_fitness_ok_max_trans_m_);
+  this->get_parameter("gicp/nonConvergedFitnessOkMaxRotDeg",
+                      this->gicp_nonconverged_fitness_ok_max_rot_deg_);
   this->get_parameter("gicp/rejectLargeJumps", this->gicp_reject_large_jumps_);
   this->get_parameter("gicp/hessianCondMax", this->gicp_hessian_cond_max_);
   this->get_parameter("gicp/hessianFitnessWarnThreshold", this->gicp_hessian_fitness_warn_);
@@ -1501,11 +1509,14 @@ void gicp_localization::LocalizationNode::getParams() {
   if (this->fitness_baseline_min_samples_ < 3) this->fitness_baseline_min_samples_ = 3;
   RCLCPP_INFO(this->get_logger(),
               "P1 gating: fitness baseline %s (window=%d, min=%d), ratio_reject=%.2f, "
+              "nonconverged_fitness_ok_max=[%.2fm, %.2fdeg], "
               "partial_update=%s (%s, L=%.1fm, floor6d=%.3f, block floors rot=%.3f trans=%.3f), "
               "yaw_gate=%s (max=%.2fdeg, ratio>%.2f)",
               this->fitness_baseline_enable_ ? "ON" : "OFF",
               this->fitness_baseline_window_, this->fitness_baseline_min_samples_,
               this->fitness_ratio_reject_,
+              this->gicp_nonconverged_fitness_ok_max_trans_m_,
+              this->gicp_nonconverged_fitness_ok_max_rot_deg_,
               this->degen_partial_update_enable_ ? "ON" : "OFF",
               this->degen_full6d_ ? "full6d" : "blockwise",
               this->degen_coupling_length_m_, this->degen_rel_floor_6d_,
@@ -3166,9 +3177,10 @@ void gicp_localization::LocalizationNode::performLocalization() {
   // in map<-lidar, then convert the optimizer output back to map<-base.
   const Eigen::Matrix4f T_base_lidar = this->extrinsics.baselink2lidar_T;
   const Eigen::Matrix4f T_lidar_base = T_base_lidar.inverse();
-  Eigen::Matrix4f initial_guess = this->deskew_
-      ? Eigen::Matrix4f::Identity()
-      : (this->T_prior * T_base_lidar);
+  Eigen::Matrix4f initial_guess = Eigen::Matrix4f::Identity();
+  if (!this->deskew_) {
+    initial_guess = this->T_prior * T_base_lidar;
+  }
   Eigen::Matrix4f guess_pose_map = this->T_prior;
 
   double guess_from_last_trans = 0.0;
@@ -3271,6 +3283,20 @@ void gicp_localization::LocalizationNode::performLocalization() {
     guess_to_solution_trans = deltaTranslationNorm(guess_pose_map, candidate_pose);
     guess_to_solution_rot_deg = rotationDistanceDeg(guess_pose_map, candidate_pose);
   }
+  const bool nonconverged_fallback_trans_ok =
+      this->gicp_nonconverged_fitness_ok_max_trans_m_ <= 0.0 ||
+      (std::isfinite(guess_to_solution_trans) &&
+       guess_to_solution_trans <= this->gicp_nonconverged_fitness_ok_max_trans_m_);
+  const bool nonconverged_fallback_rot_ok =
+      this->gicp_nonconverged_fitness_ok_max_rot_deg_ <= 0.0 ||
+      (std::isfinite(guess_to_solution_rot_deg) &&
+       guess_to_solution_rot_deg <= this->gicp_nonconverged_fitness_ok_max_rot_deg_);
+  const bool nonconverged_fitness_ok =
+      !converged && candidate_pose_valid && std::isfinite(fitness_score) &&
+      fitness_score <= this->gicp_fitness_reject_threshold_ &&
+      nonconverged_fallback_trans_ok && nonconverged_fallback_rot_ok;
+  const bool effectively_converged =
+      candidate_pose_valid && (converged || nonconverged_fitness_ok);
 
   double scan_dt = 0.0;
   if (this->last_gicp_valid_) {
@@ -3417,7 +3443,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
     }
 
     std_msgs::msg::Bool converged_msg;
-    converged_msg.data = (converged || (candidate_pose_valid && fitness_score <= this->gicp_fitness_reject_threshold_)) && candidate_pose_valid;
+    converged_msg.data = effectively_converged;
     this->dbg_converged_pub->publish(converged_msg);
 
     if (gt_pos_err >= 0.0) {
@@ -3529,12 +3555,11 @@ void gicp_localization::LocalizationNode::performLocalization() {
     return oss.str();
   };
 
-  // Accept results that have good fitness even when the optimizer didn't formally
-  // converge (hit maxIterations before epsilon was met). At highway speed the
-  // initial guess can be 1-3 m away, so the solver may need more steps than
-  // maxIterations to satisfy the tight epsilon — but the result is still accurate.
-  const bool effectively_converged = converged ||
-      (candidate_pose_valid && fitness_score <= this->gicp_fitness_reject_threshold_);
+  // Accept low-fitness results that missed formal convergence only when the
+  // optimizer stayed close to the IMU prior. Run5-on-Run3 showed that a
+  // fitness-only fallback can accept a low-fitness wrong basin with 3-9 m and
+  // 10+ deg corrections, then reset the failure counter before GT recovery can
+  // repair the pose.
 
   bool gicp_rejected_fitness = false;
   bool gicp_rejected_fitness_ratio = false;
@@ -3729,7 +3754,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
     RCLCPP_INFO(this->get_logger(),
                 "Localization: ✓ %s%s | fitness=%.6f | time=%.2fms | "
                 "correction=[%.3f, %.3f, %.3f] | pose=[%.2f, %.2f, %.2f]",
-                converged ? "CONVERGED" : "ACCEPTED(fitness-ok)",
+                nonconverged_fitness_ok ? "ACCEPTED(fitness-ok-small-correction)" : "CONVERGED",
                 gicp_partial ? " [PARTIAL: degenerate axes kept on IMU prior]" : "",
                 fitness_score, elapsed_ms,
                 t_corr.x(), t_corr.y(), t_corr.z(),
