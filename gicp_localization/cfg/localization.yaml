@@ -454,13 +454,22 @@
     # candidates fall through the existing IMU dead-reckoning / GT-recovery path
     # and do not update current_pose, observer state, or the next trusted point.
     localization/motion_consistency/enable: true
-    localization/motion_consistency/max_speed_mps: 110.0
+    localization/motion_consistency/max_speed_mps: 75.0
     localization/motion_consistency/max_reverse_m: 0.1
-    localization/motion_consistency/max_heading_error_deg: 60.0
-    localization/motion_consistency/max_curvature_1pm: 0.30
-    localization/motion_consistency/max_yaw_rate_deg_s: 60.0
+    localization/motion_consistency/max_heading_error_deg: 30.0
+    localization/motion_consistency/max_curvature_1pm: 0.20
+    localization/motion_consistency/max_yaw_rate_deg_s: 50.0
     localization/motion_consistency/min_step_for_heading_m: 0.3
     localization/motion_consistency/min_step_for_curvature_m: 2.0
+
+    # Vehicle-model prior: when free IMU integration diverges from plausible
+    # ground-vehicle motion, use a nonholonomic prior derived from the last
+    # trusted pose, observer velocity, and IMU yaw-rate. This remains a single
+    # GICP initial guess; it does not run extra basin-search registrations.
+    localization/vehicle_prior/enable: true
+    localization/vehicle_prior/max_forward_speed_mps: 75.0
+    localization/vehicle_prior/max_lateral_speed_mps: 1.5
+    localization/vehicle_prior/max_yaw_rate_deg_s: 50.0
 
     # GICP Registration Parameters
     # Maximum number of iterations (increased for better convergence)

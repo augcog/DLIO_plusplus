@@ -33,7 +33,7 @@ how the map inputs and the seed are produced.
   - **Degeneracy partial update** (`gicp/degeneracy/*`): when the hessian condition proxy trips `hessianCondMax`, the correction is projected onto well-constrained eigen-directions of the vehicle-re-centered, unit-scaled 6×6 hessian (full-6D by default — coupled rot/trans null directions included) and the IMU prior is kept along degenerate axes. Accepted-with-projection logs `status=ok_partial`; wholesale `rejected_hessian` remains only for the all-axes-degenerate case. Legacy binary gate available via `degeneracy/partialUpdate: false`.
   - **Yaw-consistency veto** (`gicp/yawGate/*`, independent of partialUpdate): a GICP yaw correction > `maxCorrDeg` vs. the IMU-integrated prior on a low-confidence match (ratio > `fitnessRatio`) keeps the IMU yaw — the wrong-basin *entry* signature the jump gate can't see.
   - Large-jump reject (compares the applied candidate to the IMU-predicted prior; speed/scan-dt-aware thresholds).
-- **IMU dead-reckoning fallback**: any non-accepted scan falls back to the IMU-integrated prior instead of freezing at the last accepted pose, seeded with the *current* IMU-propagated velocity (P2 fixed a stale-velocity bug that made multi-scan rejection streaks cut corners).
+- **Vehicle-prior correction**: after the IMU-integrated `T_prior` is built, a nonholonomic ground-vehicle prior clamps vertical drift, forward/lateral speed, and yaw-rate using the last trusted pose, observer velocity, and IMU yaw-rate. When the observer/reference is ready, GICP still runs once, but from this vehicle-constrained prior instead of a free-IMU prior. This does not use INS/GT as a normal prior.
 - **Ground-truth divergence cross-check** (optional): subscribes to a `gt_odom` topic, computes per-scan `gt_err=[trans,rot,dt]` against the pose actually applied (post-projection), publishes deltas. Diagnostic only — never feeds back into accept/reject.
 - **GT-driven pose recovery**: when GICP fails for N consecutive scans (default 5), snap pose+twist to a time-matched GT sample (composed through TF into `base_frame`) so GICP can re-acquire from a known-good state. Twist sources resolve independently (P2): angular rate backfills from the live bias-corrected gyro and linear velocity from GT pose finite-differencing when the odom twist is unpopulated — never zeroing a moving vehicle. Falls back to dead-reckoning when GT is unavailable.
 - **GT-bootstrapped initial pose** (optional): take the first GT message as the initial pose so the node starts at the right location regardless of bag offset.
@@ -362,6 +362,7 @@ Per-scan scalar metrics on `gicp/localization/debug/*`:
 - `jump_trans`, `jump_rot_deg` (raw GICP-vs-prior disagreement, pre-projection)
 - `hessian_condition_proxy`
 - **P1 gating**: `fitness_ratio` (−1 during warm-up without seed), `degen_rot_axes`, `degen_trans_axes`, `yaw_veto`
+- **Vehicle prior**: `vehicle_prior_pose`, `prior_delta_trans_m`, `prior_delta_yaw_deg`, `vehicle_prior_used`
 - **P4 concat**: `merged_aux_count` (−1 = concat disabled), `aux<i>_merge_dt_s` (signed; NaN = not merged), `aux<i>_points`, `scan_time_span_s`
 - `gt_pos_err_m`, `gt_rot_err_deg` (when GT is enabled; measured against the pose actually applied)
 - `converged` (Bool)
@@ -381,13 +382,17 @@ coverage).
                                                 ↓
    LiDAR ──→ lidar_concat ──→ preprocess ──→ T_prior = integrate(IMU, last lidarPose)
                                                 ↓
-                                              GICP align (initial guess = T_prior)
+                                  vehicle-prior correction
+                                  ├─ ready: active prior = T_vehicle_prior
+                                  └─ not ready: active prior = raw T_prior
                                                 ↓
-                            gate: fitness / fitness-ratio / degeneracy-projection / yaw-veto / jump
+                                              GICP align (initial guess = active prior)
+                                                ↓
+                            gate: fitness / fitness-ratio / degeneracy-projection / yaw-veto / jump / motion
                                 ┌─── accepted (ok | ok_partial) ─┴── rejected ──┐
                                 ↓                                                ↓
-                          updateState (geo observer,                dead-reckon: lidarPose ← T_prior,
-                          delta-form target)                        prev_vel ← state.v (current)
+                          updateState (geo observer,                dead-reckon: lidarPose ← active prior
+                          delta-form target)                        (vehicle prior if ready, else raw T_prior)
                                 ↓                                                ↓
                           state ← merge(GICP, IMU)                  consecutive_failures++
                                 ↓                                                ↓
@@ -406,8 +411,9 @@ coverage).
 - **Rejected**: `failed_to_converge`, `rejected_fitness` (absolute),
   `rejected_fitness_ratio` (P1 wrong-basin gate), `rejected_hessian` (now only
   the all-axes-degenerate case), `rejected_jump`, `invalid_solution` — all fall
-  through to the dead-reckoning branch (set `current_pose ← T_prior`, seed
-  `prev_vel` from the current IMU-propagated velocity, increment streak
+  through to the dead-reckoning branch (set `current_pose ← T_vehicle_prior`
+  only when it was selected for this frame, otherwise raw `T_prior`; seed `prev_vel` from the current IMU-propagated
+  velocity, increment streak
   counter, optionally trigger snap).
 - `last_gicp_pose_` is **not** updated on rejection, so the IMU prior on the next scan is still anchored to the last successfully-matched GICP pose.
 

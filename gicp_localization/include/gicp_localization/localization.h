@@ -149,6 +149,21 @@ private:
       const Eigen::Matrix4f& reference_pose,
       const Eigen::Matrix4f& candidate_pose,
       double dt) const;
+
+  struct VehiclePriorResult {
+    bool valid = false;
+    bool control_ready = false;
+    std::string reason = "not_evaluated";
+    Eigen::Matrix4f pose = Eigen::Matrix4f::Identity();
+    double dt = -1.0;
+    double forward_speed_mps = std::numeric_limits<double>::quiet_NaN();
+    double lateral_speed_mps = std::numeric_limits<double>::quiet_NaN();
+    double yaw_rate_deg_s = std::numeric_limits<double>::quiet_NaN();
+    double prior_delta_trans_m = std::numeric_limits<double>::quiet_NaN();
+    double prior_delta_yaw_deg = std::numeric_limits<double>::quiet_NaN();
+  };
+
+  VehiclePriorResult computeVehiclePrior(const Eigen::Matrix4f& T_prior, double scan_dt);
   // Caller must hold pose_mutex. The reference is advanced only by known-good
   // seeds: initial pose, accepted GICP, or GT snap.
   void updateMotionReferenceUnlocked(const Eigen::Matrix4f& pose, double stamp_sec);
@@ -336,6 +351,10 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_motion_curvature_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_motion_yaw_rate_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_motion_rejected_pub;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr dbg_vehicle_prior_pose_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_prior_delta_trans_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_prior_delta_yaw_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_vehicle_prior_used_pub;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr dbg_converged_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_gt_pos_err_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_gt_rot_deg_pub;
@@ -565,6 +584,11 @@ private:
   double gicp_prior_yaw_info_;           // soft in-optimizer yaw prior info (rad^-2, 0 = off)
   double gicp_prior_rollpitch_info_;     // soft in-optimizer roll/pitch prior info (rad^-2, 0 = off)
   std::deque<double> fitness_history_;   // accepted-frame fitness ring (scan thread only)
+
+  bool vehicle_prior_enable_;
+  double vehicle_prior_max_forward_speed_mps_;
+  double vehicle_prior_max_lateral_speed_mps_;
+  double vehicle_prior_max_yaw_rate_deg_s_;
 
   // Preprocessing parameters
   double crop_size_;
