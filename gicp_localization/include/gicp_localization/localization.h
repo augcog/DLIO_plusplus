@@ -35,6 +35,7 @@
 #include <deque>
 #include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace gicp_localization {
@@ -130,6 +131,27 @@ private:
   // maybeSnapPoseToGT does NOT call this -- it accepts any sample because
   // Atlas's INS dead-reckoning is the next-best fallback to GICP failure.
   bool gtSampleIsRtkFixed(const GtSample& s) const;
+
+  struct MotionConsistencyResult {
+    bool evaluated = false;
+    bool rejected = false;
+    std::string reason = "not_evaluated";
+    double dt = -1.0;
+    double ds_xy = -1.0;
+    double speed_mps = -1.0;
+    double signed_forward_m = std::numeric_limits<double>::quiet_NaN();
+    double heading_error_deg = std::numeric_limits<double>::quiet_NaN();
+    double curvature_1pm = std::numeric_limits<double>::quiet_NaN();
+    double yaw_rate_deg_s = std::numeric_limits<double>::quiet_NaN();
+    double dyaw_deg = std::numeric_limits<double>::quiet_NaN();
+  };
+  MotionConsistencyResult evaluateMotionConsistency(
+      const Eigen::Matrix4f& reference_pose,
+      const Eigen::Matrix4f& candidate_pose,
+      double dt) const;
+  // Caller must hold pose_mutex. The reference is advanced only by known-good
+  // seeds: initial pose, accepted GICP, or GT snap.
+  void updateMotionReferenceUnlocked(const Eigen::Matrix4f& pose, double stamp_sec);
 
   void preprocessPointCloud(pcl::PointCloud<PointType>::Ptr& cloud);
   // Sensor-frame crop box; must run BEFORE deskew (world-frame transform).
@@ -308,6 +330,11 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_yaw_veto_pub;           // 1.0 when the yaw-consistency veto zeroed the yaw correction
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_yaw_innovation_pub;      // raw GICP-vs-IMU yaw disagreement (deg, pre-veto)
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_yaw_stiffness_pub;        // marginal yaw information of the scan (Schur, re-centered)
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_motion_forward_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_motion_heading_error_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_motion_curvature_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_motion_yaw_rate_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_motion_rejected_pub;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr dbg_converged_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_gt_pos_err_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_gt_rot_deg_pub;
@@ -358,6 +385,9 @@ private:
   bool last_gicp_valid_;
   double last_fitness_score_{-1.0};  // -1 = no scan yet
   double last_accepted_scan_stamp_{-1.0};  // s — stamp of last accepted GICP scan (P3 dead-reckon cov)
+  Eigen::Matrix4f motion_ref_pose_;
+  double motion_ref_stamp_sec_;
+  bool motion_ref_valid_;
 
   // Trajectory. The actual ring of poses lives in path_buffer_ (deque, O(1)
   // pop_front when capping); path_msg is filled only when the path topic has
@@ -590,6 +620,14 @@ private:
   double jump_yaw_max_deg_;        // base yaw budget vs IMU prior (<=0 disables)
   double jump_yaw_dt_scale_deg_;   // extra yaw budget per second of scan_dt
   double jump_yaw_total_max_deg_;  // absolute cap the dt scaling can never exceed
+  bool motion_consistency_enable_;
+  double motion_max_speed_mps_;
+  double motion_max_reverse_m_;
+  double motion_max_heading_error_deg_;
+  double motion_max_curvature_1pm_;
+  double motion_max_yaw_rate_deg_s_;
+  double motion_min_step_for_heading_m_;
+  double motion_min_step_for_curvature_m_;
   bool verbose_;
 
   // Extrinsics

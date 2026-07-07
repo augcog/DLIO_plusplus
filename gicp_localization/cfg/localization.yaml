@@ -207,7 +207,7 @@
     # (false yaw pressure). Read the value off the per-aux offset diagnostic
     # ("header offset vs primary ... mean=+X ms" -> enter -X/1000 here);
     # runs 19/20 measured 80-90 ms offsets.
-    localization/lidar_concat/aux_time_offsets: []
+    localization/lidar_concat/aux_time_offsets: [0.0, 0.0]
     localization/lidar_concat/buffer_size: 200      # per-aux ring buffer depth (P4#3: raised 20 -> 200
                                                     #  for GLIM parity; 20 = only 2 s of aux history at
                                                     #  10 Hz, so brief stalls degraded frames to fewer
@@ -443,6 +443,20 @@
     localization/jump/yaw_max_deg: 10.0
     localization/jump/yaw_dt_scale_deg: 10.0
     localization/jump/yaw_total_max_deg: 15.0
+
+    # Vehicle motion-consistency gate: online trajectory outlier rejection for
+    # each GICP candidate. The candidate is compared against the last trusted
+    # trajectory point (initial pose, accepted GICP, or GT snap). Rejected
+    # candidates fall through the existing IMU dead-reckoning / GT-recovery path
+    # and do not update current_pose, observer state, or the next trusted point.
+    localization/motion_consistency/enable: true
+    localization/motion_consistency/max_speed_mps: 110.0
+    localization/motion_consistency/max_reverse_m: 0.1
+    localization/motion_consistency/max_heading_error_deg: 60.0
+    localization/motion_consistency/max_curvature_1pm: 0.30
+    localization/motion_consistency/max_yaw_rate_deg_s: 60.0
+    localization/motion_consistency/min_step_for_heading_m: 0.3
+    localization/motion_consistency/min_step_for_curvature_m: 2.0
 
     # GICP Registration Parameters
     # Maximum number of iterations (increased for better convergence)

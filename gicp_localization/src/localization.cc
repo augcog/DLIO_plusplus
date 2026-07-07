@@ -23,6 +23,7 @@
 #include <visualization_msgs/msg/marker.hpp>
 #include <chrono>
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -102,6 +103,14 @@ std::string scalarSummary(double value, int precision = 3) {
   std::ostringstream oss;
   oss << std::fixed << std::setprecision(precision) << value;
   return oss.str();
+}
+
+double wrapAngleRad(double angle) {
+  return std::atan2(std::sin(angle), std::cos(angle));
+}
+
+double yawFromPose(const Eigen::Matrix4f& pose) {
+  return std::atan2(static_cast<double>(pose(1, 0)), static_cast<double>(pose(0, 0)));
 }
 
 double hessianConditionProxy(const Eigen::Matrix<double, 6, 6>& hessian) {
@@ -923,6 +932,7 @@ visualization_msgs::msg::Marker makeArrowMarker(const Eigen::Matrix4f& pose,
 
 gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localization_node") {
 
+  this->sensor = dlio::SensorType::OUSTER;
   this->getParams();
 
   // Initialize flags
@@ -936,6 +946,9 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
   this->last_gicp_pose_ = Eigen::Matrix4f::Identity();
   this->last_gicp_stamp_ = rclcpp::Time(0, 0, this->get_clock()->get_clock_type());
   this->last_gicp_valid_ = false;
+  this->motion_ref_pose_ = Eigen::Matrix4f::Identity();
+  this->motion_ref_stamp_sec_ = -1.0;
+  this->motion_ref_valid_ = false;
 
   // Initialize IMU buffer
   this->imu_buffer.set_capacity(this->imu_buffer_size_);
@@ -995,9 +1008,6 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
   this->geo.prev_p = Eigen::Vector3f::Zero();
   this->geo.prev_q = Eigen::Quaternionf::Identity();
   this->geo.prev_vel = Eigen::Vector3f::Zero();
-
-  // Initialize sensor type (default to OUSTER, can be configured)
-  this->sensor = dlio::SensorType::OUSTER;
 
   // Initialize extrinsics to identity (should be configured from parameters)
   this->extrinsics.baselink2imu.t = Eigen::Vector3f::Zero();
@@ -1264,6 +1274,16 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
         this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/yaw_innovation_deg", 10);
     this->dbg_yaw_stiffness_pub =
         this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/yaw_marginal_stiffness", 10);
+    this->dbg_motion_forward_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/motion_forward_m", 10);
+    this->dbg_motion_heading_error_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/motion_heading_error_deg", 10);
+    this->dbg_motion_curvature_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/motion_curvature_1pm", 10);
+    this->dbg_motion_yaw_rate_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/motion_yaw_rate_deg_s", 10);
+    this->dbg_motion_rejected_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/motion_rejected", 10);
     // P4#3: per-frame lidar_concat diagnostics (one sample per processed frame).
     this->dbg_merged_aux_count_pub =
         this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/merged_aux_count", 10);
@@ -1299,6 +1319,85 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
 }
 
 gicp_localization::LocalizationNode::~LocalizationNode() {}
+
+void gicp_localization::LocalizationNode::updateMotionReferenceUnlocked(
+    const Eigen::Matrix4f& pose, double stamp_sec) {
+  if (!matrixFinite(pose)) return;
+  this->motion_ref_pose_ = pose;
+  this->motion_ref_stamp_sec_ = stamp_sec;
+  this->motion_ref_valid_ = true;
+}
+
+gicp_localization::LocalizationNode::MotionConsistencyResult
+gicp_localization::LocalizationNode::evaluateMotionConsistency(
+    const Eigen::Matrix4f& reference_pose,
+    const Eigen::Matrix4f& candidate_pose,
+    double dt) const {
+  MotionConsistencyResult result;
+  result.dt = dt;
+
+  if (!this->motion_consistency_enable_) {
+    result.reason = "disabled";
+    return result;
+  }
+  if (!matrixFinite(reference_pose) || !matrixFinite(candidate_pose)) {
+    result.reason = "invalid_pose";
+    return result;
+  }
+  if (!std::isfinite(dt) || dt <= 1.0e-3) {
+    result.reason = "invalid_dt";
+    return result;
+  }
+
+  const Eigen::Vector3f ref_t = reference_pose.block<3, 1>(0, 3);
+  const Eigen::Vector3f cand_t = candidate_pose.block<3, 1>(0, 3);
+  const double dx = static_cast<double>(cand_t.x() - ref_t.x());
+  const double dy = static_cast<double>(cand_t.y() - ref_t.y());
+  const double ds = std::hypot(dx, dy);
+  const double ref_yaw = yawFromPose(reference_pose);
+  const double cand_yaw = yawFromPose(candidate_pose);
+  const double dyaw = wrapAngleRad(cand_yaw - ref_yaw);
+
+  result.evaluated = true;
+  result.reason = "ok";
+  result.ds_xy = ds;
+  result.speed_mps = ds / dt;
+  result.signed_forward_m = std::cos(ref_yaw) * dx + std::sin(ref_yaw) * dy;
+  result.dyaw_deg = dyaw * kRadToDeg;
+  result.yaw_rate_deg_s = result.dyaw_deg / dt;
+
+  if (ds >= this->motion_min_step_for_heading_m_) {
+    result.heading_error_deg = wrapAngleRad(std::atan2(dy, dx) - ref_yaw) * kRadToDeg;
+  }
+  if (ds >= this->motion_min_step_for_curvature_m_) {
+    result.curvature_1pm = dyaw / ds;
+  }
+
+  if (this->motion_max_speed_mps_ > 0.0 && result.speed_mps > this->motion_max_speed_mps_) {
+    result.rejected = true;
+    result.reason = "speed";
+  } else if (this->motion_max_reverse_m_ >= 0.0 &&
+             result.signed_forward_m < -this->motion_max_reverse_m_) {
+    result.rejected = true;
+    result.reason = "reverse";
+  } else if (this->motion_max_heading_error_deg_ > 0.0 &&
+             std::isfinite(result.heading_error_deg) &&
+             std::abs(result.heading_error_deg) > this->motion_max_heading_error_deg_) {
+    result.rejected = true;
+    result.reason = "heading";
+  } else if (this->motion_max_yaw_rate_deg_s_ > 0.0 &&
+             std::abs(result.yaw_rate_deg_s) > this->motion_max_yaw_rate_deg_s_) {
+    result.rejected = true;
+    result.reason = "yaw_rate";
+  } else if (this->motion_max_curvature_1pm_ > 0.0 &&
+             std::isfinite(result.curvature_1pm) &&
+             std::abs(result.curvature_1pm) > this->motion_max_curvature_1pm_) {
+    result.rejected = true;
+    result.reason = "curvature";
+  }
+
+  return result;
+}
 
 bool gicp_localization::LocalizationNode::loadUTMTransform(const std::string& path) {
   std::ifstream f(path);
@@ -1876,6 +1975,41 @@ void gicp_localization::LocalizationNode::getParams() {
   this->get_parameter("localization/jump/yaw_dt_scale_deg", this->jump_yaw_dt_scale_deg_);
   this->get_parameter("localization/jump/yaw_total_max_deg", this->jump_yaw_total_max_deg_);
 
+  // Vehicle motion-consistency gate. This is the online version of trajectory
+  // outlier rejection: compare the candidate pose with the last known-good
+  // trajectory point and reject physically implausible jumps before they enter
+  // current_pose / observer state / the next scan's prior.
+  this->declare_parameter<bool>("localization/motion_consistency/enable", true);
+  this->declare_parameter<double>("localization/motion_consistency/max_speed_mps", 110.0);
+  this->declare_parameter<double>("localization/motion_consistency/max_reverse_m", 0.1);
+  this->declare_parameter<double>("localization/motion_consistency/max_heading_error_deg", 60.0);
+  this->declare_parameter<double>("localization/motion_consistency/max_curvature_1pm", 0.30);
+  this->declare_parameter<double>("localization/motion_consistency/max_yaw_rate_deg_s", 60.0);
+  this->declare_parameter<double>("localization/motion_consistency/min_step_for_heading_m", 0.3);
+  this->declare_parameter<double>("localization/motion_consistency/min_step_for_curvature_m", 2.0);
+  this->get_parameter("localization/motion_consistency/enable", this->motion_consistency_enable_);
+  this->get_parameter("localization/motion_consistency/max_speed_mps", this->motion_max_speed_mps_);
+  this->get_parameter("localization/motion_consistency/max_reverse_m", this->motion_max_reverse_m_);
+  this->get_parameter("localization/motion_consistency/max_heading_error_deg",
+                      this->motion_max_heading_error_deg_);
+  this->get_parameter("localization/motion_consistency/max_curvature_1pm",
+                      this->motion_max_curvature_1pm_);
+  this->get_parameter("localization/motion_consistency/max_yaw_rate_deg_s",
+                      this->motion_max_yaw_rate_deg_s_);
+  this->get_parameter("localization/motion_consistency/min_step_for_heading_m",
+                      this->motion_min_step_for_heading_m_);
+  this->get_parameter("localization/motion_consistency/min_step_for_curvature_m",
+                      this->motion_min_step_for_curvature_m_);
+  this->motion_min_step_for_heading_m_ = std::max(0.0, this->motion_min_step_for_heading_m_);
+  this->motion_min_step_for_curvature_m_ = std::max(1.0e-3, this->motion_min_step_for_curvature_m_);
+  RCLCPP_INFO(this->get_logger(),
+              "Motion consistency gate %s: speed<=%.1fm/s reverse<=%.2fm heading<=%.1fdeg "
+              "curvature<=%.3f 1/m yaw_rate<=%.1fdeg/s",
+              this->motion_consistency_enable_ ? "ON" : "OFF",
+              this->motion_max_speed_mps_, this->motion_max_reverse_m_,
+              this->motion_max_heading_error_deg_, this->motion_max_curvature_1pm_,
+              this->motion_max_yaw_rate_deg_s_);
+
   this->get_parameter("localization/verbose", this->verbose_);
 
   // Suppress INFO/DEBUG logs when verbose is off; WARN/ERROR still pass through.
@@ -2097,12 +2231,14 @@ void gicp_localization::LocalizationNode::applyInitialPoseFromParams() {
   }
   this->pending_initial_pose_ = false;
 
+  const rclcpp::Time initial_stamp = this->now();
   {
     std::lock_guard<std::mutex> lock(this->pose_mutex);
     this->current_pose.setIdentity();
     this->current_pose.block<3, 3>(0, 0) = orientation.toRotationMatrix();
     this->current_pose.block<3, 1>(0, 3) = position;
     this->initialized = true;
+    this->updateMotionReferenceUnlocked(this->current_pose, initial_stamp.seconds());
   }
 
   {
@@ -2127,7 +2263,7 @@ void gicp_localization::LocalizationNode::applyInitialPoseFromParams() {
 
   this->path_msg.poses.clear();
   this->path_msg.header.frame_id = this->map_frame;
-  this->path_msg.header.stamp = this->now();
+  this->path_msg.header.stamp = initial_stamp;
 
   RCLCPP_INFO(this->get_logger(),
               "Initial pose loaded from parameters at [%.2f, %.2f, %.2f] m with RPY [%.2f, %.2f, %.2f] rad",
@@ -2147,6 +2283,7 @@ void gicp_localization::LocalizationNode::applyInitialPose(const Eigen::Vector3f
   }
   q.normalize();
 
+  const rclcpp::Time ref_stamp = stamp.nanoseconds() > 0 ? stamp : this->now();
   {
     std::lock_guard<std::mutex> lock(this->pose_mutex);
     this->current_pose.setIdentity();
@@ -2156,6 +2293,7 @@ void gicp_localization::LocalizationNode::applyInitialPose(const Eigen::Vector3f
     if (stamp.nanoseconds() > 0) {
       this->scan_stamp = stamp;
     }
+    this->updateMotionReferenceUnlocked(this->current_pose, ref_stamp.seconds());
   }
 
   // Reset geometric observer state to prevent drift from previous estimates
@@ -2182,7 +2320,7 @@ void gicp_localization::LocalizationNode::applyInitialPose(const Eigen::Vector3f
   // Clear trajectory path on reinitialization
   this->path_msg.poses.clear();
   this->path_msg.header.frame_id = this->map_frame;
-  this->path_msg.header.stamp = stamp.nanoseconds() > 0 ? stamp : this->now();
+  this->path_msg.header.stamp = ref_stamp;
 
   RCLCPP_INFO(this->get_logger(), "Received initial pose (%s) at [%.2f, %.2f, %.2f]",
               source.c_str(), p.x(), p.y(), p.z());
@@ -3350,6 +3488,11 @@ void gicp_localization::LocalizationNode::performLocalization() {
           : static_cast<double>(num_correspondences) / static_cast<double>(this->current_scan->points.size());
   const Eigen::Matrix<double, 6, 6>& final_hessian = this->gicp.getFinalHessian();
   const double hessian_condition = hessianConditionProxy(final_hessian);
+  const Eigen::Matrix4f optimizer_solution = this->gicp.getFinalTransformation();
+  const Eigen::Matrix4f candidate_pose = this->deskew_
+      ? (optimizer_solution * this->T_prior)
+      : (optimizer_solution * T_lidar_base);
+  const bool candidate_pose_valid = matrixFinite(candidate_pose);
 
   // Marginal yaw stiffness (yaw-defect diagnostic): Schur complement of the
   // vehicle-re-centered hessian w.r.t. everything except yaw — the
@@ -3379,12 +3522,6 @@ void gicp_localization::LocalizationNode::performLocalization() {
       if (std::isfinite(schur)) yaw_marginal_stiffness = std::max(0.0, schur);
     }
   }
-
-  const Eigen::Matrix4f optimizer_solution = this->gicp.getFinalTransformation();
-  const Eigen::Matrix4f candidate_pose = this->deskew_
-      ? (optimizer_solution * this->T_prior)
-      : (optimizer_solution * T_lidar_base);
-  const bool candidate_pose_valid = matrixFinite(candidate_pose);
 
   // --- P1: per-map fitness baseline (rolling median of accepted-frame fitness).
   // Absolute fitness thresholds calibrated on a same-run map (floor 0.03-0.06)
@@ -3565,6 +3702,19 @@ void gicp_localization::LocalizationNode::performLocalization() {
   const bool yaw_jump_final = candidate_pose_valid && std::isfinite(eff_yaw_max_deg) &&
                               yaw_innov_final_deg > eff_yaw_max_deg;
 
+  MotionConsistencyResult motion_consistency;
+  if (candidate_pose_valid && this->motion_ref_valid_) {
+    const double motion_dt = this->scan_stamp.seconds() - this->motion_ref_stamp_sec_;
+    motion_consistency =
+        this->evaluateMotionConsistency(this->motion_ref_pose_, final_candidate, motion_dt);
+  } else if (!this->motion_consistency_enable_) {
+    motion_consistency.reason = "disabled";
+  } else if (!this->motion_ref_valid_) {
+    motion_consistency.reason = "no_reference";
+  } else {
+    motion_consistency.reason = "invalid_candidate";
+  }
+
   // PR#6: BOUNDED non-converged fitness fallback. The "effectively converged"
   // rule (non-converged but fitness under the absolute threshold) exists for
   // the max-iterations-at-highway-speed case, where the correction is small.
@@ -3658,6 +3808,11 @@ void gicp_localization::LocalizationNode::performLocalization() {
     // P1 yaw-safety: raw GICP-vs-IMU yaw disagreement (pre-veto/projection).
     publish_float(this->dbg_yaw_innovation_pub, yaw_innov_raw_deg);
     publish_float(this->dbg_yaw_stiffness_pub, yaw_marginal_stiffness);
+    publish_float(this->dbg_motion_forward_pub, motion_consistency.signed_forward_m);
+    publish_float(this->dbg_motion_heading_error_pub, motion_consistency.heading_error_deg);
+    publish_float(this->dbg_motion_curvature_pub, motion_consistency.curvature_1pm);
+    publish_float(this->dbg_motion_yaw_rate_pub, motion_consistency.yaw_rate_deg_s);
+    publish_float(this->dbg_motion_rejected_pub, motion_consistency.rejected ? 1.0 : 0.0);
     // P4#3: per-frame concat/source-set record (merged_aux_count = -1 when
     // concat disabled; aux dt = NaN when that aux did not merge this frame).
     publish_float(this->dbg_merged_aux_count_pub,
@@ -3764,6 +3919,16 @@ void gicp_localization::LocalizationNode::performLocalization() {
         << " yaw_innov=[" << scalarSummary(yaw_innov_raw_deg, 2) << "deg,fin="
         << scalarSummary(yaw_innov_final_deg, 2) << "deg]"
         << " yaw_stiff=" << scalarSummary(yaw_marginal_stiffness, 1)
+        << " motion=[eval=" << (motion_consistency.evaluated ? 1 : 0)
+        << ",rej=" << (motion_consistency.rejected ? 1 : 0)
+        << ",reason=" << motion_consistency.reason
+        << ",dt=" << scalarSummary(motion_consistency.dt, 3) << "s"
+        << ",ds=" << scalarSummary(motion_consistency.ds_xy, 3) << "m"
+        << ",speed=" << scalarSummary(motion_consistency.speed_mps, 2) << "mps"
+        << ",fwd=" << scalarSummary(motion_consistency.signed_forward_m, 3) << "m"
+        << ",head=" << scalarSummary(motion_consistency.heading_error_deg, 2) << "deg"
+        << ",curv=" << scalarSummary(motion_consistency.curvature_1pm, 3) << "1pm"
+        << ",yaw_rate=" << scalarSummary(motion_consistency.yaw_rate_deg_s, 2) << "degps]"
         << " imu_buffer_span=" << scalarSummary(imu_buffer_span) << "s"
         << " scan_to_latest_imu_lag=" << scalarSummary(scan_to_latest_imu_lag) << "s"
         << " concat=[" << this->concat_last_merged_aux_ << "/" << this->aux_lidars_.size();
@@ -3798,6 +3963,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
   bool gicp_rejected_jump = false;
   bool gicp_rejected_yaw = false;
   bool gicp_rejected_hessian = false;
+  bool gicp_rejected_motion = false;
   if (effectively_converged && candidate_pose_valid) {
     if (fitness_score > this->gicp_fitness_reject_threshold_) {
       gicp_rejected_fitness = true;
@@ -3815,6 +3981,8 @@ void gicp_localization::LocalizationNode::performLocalization() {
       // wrong-basin solution must not be partially applied either — fall back
       // to the IMU prior entirely.
       gicp_rejected_fitness_ratio = true;
+    } else if (motion_consistency.rejected) {
+      gicp_rejected_motion = true;
     } else if (this->degen_partial_update_enable_) {
       // P1 partial-update path: degenerate geometry no longer rejects the scan
       // (the old binary gate produced 253-frame dead-reckoning streaks when the
@@ -3856,7 +4024,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
   const bool gicp_accepted = effectively_converged && candidate_pose_valid &&
                              !gicp_rejected_fitness && !gicp_rejected_fitness_ratio &&
                              !gicp_rejected_hessian && !gicp_rejected_jump &&
-                             !gicp_rejected_yaw;
+                             !gicp_rejected_yaw && !gicp_rejected_motion;
   const bool gicp_partial = gicp_accepted && degen.valid && degen.modified;
 
   if (!candidate_pose_valid) {
@@ -3879,6 +4047,17 @@ void gicp_localization::LocalizationNode::performLocalization() {
                 "GICP REJECTED (fitness_ratio=%.3f > %.3f, baseline=%.4f — wrong-basin signature): %s",
                 fitness_ratio, this->fitness_ratio_reject_, fitness_baseline,
                 build_scan_debug_log("rejected_fitness_ratio").c_str());
+  } else if (gicp_rejected_motion) {
+    RCLCPP_WARN(this->get_logger(),
+                "GICP REJECTED (motion consistency %s: speed=%.2fm/s forward=%.3fm "
+                "heading=%.2fdeg curvature=%.3f 1/m yaw_rate=%.2fdeg/s): %s",
+                motion_consistency.reason.c_str(),
+                motion_consistency.speed_mps,
+                motion_consistency.signed_forward_m,
+                motion_consistency.heading_error_deg,
+                motion_consistency.curvature_1pm,
+                motion_consistency.yaw_rate_deg_s,
+                build_scan_debug_log("rejected_motion").c_str());
   } else if (gicp_rejected_hessian) {
     RCLCPP_WARN(this->get_logger(),
                 "GICP REJECTED (hessian_cond=%.3e > %.3e AND [fitness=%.4f|trans=%.3fm|rot=%.3fdeg] crossed [%.4f|%.3fm|%.3fdeg] — degenerate slide): %s",
@@ -3986,6 +4165,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
       this->last_gicp_pose_ = this->current_pose;
       this->last_gicp_stamp_ = this->scan_stamp;
       this->last_gicp_valid_ = true;
+      this->updateMotionReferenceUnlocked(this->current_pose, this->scan_stamp.seconds());
     }
 
     // Reset consecutive-failure counter on any accepted scan so the GT-recovery
@@ -4016,6 +4196,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
                        : gicp_rejected_fitness ? "fitness rejected"
                        : gicp_rejected_yaw ? "yaw-innovation rejected (impossible heading)"
                        : gicp_rejected_fitness_ratio ? "fitness-ratio rejected (wrong basin)"
+                       : gicp_rejected_motion ? "motion-consistency rejected"
                        : gicp_rejected_hessian ? "degenerate geometry"
                        : "jump rejected";
     if (matrixFinite(this->T_prior)) {
@@ -4686,6 +4867,7 @@ bool gicp_localization::LocalizationNode::maybeSnapPoseToGT(const char* reason) 
   this->basePose.p = p_new;
   this->basePose.q = q_new;
   this->prev_vel = v_base_world;
+  this->updateMotionReferenceUnlocked(this->current_pose, this->scan_stamp.seconds());
 
   RCLCPP_WARN(this->get_logger(),
               "Localization: ⟳ snapped pose to GT (%s after %d consecutive non-accepts) — "
