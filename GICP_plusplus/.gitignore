@@ -1,0 +1,52 @@
+# ROS 2 / colcon build artifacts
+build/
+install/
+log/
+.colcon_install_layout
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!cmake/
+
+# Compiled output
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# PCD / point cloud map files (often large binaries)
+*.pcd
+*.ply
+*.las
+*.laz
+
+# ROS bags
+*.bag
+*.db3
+*.mcap
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Doxygen
+docs/html/
+docs/latex/
+
+# Compiled Python extensions
+*.pyd

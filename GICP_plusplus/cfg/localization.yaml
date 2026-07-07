@@ -1,0 +1,590 @@
+/**:
+  ros__parameters:
+
+    use_sim_time: true
+
+    # Localization Parameters
+    # Path to pre-built PCD map file
+    localization/map_path: "dlio_maps/may_4_putnam.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
+
+    # UTM output: path to GLIM's T_world_utm.txt for the map being used.
+    # Leave empty to disable UTM-frame publishing.
+    localization/utm_transform_path: ""
+    localization/utm_frame: "utm"
+
+    # Frame IDs
+    # Atlas-INS IMU design: GICP consumes IMU from /gps_p1/imu (Atlas
+    # imu_calibrated -- sensor-level bias/scale/misalignment removed by
+    # FusionEngine firmware, gravity still PRESENT, no fused orientation).
+    #
+    # IMU frame note: the Atlas LG69T physically sits at the chassis link
+    # "pointonenav" (URDF xyz=1.898, 0.027, 0.450). Per the FusionEngine
+    # Message Spec v0.21 3.4.1, IMUOutput (11000) is bias/scale-corrected and
+    # ROTATED into vehicle body axes, but is NOT lever-arm-projected to the
+    # antenna -- the accelerometer specific force stays at the device
+    # location. (Only the INS pose/position output is referenced to the
+    # antenna, via the firmware Output Lever Arm config.) So /gps_p1/imu
+    # carries body-axis-rotated accel/gyro measured at "pointonenav",
+    # ~0.63 m from the antenna link "gps_antenna_top" (xyz=1.27135,0.0,0.91994).
+    #
+    # We nonetheless set imu_frame == base_frame == gps_antenna_top, which
+    # zeroes callbackImu's base<-imu translation t, so the centripetal
+    # lever-arm term (localization.cc: lin_accel -= w x (w x t)) is skipped.
+    # This is an intentional APPROXIMATION, not a claim that firmware pre-
+    # projected the IMU: at mapping speeds the dropped term is small
+    # (~0.2 m/s^2 at 0.5 rad/s), the gyro is unaffected (rigid body), and it
+    # is absorbed by the accel-bias estimator + scan matching. To model it
+    # exactly, set imu_frame: "pointonenav" (and re-verify GLIM
+    # sensors/T_lidar_imu targets the same physical IMU point); callbackImu
+    # then resolves a nonzero t and applies the compensation.
+    #
+    # gt_odom is /gps_p1/filtered_odom (Atlas FusionEngine INS solution)
+    # which publishes nav_msgs/Odometry with header.frame_id="map" and
+    # child_frame_id="gps_antenna_top" -- same body frame as base_frame
+    # and imu_frame. composeGtPoseInBase therefore also collapses to an
+    # identity TF; no cross-vendor lever-arm work happens anywhere.
+    localization/map_frame: "map"
+    localization/base_frame: "gps_antenna_top"
+    localization/imu_frame: "gps_antenna_top"
+    localization/lidar_frame: "luminar_front"  # Must match launch child_frame or incoming LiDAR frame
+
+    # Static base_frame<-lidar_frame lever arm (row-major 4x4, p_base = T * p_lidar),
+    # used to resolve the extrinsic WITHOUT live TF so offline replay (no /tf_static
+    # or robot_state_publisher) still localizes. Resolution priority: URDF
+    # (lidar_concat/urdf_path, set by the launch) > this static matrix > live TF.
+    # Derived from av24.urdf (gps_antenna_top <- luminar_front); keep in sync with
+    # the URDF if mounts change, or set lidar_concat/urdf_path. [] disables (URDF/TF only).
+    localization/base_lidar_transform: [
+      1.0, 0.0, 0.0,  0.95065,
+      0.0, 1.0, 0.0,  0.00500,
+      0.0, 0.0, 1.0, -0.47194,
+      0.0, 0.0, 0.0,  1.0
+    ]
+
+    # Optional map rotation (degrees) to correct sideways/up-axis issues from source map files.
+    # If your map looks sideways, try roll +/-90 first.
+    localization/map_rotation/roll_deg: 0.0
+    localization/map_rotation/pitch_deg: 0.0
+    localization/map_rotation/yaw_deg: 0.0
+
+    # GICP target-map downsampling. The map is voxel-downsampled (in place) at
+    # load, BEFORE the kd-tree is built. A dense map (e.g. a ~49M-point GLIM
+    # export) otherwise builds a multi-GB kd-tree that exhausts RAM/swap and
+    # stalls registration for seconds. ~0.3 m cuts point count / memory ~10x with
+    # negligible accuracy loss at the scan voxel (dlio/preprocessing/voxelFilter/res
+    # below, 0.5 m). Set to 0.0 to disable and register against the full-res map.
+    localization/map_voxel_size: 0.3
+
+    # Map visualization (separate, coarser downsample used only for RViz publishing)
+    localization/visualize_map: true
+    localization/map_voxel_size_vis: 1.5  # Downsample map for visualization (increase for faster RViz)
+
+    # TF publishing
+    localization/publish_tf: false
+    # If true, disable GICP scan matching and propagate pose using IMU/geometric observer only.
+    localization/imu_only: false
+
+    # Logging verbosity. true = current behavior (INFO + raw stderr debug prints).
+    # false = silence INFO/DEBUG; WARN/ERROR still pass through.
+    localization/verbose: false
+
+    # Use odometry for pose initialization
+    # If true, waits for first odometry message to initialize
+    # If false, waits for initial pose from RViz or topic
+    localization/use_odom_init: true
+
+    # Ground-truth odom cross-check. When enabled, the node subscribes to the
+    # `gt_odom` remap (default /gps_p1/filtered_odom -- Atlas FusionEngine INS
+    # solution, header.frame_id="map", child_frame_id="gps_antenna_top") and
+    # reports gt_err=[trans,rot,dt] in every SCAN DEBUG line + publishes the
+    # deltas on gicp/localization/debug/gt_pos_err_m and .../gt_rot_err_deg.
+    # Diagnostic only -- never feeds back into accept/reject decisions.
+    #
+    # Frame note: gt_odom's child_frame_id is gps_antenna_top, identical to
+    # base_frame and imu_frame, so the cross-check ||cand_p - gt.p|| is exact
+    # (no lever-arm bias) and the snap helper's T_base_gtbody_ resolves to
+    # identity. The composeGtPoseInBase helper still runs and caches the TF on
+    # first GT message, but it returns identity in this configuration.
+    localization/gt_odom/enable: true
+    localization/gt_odom/buffer_size: 200      # ring buffer depth (~2s @ 100Hz GT)
+    localization/gt_odom/max_dt: 0.1           # seconds; reject lookups farther than this from scan stamp
+
+    # RTK quality gate on the gt_odom buffer. Drops every incoming gt_odom
+    # sample whose Atlas-reported pose covariance is worse than the configured
+    # thresholds. This is the P1-native replacement for the NovAtel BESTGNSSPOS
+    # enum gate (RAWIMUSX/INSPVAX/CORRIMUSX path is gone -- everything now
+    # comes from /gps_p1/* and the FusionEngine driver populates Odometry's
+    # covariance directly from its solution quality).
+    #
+    # The gate inspects msg->pose.covariance[0,7,14] (xx, yy, zz position
+    # variances in m^2). Reject if any horizontal variance exceeds
+    # max_pose_var_xy, OR vertical variance exceeds max_pose_var_z.
+    #
+    # Reference values from a known-RTK-fixed bag (run_2, 17 min, Atlas
+    # at AV-24): median cov_xx=2.8e-5, cov_yy=4.2e-5, cov_zz=1.0e-4. p95
+    # cov_xx=4.1e-5, cov_yy=5.7e-5, cov_zz=1.3e-4. Maxes never exceed
+    # 1.1e-4 horizontal / 2.5e-4 vertical. RTK-float typically lives in
+    # the 1e-2 -- 1e-1 m^2 band; GPS-only at 1 m^2 +. The default thresholds
+    # below admit anything down to RTK-float and reject only when Atlas
+    # has fully degraded to GPS-only.
+    #
+    # Disable (enable=false) only for replays of bags lacking covariance
+    # populating, or for diagnostic runs where you want all gt_odom samples
+    # accepted.
+    localization/rtk_gate/enable: true
+    localization/rtk_gate/max_pose_var_xy: 0.25  # m^2; ~0.5 m horizontal std
+    localization/rtk_gate/max_pose_var_z: 1.0    # m^2; ~1.0 m vertical std (GPS Z is naturally worse)
+
+    # GT-driven pose recovery: when GICP fails for `min_consecutive_failures`
+    # scans in a row, snap current_pose / lidarPose / state.{p,q,v} to the
+    # time-matched GT sample so GICP can re-acquire from a known-good state.
+    # The GT pose+twist is transformed from msg->child_frame_id into base_frame
+    # via TF (cached on first GT message). IMU biases are preserved. Disabled by
+    # default — production deployments without a GT topic keep the existing
+    # dead-reckoning behavior. Setting enable=true forces gt_odom/enable=true.
+    localization/gt_recovery/enable: true
+    # P2#3: raised 1 -> 5. With min=1 the snap fired on EVERY rejected frame
+    # (1,860 snaps in run 12), masking dead-reckoning quality in all replay
+    # metrics and hiding the stale-prev_vel bug. With the P1 partial-update
+    # gating, long rejection streaks should no longer occur, so the snap is
+    # back to what it was meant to be: a last-resort recovery after a
+    # sustained losing streak (~0.5 s at 10 Hz), not a per-frame crutch.
+    # Validation runs should ALSO do one pass with enable=false to expose the
+    # true dead-reckoning behavior (production has no GT topic).
+    localization/gt_recovery/min_consecutive_failures: 5
+
+    # Initial pose taken directly from GLIM traj_lidar.txt first row.
+    # robot_state_publisher (launched alongside this node from the URDF) provides
+    # the real base_link -> luminar_front transform, so the node internally
+    # tracks the base_link pose in world. Set `frame: "lidar"` and the node
+    # will post-multiply inv(T_base_lidar) automatically; set "base_link" if
+    # you already computed T_world_baselink yourself.
+    localization/initial_pose/use: false
+    localization/initial_pose/frame: "lidar"   # "lidar" (GLIM traj_lidar.txt) or "base_link"
+    localization/initial_pose/x: 12.602963     # meters
+    localization/initial_pose/y: -9.739742      # meters
+    localization/initial_pose/z: -33.576455      # meters
+    localization/initial_pose/roll: -0.021723   # radians (-0.134 deg)
+    localization/initial_pose/pitch: 0.024880 # radians (-2.007 deg)
+    localization/initial_pose/yaw: 2.711203   # radians (-0.289 deg)
+
+    # Preprocessing Parameters (override defaults for localization)
+    # Crop box filter: keeps points within ±size meters of the sensor origin.
+    # Applied in SENSOR frame BEFORE deskew (cropBoxFilterSensorFrame), so it is a
+    # near/far-field filter around the lidar regardless of deskew on/off. (It is
+    # NOT applied after deskew, where the cloud is world-frame and a box would clip
+    # around the map origin.)
+    dlio/preprocessing/cropBoxFilter/size: 80.0  # metres; 160 m cube around the sensor
+    dlio/preprocessing/voxelFilter/use: true    # Enabled for full-map localization to reduce correspondence ambiguity
+    # P4#1: 0.5 -> 0.3. At 0.5 m the median post-filter scan was only ~6.9k
+    # points (front-only frames 1-2k), starving GICP of yaw-constraining
+    # geometry exactly at corners. 0.3 m roughly doubles-to-triples scan
+    # density. WATCHPOINT: gicp_ms (run-12 baseline: median 18 ms, p99 68 ms)
+    # — if p99 approaches the 100 ms scan period, back off to 0.4. A/B ladder
+    # worth running: 0.5 (old) / 0.3 (default) / 0.25 (dense).
+    dlio/preprocessing/voxelFilter/res: 0.3
+
+    # Flip Y axis of incoming point cloud (e.g. SAE Y-right -> ROS Y-left without touching Z).
+    # When lidar_concat is enabled this runs AFTER merge, so it flips the merged primary+aux cloud.
+    localization/flip_y: false
+
+    # Multi-LiDAR concatenation (mirrors GLIM's lidar_concat). When enabled, the node
+    # subscribes to each aux topic, buffers the latest scans, and on every primary
+    # scan finds the nearest aux scan in time, transforms its XYZ into the primary
+    # sensor frame, rebases per-point timestamps onto the primary clock, and appends
+    # the bytes to the primary PointCloud2. Downstream steps see a single cloud in
+    # primary frame with one coherent timebase.
+    localization/lidar_concat/enabled: true
+    localization/lidar_concat/aux_topics: ["/luminar_right/points", "/luminar_left/points"]
+    localization/lidar_concat/aux_frames: ["luminar_right", "luminar_left"]
+    localization/lidar_concat/time_threshold: 0.1   # seconds; aux scans further than this from primary are dropped
+                                                    # (0.05 dropped ~half the aux scans on the Run3 bag; 0.1 captures
+                                                    #  the observed aux-to-primary jitter so 3-LiDAR completes reliably)
+    # Yaw-defect fix (P3): constant per-aux clock offsets (seconds, order =
+    # aux_topics; missing = 0). ADDED to the aux header stamp for matching /
+    # rebasing AND to Luminar absolute per-point times, so a constant clock
+    # offset vs the primary/IMU no longer warps the merged scan during turns
+    # (false yaw pressure). Read the value off the per-aux offset diagnostic
+    # ("header offset vs primary ... mean=+X ms" -> enter -X/1000 here);
+    # runs 19/20 measured 80-90 ms offsets.
+    localization/lidar_concat/aux_time_offsets: []
+    localization/lidar_concat/buffer_size: 200      # per-aux ring buffer depth (P4#3: raised 20 -> 200
+                                                    #  for GLIM parity; 20 = only 2 s of aux history at
+                                                    #  10 Hz, so brief stalls degraded frames to fewer
+                                                    #  LiDARs — run 12 merged 2/2 on only ~35% of sampled scans)
+
+    # Strict merge guard. false = OPERATIONAL default: localize on whatever LiDARs
+    # merged this scan (front + any available aux) instead of skipping/aborting when
+    # an aux is missing or late. This avoids the scan-gap / long-tail behavior seen
+    # on the Run3 bag, where require_all_aux=true dropped ~half the scans at a tight
+    # window and dead-reckoned through the gaps. Set true only for a sync-validation
+    # / bring-up pass: an incomplete required merge then SKIPS the scan, and past
+    # max_consecutive_aux_merge_failures the node shuts down only if
+    # abort_on_merge_failure=true (otherwise it keeps skipping non-fatally).
+    # Keep in parity with GLIM lidar_concat/require_all_aux.
+    localization/lidar_concat/require_all_aux: false
+    # When require_all_aux=true and merges keep failing past the budget below:
+    #   true  = abort the node (fail-fast; use for sync validation / bring-up)
+    #   false = keep skipping incomplete scans non-fatally (robust long replays)
+    # Ignored when require_all_aux=false. Keep in parity with GLIM abort_on_merge_failure.
+    localization/lidar_concat/abort_on_merge_failure: true
+    localization/lidar_concat/max_consecutive_aux_merge_failures: 10  # 0 = fail on first incomplete scan (only when require_all_aux=true)
+
+    # Aux-LiDAR extrinsic resolution (NO live TF required) -- resolved once at startup,
+    # so the merge works in offline replay without robot_state_publisher / /tf_static.
+    # Priority per aux: (1) URDF if urdf_path set, (2) the static matrices below,
+    # (3) live TF lookup as a last resort. This matches GLIM, which reads the same
+    # av24.urdf for its extrinsics.
+    localization/lidar_concat/primary_frame: "luminar_front"  # URDF link of the primary LiDAR
+    # Set to the absolute path of av24.urdf to use the URDF as the single source of
+    # truth (overrides the static matrices below). Empty = use the static matrices.
+    localization/lidar_concat/urdf_path: ""
+    # Static fallback: row-major 4x4 (p_primary = T * p_aux) per aux, in aux_frames
+    # order [luminar_right, luminar_left]. Derived from av24.urdf (rear_axle_middle
+    # parent); keep in sync with the URDF if mounts change, or set urdf_path instead.
+    localization/lidar_concat/aux_static_transforms: [
+      # luminar_right  (yaw -1.9634954 rad about primary)
+      -0.38268342,  0.92387954, 0.0, -0.648,
+      -0.92387954, -0.38268342, 0.0, -0.158,
+       0.0,         0.0,        1.0,  0.087,
+       0.0,         0.0,        0.0,  1.0,
+      # luminar_left   (yaw +1.9634954 rad about primary)
+      -0.38268342, -0.92387954, 0.0, -0.658,
+       0.92387954, -0.38268342, 0.0,  0.144,
+       0.0,         0.0,        1.0,  0.087,
+       0.0,         0.0,        0.0,  1.0
+    ]
+
+    # LiDAR sensor type for per-point timestamp handling during deskewing
+    # Options: ouster, velodyne, hesai, livox, luminar
+    localization/sensor_type: "luminar"
+
+    # IMU and Deskewing Parameters
+    # Enabled now that the Luminar per-point timestamp encoding is confirmed:
+    # Iris emits UINT8[8] = uint64 PTP epoch nanoseconds per point (Iris
+    # Product Information Guide R2.0.7 sec 7.8.4: "If those timestamps are
+    # in epoch time, and not time since sensor startup, then the sensor
+    # synced at least once"). The previously observed "collapsed" symptom
+    # was a side-effect of the lidar_concat shift double-counting the
+    # inter-scan offset on absolute-epoch timestamps; that shift now passes
+    # UINT8[8] through unchanged (see shiftCloudTimestamps).
+    # If the LUMINAR_TS_DIAG one-shot dump on first cloud ever reports a
+    # different encoding (e.g. FLOAT64 seconds-since-scan-start), flip back
+    # to false until copyPointTimeFromCloud's LUMINAR branch is updated.
+    dlio/deskew: true
+    dlio/gravity: 9.81  # Gravity magnitude (m/s^2)
+    dlio/imu/bufferSize: 2000  # IMU buffer size
+    # Hard guard on IMU topic remap. When true, node startup fails unless the
+    # resolved imu topic is in topic_allowlist (default: /gps_p1/imu).
+    localization/imu/require_topic_allowlist: true
+    localization/imu/topic_allowlist: ["/gps_p1/imu"]
+    # Reject IMU samples whose message frame_id does not match imu_frame.
+    # Re-enabled now that imu_frame=gps_antenna_top matches the frame_id the
+    # upstream pointonenav_interface / adapter stamps on /gps_p1/imu. This is
+    # a label match only; the IMU is physically device-located (see the IMU
+    # frame note above), so it confirms the tag, not a lever-arm projection.
+    localization/imu/require_frame_match: true
+    dlio/imu/calibTime: 0.5  # Seconds of stationary IMU data for bias/gravity calibration (fallback when RTK init is off/unavailable). With Atlas imu_calibrated input the residual bias is already near-zero, so this estimate captures only mount-level tilt; shortening below ~0.1s is safe.
+
+    # RTK-driven IMU calibration: use the GT odom buffer as the truth source
+    # for bias estimation. Lets the vehicle calibrate while moving and seeds
+    # pose+velocity from an RTK-quality sample rather than assuming stationary.
+    #
+    # Gate contract (consumer-side): callbackGtOdom() buffers EVERY gt_odom
+    # message and sets gt_odom_received_ regardless of covariance, so
+    # gt_odom_received_ only means "some Atlas odom arrived" -- NOT that it is
+    # RTK-FIXED quality. The localization/rtk_gate covariance check is applied
+    # per-sample at consumption time (gtSampleIsRtkFixed in tryRtkCalibrationStep
+    # and the cross-check), so only RTK-FIXED samples drive bias/seed; snap
+    # recovery still accepts degraded samples.
+    #
+    # Output continuity (seed-and-go): localization output is DECOUPLED from
+    # bias calibration. As soon as a state seed exists (GT odom-init, a param
+    # initial pose, or the first GICP scan) the node propagates and publishes
+    # continuously; RTK/stationary bias calibration runs in the background and
+    # applies its refined bias as a smooth correction when it completes. Output
+    # is suppressed only while genuinely unseeded (nothing to propagate from).
+    #
+    # Consequences for this calibration:
+    #   - If no GT arrives within fallback_timeout of the first IMU AND we have
+    #     no seed, the node falls back to the stationary path above to obtain
+    #     gravity/orientation (a brief, unavoidable startup blackout).
+    #   - With continuous-but-degraded Atlas odom, RTK calibration simply never
+    #     completes, but a GT odom-init seed keeps output flowing the whole time
+    #     and a later RTK-FIXED sample finishes the calibration opportunistically.
+    #     The (calib_window + fallback_timeout) bound on RTK_CALIBRATING now only
+    #     applies while still unseeded, where it forces the stationary fallback.
+    localization/rtk_init/enable: true
+    localization/rtk_init/calib_window: 2.0      # seconds of IMU+GT residual accumulation
+    localization/rtk_init/fallback_timeout: 5.0  # seconds without GT before stationary fallback
+
+    # Geometric Observer Parameters
+    # Proportional gains that drive the state toward each accepted GICP
+    # scan (run at ~10 Hz Luminar). Time constants tau = 1/K:
+    #   Kp=4.5  -> tau_p  ~ 0.22 s  (position pull-in)
+    #   Kv=11.25-> tau_v  ~ 0.09 s  (velocity)
+    #   Kq=4.0  -> tau_q  ~ 0.25 s  (orientation)
+    # These are the upstream DLIO defaults. They have held up well on the
+    # AV-24 high-speed runs and are NOT tightened further here -- raising
+    # them aggravates LiDAR-noise feedthrough on Luminar at >60 m/s.
+    odom/geo/Kp: 4.5      # Position correction gain
+    odom/geo/Kv: 11.25    # Velocity correction gain
+    odom/geo/Kq: 4.0      # Orientation correction gain
+    # P3: delta-form observer correction. The GICP measurement is stamped at
+    # the scan's median point time, 0.1-0.3 s before the correction is applied
+    # (half sweep + queueing + solve, gicp_ms p99 = 68 ms on run 12). Legacy
+    # (false) pulls the CURRENT state toward that stale absolute pose — a
+    # systematic backward/yaw-lag drag that made accepted-frame gt_err scale
+    # with yaw rate (1.0 m at <2 deg/s -> 2.1 m at >25 deg/s). true applies
+    # the time-free delta T_corr = T_meas * inv(T_prior) to the current state
+    # instead: perfect IMU/GICP agreement => zero correction at any latency.
+    # Gains and observer structure are unchanged — only the target moves.
+    odom/geo/delta_correction: true
+    # Online bias adaptation from GICP residuals stays disabled for the
+    # Atlas-INS imu_calibrated path: residual bias is already small
+    # (firmware-stable) and there is no reason to let GICP residuals
+    # rewrite the bias estimate. Initial RTK / stationary calibration still
+    # seeds state.b once; set these >0 only to restore upstream DLIO-style
+    # adaptive IMU bias tracking.
+    odom/geo/Kab: 0.0     # Accelerometer bias adaptation gain
+    odom/geo/Kgb: 0.0     # Gyroscope bias adaptation gain
+    # Vertical-velocity damping. DISABLED by default.
+    #
+    # The propagator term is:  new_v_lin_w[2] *= (1 - dt * Kz_damping)
+    # i.e. a blind exponential pull on world-Z velocity, applied every
+    # 10 ms regardless of whether the vehicle is actually airborne or
+    # just climbing a grade. With Kz_damping=5.0, ~40% of any true
+    # vertical velocity is lost between adjacent 10 Hz GICP scans, which
+    # systematically biases position on sustained climbs (Pikes Peak,
+    # mountain rally, banked-oval entry/exit, hill stages). Flat-track
+    # use cases (IMS, Putnam) are unaffected because vel_z stays near 0.
+    #
+    # We keep this at 0 because Atlas FusionEngine provides a
+    # firmware-precise gravity reference -- the original DLIO motivation
+    # for the term (cumulative gravity sub-compensation error from raw
+    # MEMS bias x mount-tilt cross-term) does not apply here. Re-enable
+    # (try 0.5 -> tau ~ 2 s) only if you observe slow Z drift between
+    # scans AND the bag is from a near-flat track.
+    odom/geo/Kz_damping: 0.0
+    # Tightened from upstream DLIO's 5.0 / 0.5 to physically-plausible
+    # MEMS-bias bounds. With Atlas firmware calibration the residual bias
+    # is well under these. These clamps only matter if someone re-enables
+    # Kab/Kgb above; tighter values prevent the observer from soaking
+    # extrinsic-mismatch error into bias.
+    odom/geo/abias_max: 0.3    # Max accelerometer bias (m/s^2)
+    odom/geo/gbias_max: 0.05   # Max gyroscope bias (rad/s)
+
+    # Observer-correction stability bounds (racing safety, P2#1).
+    # The observer applies dt*K corrections (forward-Euler, stable only for
+    # dt*K < 2). At Kv=11.25 that bound is hit at dt≈0.18 s, so a 0.3-0.5 s scan
+    # gap (dropped Luminar frames / 200 mph) would inject an unstable velocity
+    # correction from one GICP residual. We cap the effective timestep used in
+    # updateState() at observer_dt_max; at nominal ~10 Hz this is a no-op.
+    odom/geo/observer_dt_max: 0.15   # s — cap on dt for observer corrections
+    # Optional hard clamps on the per-update correction magnitude (0 = disabled).
+    # The dt cap above already bounds the gain; enable these only if you also want
+    # an absolute ceiling on how far one scan can move the state.
+    odom/geo/max_pos_correction: 0.0 # m   — clamp per-update position correction
+    odom/geo/max_vel_correction: 0.0 # m/s — clamp per-update velocity correction
+    # P1 yaw-safety fix #3: ORIENTATION got the clamp position/velocity always
+    # had. The observer pulls dt_eff*Kq (~45%) of the orientation error per
+    # update; unclamped, one bad accepted scan injects tens of degrees of
+    # heading in a single update (runs 19/20). The yaw clamp bounds the error's
+    # body-z component BEFORE the gain; 5 deg still allows >20 deg/s of
+    # legitimate correction authority at 10 Hz. max_rot bounds total rotation
+    # error (roll/pitch included); 0 = off.
+    odom/geo/max_yaw_correction_deg: 5.0
+    odom/geo/max_rot_correction_deg: 0.0
+
+    # Dead-reckoning covariance growth (P3). During GICP loss the reported
+    # position sigma grows with elapsed dead-reckon time and distance travelled
+    # (speed*time), not the missed-scan count — so it stays honest at racing
+    # speed, where N missed scans cover ~4x more ground at 200 vs 100 mph.
+    # sigma_xy += time_rate*elapsed + dist_frac*speed*elapsed. Both 0 = no growth.
+    odom/geo/dr_cov_time_rate: 0.5   # m of sigma per second of dead reckoning
+    odom/geo/dr_cov_dist_frac: 0.05  # m of sigma per metre travelled (≈5% of distance)
+
+    # Debug / Visualization helpers
+    # P1/P4 review fix: enable_pub and verbose_scan_log are ON by default so
+    # every replay produces the evidence the validation loop consumes — the
+    # per-frame debug topics (fitness_ratio, degen axes, yaw_veto,
+    # merged_aux_count, aux dt/points, scan span, ...) and the SCAN DEBUG lines
+    # that scripts/analyze_scan_debug_log.py scores. Cost is trivial (run-12
+    # debug bag: 14 MB over 36 min; log lines ~10/s). Turn OFF only for
+    # resource-constrained live deployment.
+    localization/debug/enable_pub: true
+    localization/debug/enable_jump_log: false
+    localization/debug/verbose_scan_log: true
+    localization/debug/small_gicp_lm_debug: false  # Enable only for short controlled replays
+    localization/debug/jump_trans_m: 30.0      # Base reject threshold if pose jumps > this (meters)
+    localization/debug/jump_rot_deg: 30.0     # Base reject threshold if pose jumps > this (degrees)
+    # Speed/scan_dt-aware jump-gate scaling (P2#2). The jump is GICP-vs-IMU-prior,
+    # so legitimate disagreement scales with how far the prior could have drifted.
+    # Effective thresholds:
+    #   trans = jump_trans_m + trans_speed_scale * speed[m/s] * scan_dt[s]
+    #   rot   = jump_rot_deg + rot_dt_scale_deg * scan_dt[s]
+    # scan_dt is the time since the last accepted pose (grows during a failure
+    # streak), so the gate loosens after a gap / at high speed to admit a valid
+    # reacquisition, while staying tight for slow, short-gap scans. Set to 0 to
+    # restore the fixed thresholds above.
+    localization/jump/trans_speed_scale: 1.5   # extra metres of threshold per (speed*scan_dt) metre
+    localization/jump/rot_dt_scale_deg: 60.0   # extra degrees of threshold per second of scan_dt
+    # P1 yaw-safety: YAW is split out of the rotation jump gate. The generic
+    # 30 + 60*dt envelope (36 deg at a normal 0.1 s scan, 45 deg after a
+    # 0.25 s recovery gap) is a re-acquisition allowance for TOTAL rotation,
+    # but as a yaw budget it is physically absurd — runs 19/20 accepted
+    # 45-47 deg heading proposals through it. Yaw innovation vs the IMU prior
+    # gets its own budget with an absolute cap the dt scaling can never lift:
+    #   eff_yaw = min(yaw_max_deg + yaw_dt_scale_deg * scan_dt, yaw_total_max_deg)
+    # Evaluated on the APPLIED pose (post yaw-veto), so vetoed frames pass and
+    # keep their translation info. Set yaw_max_deg <= 0 to disable.
+    # Re-acquisition after long dead-reckoning with genuinely drifted yaw is
+    # the GT snap's job (it bypasses scan gates by design), not this gate's.
+    localization/jump/yaw_max_deg: 10.0
+    localization/jump/yaw_dt_scale_deg: 10.0
+    localization/jump/yaw_total_max_deg: 15.0
+
+    # GICP Registration Parameters
+    # Maximum number of iterations (increased for better convergence)
+    gicp/maxIterations: 128
+
+    # Number of neighbors used to compute per-point covariances (typical: 20)
+    gicp/correspondenceRandomness: 20
+
+    # Maximum correspondence distance (meters)
+    # Points further apart than this won't be considered correspondences
+    # Tightened from 5.0 to cut spurious matches against the dense full map.
+    gicp/maxCorrespondenceDistance: 4.0
+
+    # Convergence criteria — tightened now that downsampling is re-enabled
+    gicp/transformationEpsilon: 0.004
+    gicp/rotationEpsilon: 0.004
+
+    # GICP result gating: reject poor registrations and fall back to IMU dead-reckoning.
+    # Good alignments on the full map hit fitness ~0.01–0.05 (p90 0.04, p99 0.39).
+    # Keep this at 1.0, not tighter: during the first ~4 scans the initial pose is still
+    # settling, so fitness spikes to 1.2–1.4 on correct geometry; a 0.3 threshold rejects
+    # those and the node gets stuck at initial pose with no GICP updates to recover from.
+    gicp/fitnessRejectThreshold: 1.0   # Reject GICP if fitness score exceeds this value
+    # PR#6: bounds on the NON-CONVERGED low-fitness fallback ("effectively
+    # converged"). The fallback exists for max-iterations-at-speed scans whose
+    # correction is small; unbounded, it also admitted wrong-basin results
+    # (3.27 m/11.2 deg, 9.21 m/10.7 deg on run5-vs-run3) whose accepts reset
+    # the failure counter and locked GT recovery out. Non-converged candidates
+    # whose applied correction vs the IMU prior exceeds either bound are
+    # classified failed_to_converge instead. <=0 disables a bound.
+    # PR validation: nonconv accepts 1145->397; accepts with INS err >=50 m
+    # 99->3; p90 INS err 21.6->12.7 m.
+    gicp/nonConvergedFitnessOkMaxTransM: 3.0
+    gicp/nonConvergedFitnessOkMaxRotDeg: 5.0
+    gicp/rejectLargeJumps: true        # Hard-reject results that exceed the jump thresholds below
+
+    # ========== P1 gating rework (docs/action_plan_turn_error_20260704.md) ==========
+    # The run-12/13 cross-run replays showed the old binary gates failing in BOTH
+    # directions: 1,804 hessian rejections (streaks up to 253 frames = ~25 s of
+    # dead reckoning) whose discarded solutions were mostly fine (gt_err median
+    # 1.57 m), AND 359 wrong-basin matches accepted with gt_err > 20 m. Root
+    # cause: every threshold was an ABSOLUTE fitness value calibrated on a
+    # same-run map (floor 0.03-0.06), while the cross-run map's fitness floor is
+    # ~0.27 — so the fitness-conditioned branches were permanently true. The
+    # rework has four pieces:
+    #   1. fitnessBaseline — rolling median of ACCEPTED-frame fitness; gates use
+    #      fitness_ratio = fitness / baseline (map-independent). Warm-up: gates
+    #      stay absolute-only until minSamples accepted frames exist.
+    #   2. fitnessRatioRejectThreshold — wrong-basin (bad-accept) gate. Run-12
+    #      data: good accepts ratio median 1.00 / p99 1.92; bad accepts
+    #      (gt_err>20 m) median 1.34 / p90 2.55. 2.0 rejects the clear outliers.
+    #   3. degeneracy/partialUpdate — when hessianCondMax trips, PROJECT the
+    #      correction onto well-constrained hessian eigen-directions (solution
+    #      remapping, Zhang & Singh; the hessian is re-centered about the
+    #      vehicle so its rotation block measures physical vehicle rotations,
+    #      not lever-arm effects about the map origin) instead of rejecting the
+    #      scan. Accepted-with-projection logs status=ok_partial;
+    #      rejected_hessian remains only for the all-axes-degenerate case.
+    #   4. yawGate — turn-aware consistency veto (Codex finding): T_prior
+    #      already carries the IMU-integrated yaw across the scan gap, so a
+    #      GICP yaw correction > maxCorrDeg on a low-confidence match
+    #      (fitness_ratio > yawGate/fitnessRatio) keeps the IMU yaw instead.
+    #      This is the wrong-basin ENTRY signature the jump gate can't see
+    #      (bad accepts had jump medians of only 1.87 m / 1.38 deg).
+    gicp/fitnessBaseline/enable: true
+    gicp/fitnessBaseline/window: 201     # accepted-frame samples in the rolling median (~20 s @ 10 Hz)
+    gicp/fitnessBaseline/minSamples: 50  # rolling median takes over after this many accepted frames
+    # Warm-up seed (review fix): baseline used until minSamples accepted frames
+    # exist, so the ratio gates and yaw veto are live from frame 1 — a replay
+    # that starts mid-turn is otherwise unprotected during its most fragile
+    # window. Set from the previous run's scorecard floor
+    # (scripts/analyze_scan_debug_log.py; run-12 sparse cross-run map: 0.28).
+    # RE-MEASURE after the dense-map rebuild. 0 = off (absolute-only warm-up).
+    gicp/fitnessBaseline/seedBaseline: 0.28
+    gicp/fitnessRatioRejectThreshold: 2.0  # <=0 disables the wrong-basin ratio reject
+    gicp/degeneracy/partialUpdate: true    # false = restore legacy binary hessian gate below
+    # Full 6D coupled solution remapping (default). The re-centered hessian's
+    # rotation coordinates are scaled by couplingLengthM (the typical
+    # constraint lever arm, ~point-cloud radius after the 80 m crop) so rad
+    # and m are commensurable, then ONE 6x6 eigendecomposition marks
+    # degenerate directions — including COUPLED rot/trans null directions
+    # (slide-along-a-wall = yaw + lateral mix) that the blockwise 3x3 analysis
+    # (full6d: false, kept for A/B) structurally cannot see.
+    gicp/degeneracy/full6d: true
+    gicp/degeneracy/couplingLengthM: 20.0  # m; lever arm making rotation eigenvalues comparable to translation
+    gicp/degeneracy/relFloor6d: 0.02       # full6d: eigen-axis degenerate if lambda < floor * lambda_max
+    gicp/degeneracy/relFloorRot: 0.02      # blockwise only: rot eigen-axis floor
+    gicp/degeneracy/relFloorTrans: 0.02    # blockwise only: trans eigen-axis floor
+    # yawGate is INDEPENDENT of degeneracy/partialUpdate: the veto still fires
+    # with the legacy binary hessian gate.
+    gicp/yawGate/enable: true
+    gicp/yawGate/maxCorrDeg: 1.5           # SOFT tier: healthy GICP yaw corrections are <0.5 deg (IMU prior is good)
+    gicp/yawGate/fitnessRatio: 1.2         # soft tier arms only on low-confidence matches (ratio above this)
+    # HARD tier (P1 yaw-safety, runs 19/20): UNCONDITIONAL — independent of
+    # fitness ratio. A wrong-basin match can carry plausible fitness and slip
+    # the soft tier; but the IMU-integrated prior yaw cannot be 8+ deg wrong
+    # over a 0.1-0.3 s scan gap on a ground vehicle, so any larger GICP yaw
+    # "correction" is dropped (IMU yaw kept, translation still gated).
+    # Runs 19/20 saw 45-47 deg proposals accepted -> 78-98 deg heading error.
+    # <= 0 disables the hard tier.
+    gicp/yawGate/hardMaxCorrDeg: 8.0
+
+    # ===== Algorithmic yaw-defect fixes (2026-07-05 deep-cause report) =====
+    # The gates above bound damage AFTER the optimizer proposes a bad pose;
+    # these remove the failure at the source.
+    #
+    # 1) Registration DoF. The upstream optimizer is unconstrained SE(3); a
+    #    ground vehicle with firmware-calibrated Atlas attitude should not let
+    #    LiDAR registration freely re-estimate roll/pitch against repeated map
+    #    structure. "4dof" (default) fixes roll+pitch to the IMU prior INSIDE
+    #    the LM solve (translation + yaw stay free); "3dof" also fixes yaw
+    #    (translation-only — maximum protection, but yaw drift then recovers
+    #    only via GT snap); "6dof" restores upstream behavior. Every
+    #    full6dofEveryN-th scan runs unconstrained so roll/pitch re-anchor to
+    #    map structure and slow gyro drift cannot accumulate in fixed axes.
+    gicp/dof/mode: "4dof"
+    gicp/dof/full6dofEveryN: 10
+    # 2) Soft attitude prior INSIDE the optimizer (the deep P1 cause: no IMU
+    #    yaw term existed, so plausible correspondences on repeated curbs /
+    #    barriers could pull yaw into a wrong basin unopposed). Info is rad^-2
+    #    on the world-tangent attitude residual vs the IMU-integrated initial
+    #    guess, and competes directly with the point terms. 0 = off (default —
+    #    calibrate first: read debug/yaw_marginal_stiffness (or yaw_stiff= in
+    #    SCAN DEBUG) from a replay and start yawInfo at ~0.2x its median; the
+    #    scorecard prints the suggestion). rollPitchInfo only matters in 6dof.
+    gicp/prior/yawInfo: 0.0
+    gicp/prior/rollPitchInfo: 0.0
+
+    # Degeneracy TRIGGER (condition proxy of the raw 6x6 hessian). With
+    # partialUpdate=true this no longer rejects — it decides when the
+    # eigen-projection engages. 5e9 was calibrated on AV-24 Putnam data
+    # (healthy corners 1-4e9; degenerate 6e9+); run 12 confirms the bulk of
+    # corner frames sit just above it (hessian p90 6.9e9). Set <= 0 to disable.
+    gicp/hessianCondMax: 5.0e9
+    # LEGACY combined-gate thresholds — only consulted when
+    # degeneracy/partialUpdate=false. These are ABSOLUTE values calibrated on
+    # the same-run May 4 map; on cross-run maps they go stale (fitness floor
+    # ~0.27 > 0.15 warn => gate collapses to "hessian alone" and mass-rejects
+    # corners). Prefer the ratio-based gates above.
+    gicp/hessianFitnessWarnThreshold: 0.15
+    gicp/hessianTransWarnM: 1.0
+    gicp/hessianRotWarnDeg: 1.5
+
+
+  
