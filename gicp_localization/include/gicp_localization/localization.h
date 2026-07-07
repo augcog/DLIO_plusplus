@@ -249,6 +249,7 @@ private:
   rclcpp::CallbackGroup::SharedPtr aux_cb_group_;
   bool concat_enabled_;
   double concat_time_threshold_;
+  double concat_luminar_time_threshold_;
   size_t concat_buffer_size_;
   // Offline aux-extrinsic resolution (no live TF needed). Resolved once at
   // startup: URDF (concat_urdf_path_ + concat_primary_frame_) takes priority,

@@ -200,6 +200,10 @@
     localization/lidar_concat/time_threshold: 0.1   # seconds; aux scans further than this from primary are dropped
                                                     # (0.05 dropped ~half the aux scans on the Run3 bag; 0.1 captures
                                                     #  the observed aux-to-primary jitter so 3-LiDAR completes reliably)
+    # For Luminar UINT8[8] absolute timestamps, header stamps are not sufficient:
+    # an aux header can be close while its per-point sweep is one period early.
+    # Require the aux per-point timestamp range to align with the primary range.
+    localization/lidar_concat/luminar_time_threshold: 0.010
     # Yaw-defect fix (P3): constant per-aux clock offsets (seconds, order =
     # aux_topics; missing = 0). ADDED to the aux header stamp for matching /
     # rebasing AND to Luminar absolute per-point times, so a constant clock
