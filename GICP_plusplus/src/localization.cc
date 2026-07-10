@@ -1005,9 +1005,6 @@ gicp_plusplus::LocalizationNode::LocalizationNode() : Node("gicp_plusplus_node")
   this->geo.prev_q = Eigen::Quaternionf::Identity();
   this->geo.prev_vel = Eigen::Vector3f::Zero();
 
-  // Initialize sensor type (default to OUSTER, can be configured)
-  this->sensor = dlio::SensorType::OUSTER;
-
   // Initialize extrinsics to identity (should be configured from parameters)
   this->extrinsics.baselink2imu.t = Eigen::Vector3f::Zero();
   this->extrinsics.baselink2imu.R = Eigen::Matrix3f::Identity();
@@ -1289,6 +1286,11 @@ gicp_plusplus::LocalizationNode::LocalizationNode() : Node("gicp_plusplus_node")
         this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/merged_aux_count", 10);
     this->dbg_scan_time_span_pub =
         this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/scan_time_span_s", 10);
+    this->dbg_deskew_applied_pub =
+        this->create_publisher<std_msgs::msg::Bool>("gicp/localization/debug/deskew_applied", 10);
+    this->dbg_deskew_clamped_fraction_pub =
+        this->create_publisher<std_msgs::msg::Float64>(
+            "gicp/localization/debug/deskew_clamped_point_fraction", 10);
     for (size_t i = 0; i < this->aux_lidars_.size(); ++i) {
       this->dbg_aux_dt_pubs_.push_back(this->create_publisher<std_msgs::msg::Float64>(
           "gicp/localization/debug/aux" + std::to_string(i) + "_merge_dt_s", 10));
@@ -2572,6 +2574,12 @@ void gicp_plusplus::LocalizationNode::callbackPointCloud(
   // Deskew using IMU
   this->deskewPointcloud();
 
+  // A fully stale/out-of-order sweep is intentionally dropped by the deskew
+  // path instead of being registered against a newer state.
+  if (!this->current_scan) {
+    return;
+  }
+
   RCLCPP_DEBUG(this->get_logger(), "After deskewing: current_scan has %lu points",
                this->current_scan->points.size());
 
@@ -3207,6 +3215,9 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
   // returns (deskew off, unsupported sensor, empty IMU buffer, ...) publish
   // -1 instead of the previous frame's stale span.
   this->last_scan_time_span_s_ = -1.0;
+  this->last_deskew_applied_ = false;
+  this->last_deskew_clamped_point_fraction_ = -1.0;
+  this->current_scan.reset();
 
   // INS heading/pose prior — must run BEFORE any IMU integration or cloud
   // placement so the whole prior chain is consistent (see helper above).
@@ -3406,8 +3417,52 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
     return;
   }
 
-  // Check if we have sufficient IMU history
-  // We need IMU data from BEFORE prev_scan_stamp to integrate
+  // basePose is valid at the previous scan's median point time, not at the
+  // previous scan header. Use that actual state time as the integration
+  // origin; the header is only a fallback for pre-fix/first-scan state.
+  const double integration_start_time =
+      (this->base_pose_stamp_ > 0.0) ? this->base_pose_stamp_ : this->prev_scan_stamp;
+
+  // A scan whose entire sweep predates the current state arrived stale (sensor
+  // header disorder / executor backlog). Rewinding the localization state is
+  // unsafe, and registering it rigidly would mix time order, so drop it.
+  if (timestamps.back() + 1e-6 < integration_start_time) {
+    RCLCPP_WARN(
+        this->get_logger(),
+        "Dropping stale LiDAR sweep: point-time end %.6f precedes state time %.6f",
+        timestamps.back(), integration_start_time);
+    return;
+  }
+
+  // A merged multi-LiDAR sweep can legitimately overlap the previous state:
+  // an aux scan selected for the current primary may have started before the
+  // prior primary's median point time. integrateImu() cannot propagate a state
+  // backward, and previously rejected the entire frame when just one such
+  // timestamp was present. Clamp only those leading points to the earliest
+  // known pose; all later points retain full per-point IMU compensation.
+  size_t clamped_point_count = 0;
+  for (size_t i = 0; i < timestamps.size(); ++i) {
+    if (timestamps[i] < integration_start_time) {
+      clamped_point_count += static_cast<size_t>(unique_time_indices[i + 1] -
+                                                 unique_time_indices[i]);
+      timestamps[i] = integration_start_time;
+    }
+  }
+  this->last_deskew_clamped_point_fraction_ =
+      deskewed_scan_->points.empty()
+          ? 0.0
+          : static_cast<double>(clamped_point_count) /
+                static_cast<double>(deskewed_scan_->points.size());
+  if (clamped_point_count > 0) {
+    RCLCPP_INFO_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "Deskew overlap: clamped %zu/%zu leading points (%.1f%%) to known pose time %.3f",
+        clamped_point_count, deskewed_scan_->points.size(),
+        100.0 * this->last_deskew_clamped_point_fraction_, integration_start_time);
+  }
+
+  // Check if we have sufficient IMU history. We need IMU data from before the
+  // state time used as the integration origin.
   {
     std::lock_guard<std::mutex> lock(this->mtx_imu);
     if (this->imu_buffer.empty()) {
@@ -3420,14 +3475,14 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
       return;
     }
 
-    // Check if oldest IMU is before prev_scan_stamp (need some margin)
+    // Check if oldest IMU is before integration_start_time (need some margin)
     double oldest_imu_time = this->imu_buffer.back().stamp;
     double margin = 0.1;  // 100ms margin
 
-    if (oldest_imu_time > this->prev_scan_stamp - margin) {
+    if (oldest_imu_time > integration_start_time - margin) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                            "Waiting for sufficient IMU history (oldest: %.3f, need: %.3f). Skipping deskewing.",
-                           oldest_imu_time, this->prev_scan_stamp);
+                           oldest_imu_time, integration_start_time);
       this->T_prior = this->basePoseMatrix();  // [REVIEW FIX 2026-07-08] basePose (INS-prior-corrected), not current_pose
       pcl::transformPointCloud(*deskewed_scan_, *deskewed_scan_, this->T_prior * this->extrinsics.baselink2lidar_T);
       this->current_scan = deskewed_scan_;
@@ -3439,8 +3494,8 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
 
   // IMU prior & deskewing
   RCLCPP_DEBUG(this->get_logger(),
-               "Integrating IMU: prev_stamp=%.3f, pos=[%.2f,%.2f,%.2f], vel=[%.2f,%.2f,%.2f]",
-               this->prev_scan_stamp,
+               "Integrating IMU: state_stamp=%.3f, pos=[%.2f,%.2f,%.2f], vel=[%.2f,%.2f,%.2f]",
+               integration_start_time,
                this->basePose.p.x(), this->basePose.p.y(), this->basePose.p.z(),
                this->prev_vel.x(), this->prev_vel.y(), this->prev_vel.z());
 
@@ -3454,6 +3509,12 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
       if (!this->imu_buffer.empty()) latest_imu = this->imu_buffer.front().stamp;
     }
     if (latest_imu > 0.0) {
+      if (latest_imu + 1e-6 < integration_start_time) {
+        RCLCPP_WARN(this->get_logger(),
+                    "Dropping LiDAR sweep: latest IMU %.6f precedes state time %.6f",
+                    latest_imu, integration_start_time);
+        return;
+      }
       for (auto& ts : timestamps) {
         if (ts > latest_imu) ts = latest_imu;
       }
@@ -3461,7 +3522,7 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
   }
 
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> frames;
-  frames = this->integrateImu(this->prev_scan_stamp, this->basePose.q, this->basePose.p,
+  frames = this->integrateImu(integration_start_time, this->basePose.q, this->basePose.p,
                               this->prev_vel, timestamps);
 
   // If there are no frames between the start and end of the sweep, use previous transform
@@ -3480,7 +3541,7 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
                 "IMU integration failed! Got %lu frames for %lu timestamps. "
                 "Time range: [%.3f, %.3f], IMU buffer size: %lu, first IMU: %.3f",
                 frames.size(), timestamps.size(),
-                this->prev_scan_stamp, timestamps.back(),
+                integration_start_time, timestamps.back(),
                 imu_buf_size, imu_oldest_stamp);
     this->T_prior = this->basePoseMatrix();  // [REVIEW FIX 2026-07-08] basePose (INS-prior-corrected), not current_pose
     pcl::transformPointCloud(*deskewed_scan_, *deskewed_scan_, this->T_prior * this->extrinsics.baselink2lidar_T);
@@ -3514,6 +3575,7 @@ void gicp_plusplus::LocalizationNode::deskewPointcloud() {
     }
   }
 
+  this->last_deskew_applied_ = true;
   this->current_scan = deskewed_scan_;
   this->scan_in_world_frame_ = true;
   this->prev_scan_stamp = this->scan_stamp.seconds();
@@ -4035,6 +4097,11 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
     publish_float(this->dbg_merged_aux_count_pub,
                   static_cast<double>(this->concat_last_merged_aux_));
     publish_float(this->dbg_scan_time_span_pub, this->last_scan_time_span_s_);
+    std_msgs::msg::Bool deskew_applied_msg;
+    deskew_applied_msg.data = this->last_deskew_applied_;
+    this->dbg_deskew_applied_pub->publish(deskew_applied_msg);
+    publish_float(this->dbg_deskew_clamped_fraction_pub,
+                  this->last_deskew_clamped_point_fraction_);
     for (size_t i = 0; i < this->dbg_aux_dt_pubs_.size(); ++i) {
       const double dt_i = (i < this->concat_last_aux_dt_.size())
           ? this->concat_last_aux_dt_[i] : std::numeric_limits<double>::quiet_NaN();
