@@ -49,6 +49,7 @@ def generate_launch_description():
         default='')
     parent_frame = LaunchConfiguration('parent_frame', default='base_link')
     child_frame = LaunchConfiguration('child_frame', default='luminar_front')
+    config_path = LaunchConfiguration('config_path', default='')
 
     declare_rviz_arg = DeclareLaunchArgument(
         'rviz', default_value=rviz, description='Launch RViz')
@@ -88,8 +89,23 @@ def generate_launch_description():
     declare_map_path_arg = DeclareLaunchArgument(
         'map_path', default_value='',
         description='Path to PCD map file for localization (overrides localization.yaml when non-empty)')
+    declare_config_path_arg = DeclareLaunchArgument(
+        'config_path', default_value='',
+        description='Absolute path to the localization ROS-parameter YAML. '
+                    'Empty uses the package cfg/localization.yaml.')
 
     localization_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'localization.yaml'])
+
+    def resolve_config_path(context):
+        config_file = config_path.perform(context).strip()
+        if not config_file:
+            config_file = localization_yaml_path.perform(context)
+        config_file = os.path.abspath(config_file)
+        if not os.path.isfile(config_file):
+            raise RuntimeError(
+                f"Localization config file not found at '{config_file}'. "
+                f"Pass a valid absolute path with config_path:=<yaml>.")
+        return config_file
 
     # Publish the full vehicle URDF via robot_state_publisher. This provides the
     # real base_link -> luminar_front and base_link -> gps_bottom/imu_bottom
@@ -132,12 +148,13 @@ def generate_launch_description():
     def make_localization_node(context):
         map_path_value = LaunchConfiguration('map_path').perform(context).strip()
         child_frame_value = LaunchConfiguration('child_frame').perform(context).strip()
+        config_file = resolve_config_path(context)
         # Same av24.urdf the robot_state_publisher uses: hand the localization node
         # the resolved ABSOLUTE path so lidar_concat resolves aux extrinsics from the
         # URDF (single source of truth) instead of relying on CWD or the static fallback.
         urdf_file = resolve_urdf_path(context)
         params = [
-            localization_yaml_path,
+            config_file,
             {'localization/lidar_frame': child_frame_value},
             {'localization/imu_only': LaunchConfiguration('imu_only')},
             {'localization/lidar_concat/urdf_path': urdf_file},
@@ -166,9 +183,7 @@ def generate_launch_description():
     rviz_config_path = PathJoinSubstitution([current_pkg, 'launch', 'localization.rviz'])
 
     def make_rviz_node(context):
-        yaml_path = PathJoinSubstitution(
-            [FindPackageShare('gicp_plusplus'), 'cfg', 'localization.yaml']
-        ).perform(context)
+        yaml_path = resolve_config_path(context)
         with open(yaml_path, 'r') as f:
             ros_params = yaml.safe_load(f).get('/**', {}).get('ros__parameters', {})
         map_frame = ros_params.get('localization/map_frame', 'map')
@@ -204,6 +219,7 @@ def generate_launch_description():
         declare_parent_frame_arg,
         declare_child_frame_arg,
         declare_map_path_arg,
+        declare_config_path_arg,
         OpaqueFunction(function=make_robot_state_publisher),
         OpaqueFunction(function=make_localization_node),
         OpaqueFunction(function=make_rviz_node),

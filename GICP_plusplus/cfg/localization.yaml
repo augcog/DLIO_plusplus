@@ -140,9 +140,10 @@
     # scans in a row, snap current_pose / lidarPose / state.{p,q,v} to the
     # time-matched GT sample so GICP can re-acquire from a known-good state.
     # The GT pose+twist is transformed from msg->child_frame_id into base_frame
-    # via TF (cached on first GT message). IMU biases are preserved. Disabled by
-    # default — production deployments without a GT topic keep the existing
-    # dead-reckoning behavior. Setting enable=true forces gt_odom/enable=true.
+    # via TF (cached on first GT message). IMU biases are preserved. This
+    # local-ENU profile enables recovery and therefore forces gt_odom/enable.
+    # Deployments without Atlas odometry must disable both GT recovery and the
+    # velocity shadow; rejected frames then retain IMU dead-reckoning behavior.
     localization/gt_recovery/enable: true
     # P2#3: raised 1 -> 5. With min=1 the snap fired on EVERY rejected frame
     # (1,860 snaps in run 12), masking dead-reckoning quality in all replay
@@ -150,9 +151,22 @@
     # gating, long rejection streaks should no longer occur, so the snap is
     # back to what it was meant to be: a last-resort recovery after a
     # sustained losing streak (~0.5 s at 10 Hz), not a per-frame crutch.
-    # Validation runs should ALSO do one pass with enable=false to expose the
-    # true dead-reckoning behavior (production has no GT topic).
     localization/gt_recovery/min_consecutive_failures: 5
+
+    # Stateful wrong-basin watchdog. Known-pose events (odom init and explicit
+    # GT recovery snaps) anchor an independent position track. Between anchors
+    # it consumes only Atlas body-frame velocity plus orientation; ordinary
+    # Atlas position is not used by the acceptance gate. Retained history uses
+    # cubic-Hermite interpolation for delayed scan queries, while forward
+    # holdover is bounded by maxAgeS. Once armed, stale/unavailable shadow state
+    # fails closed and enters the same five-frame recovery path above.
+    gicp/velocityShadow/enable: true
+    gicp/velocityShadow/maxHorizontalDivergenceM: 4.0
+    gicp/velocityShadow/maxAgeS: 0.15
+    gicp/velocityShadow/maxIntegrationGapS: 0.50
+    gicp/velocityShadow/maxAnchorAgeS: 300.0
+    gicp/velocityShadow/historyDurationS: 2.0
+    gicp/velocityShadow/failClosedAfterAnchor: true
 
     # Initial pose taken directly from GLIM traj_lidar.txt first row.
     # robot_state_publisher (launched alongside this node from the URDF) provides
@@ -207,8 +221,11 @@
     # offset vs the primary/IMU no longer warps the merged scan during turns
     # (false yaw pressure). Read the value off the per-aux offset diagnostic
     # ("header offset vs primary ... mean=+X ms" -> enter -X/1000 here);
-    # runs 19/20 measured 80-90 ms offsets.
-    localization/lidar_concat/aux_time_offsets: []
+    # Putnam cross-run replay measured stable right/left offsets of +45/+17 ms
+    # after applying this sign convention.
+    # ROS 2 Jazzy cannot infer a parameter type from an empty YAML sequence.
+    # Explicit values also preserve the required double-array parameter type.
+    localization/lidar_concat/aux_time_offsets: [0.045, 0.017]
     localization/lidar_concat/buffer_size: 200      # per-aux ring buffer depth (P4#3: raised 20 -> 200
                                                     #  for GLIM parity; 20 = only 2 s of aux history at
                                                     #  10 Hz, so brief stalls degraded frames to fewer
@@ -461,12 +478,13 @@
     gicp/transformationEpsilon: 0.004
     gicp/rotationEpsilon: 0.004
 
-    # GICP result gating: reject poor registrations and fall back to IMU dead-reckoning.
-    # Good alignments on the full map hit fitness ~0.01–0.05 (p90 0.04, p99 0.39).
-    # Keep this at 1.0, not tighter: during the first ~4 scans the initial pose is still
-    # settling, so fitness spikes to 1.2–1.4 on correct geometry; a 0.3 threshold rejects
-    # those and the node gets stuck at initial pose with no GICP updates to recover from.
-    gicp/fitnessRejectThreshold: 1.0   # Reject GICP if fitness score exceeds this value
+    # GICP result gating: reject poor registrations and fall back to IMU
+    # dead-reckoning. small_gicp reports a Mahalanobis-style fitness whose
+    # cross-run local-ENU floor is materially higher than the former NanoGICP
+    # score. The 3.0 cap is the validated catastrophic backstop; relative
+    # fitness, support, yaw, degeneracy, jump, and velocity-shadow gates remain
+    # active below it.
+    gicp/fitnessRejectThreshold: 3.0
     # PR#6: bounds on the NON-CONVERGED low-fitness fallback ("effectively
     # converged"). The fallback exists for max-iterations-at-speed scans whose
     # correction is small; unbounded, it also admitted wrong-basin results
@@ -521,16 +539,15 @@
     #      This is the wrong-basin ENTRY signature the jump gate can't see
     #      (bad accepts had jump medians of only 1.87 m / 1.38 deg).
     gicp/fitnessBaseline/enable: true
-    gicp/fitnessBaseline/window: 201     # accepted-frame samples in the rolling median (~20 s @ 10 Hz)
+    gicp/fitnessBaseline/window: 101     # accepted-frame samples in the rolling median
     gicp/fitnessBaseline/minSamples: 50  # rolling median takes over after this many accepted frames
     # Warm-up seed (review fix): baseline used until minSamples accepted frames
     # exist, so the ratio gates and yaw veto are live from frame 1 — a replay
     # that starts mid-turn is otherwise unprotected during its most fragile
-    # window. Set from the previous run's scorecard floor
-    # (scripts/analyze_scan_debug_log.py; run-12 sparse cross-run map: 0.28).
-    # RE-MEASURE after the dense-map rebuild. 0 = off (absolute-only warm-up).
-    gicp/fitnessBaseline/seedBaseline: 0.28
-    gicp/fitnessRatioRejectThreshold: 2.0  # <=0 disables the wrong-basin ratio reject
+    # window. Set from the validated cross-run local-ENU score floor. 0 = off
+    # (absolute-only warm-up).
+    gicp/fitnessBaseline/seedBaseline: 0.50
+    gicp/fitnessRatioRejectThreshold: 2.25  # <=0 disables the wrong-basin ratio reject
     gicp/degeneracy/partialUpdate: true    # false = restore legacy binary hessian gate below
     # Full 6D coupled solution remapping (default). The re-centered hessian's
     # rotation coordinates are scaled by couplingLengthM (the typical

@@ -33,13 +33,14 @@ how the map inputs and the seed are produced.
 - **IMU + LiDAR pipeline**: IMU integrates a motion prior between scans; GICP refines; a geometric observer fuses the two and propagates pose at IMU rate (~100 Hz).
 - **Multi-LiDAR concatenation** (`lidar_concat`): 3x Luminar (`luminar_front` primary + `luminar_right`/`luminar_left` merged); time-aligns aux LiDARs to the primary, transforms them via offline-resolved extrinsics, and concatenates per-point timestamps onto the primary clock. A strict merge guard (`require_all_aux` / `abort_on_merge_failure`, identical semantics + defaults to GLIM) controls whether an incomplete merge degrades or skips the scan.
 - **Confidence-weighted gating** (P1 rework, 2026-07 — replaces the old binary gates; see `docs/action_plan_turn_error_20260704.md` for the evidence):
-  - Hard fitness reject (`gicp/fitnessRejectThreshold`) — catastrophic backstop, unchanged.
+  - Hard fitness reject (`gicp/fitnessRejectThreshold`) — a `3.0` catastrophic backstop calibrated for the small_gicp score scale.
   - **Per-map fitness-ratio gates** (`gicp/fitnessBaseline/*`, `fitnessRatioRejectThreshold`): gates operate on fitness divided by a rolling median of accepted-frame fitness, so they survive cross-run maps whose absolute fitness floor differs 5–10× from the calibration map. `seedBaseline` keeps them live during warm-up.
   - **Degeneracy partial update** (`gicp/degeneracy/*`): when the hessian condition proxy trips `hessianCondMax`, the correction is projected onto well-constrained eigen-directions of the vehicle-re-centered, unit-scaled 6×6 hessian (full-6D by default — coupled rot/trans null directions included) and the IMU prior is kept along degenerate axes. Accepted-with-projection logs `status=ok_partial`; wholesale `rejected_hessian` remains only for the all-axes-degenerate case. Legacy binary gate available via `degeneracy/partialUpdate: false`.
   - **Yaw-consistency veto** (`gicp/yawGate/*`, independent of partialUpdate): a GICP yaw correction > `maxCorrDeg` vs. the IMU-integrated prior on a low-confidence match (ratio > `fitnessRatio`) keeps the IMU yaw — the wrong-basin *entry* signature the jump gate can't see.
+  - **Stateful velocity-shadow watchdog** (`gicp/velocityShadow/*`): explicit known-pose events anchor an independent position track, which is then propagated from Atlas body velocity and orientation without consuming ordinary Atlas position. It rejects cumulative horizontal wrong-basin drift that can evade per-frame jump gates, and fails closed after arming when its state is stale or unavailable.
   - Large-jump reject (compares the applied candidate to the IMU-predicted prior; speed/scan-dt-aware thresholds).
 - **IMU dead-reckoning fallback**: any non-accepted scan falls back to the IMU-integrated prior instead of freezing at the last accepted pose, seeded with the *current* IMU-propagated velocity (P2 fixed a stale-velocity bug that made multi-scan rejection streaks cut corners).
-- **Ground-truth divergence cross-check** (optional): subscribes to a `gt_odom` topic, computes per-scan `gt_err=[trans,rot,dt]` against the pose actually applied (post-projection), publishes deltas. Diagnostic only — never feeds back into accept/reject.
+- **Ground-truth divergence cross-check** (optional): subscribes to a `gt_odom` topic, computes per-scan `gt_err=[trans,rot,dt]` against the pose actually applied (post-projection), and publishes deltas. GT position error remains diagnostic and never gates a frame. When the velocity shadow is enabled, the same odometry topic independently supplies Atlas orientation and body velocity; ordinary Atlas position is used only at explicit seed/recovery anchors.
 - **GT-driven pose recovery**: when GICP fails for N consecutive scans (default 5), snap pose+twist to a time-matched GT sample (composed through TF into `base_frame`) so GICP can re-acquire from a known-good state. Twist sources resolve independently (P2): angular rate backfills from the live bias-corrected gyro and linear velocity from GT pose finite-differencing when the odom twist is unpopulated — never zeroing a moving vehicle. Falls back to dead-reckoning when GT is unavailable.
 - **GT-bootstrapped initial pose** (optional): take the first GT message as the initial pose so the node starts at the right location regardless of bag offset.
 - **Local-ENU output** (operational contract): the primary `map_frame` pose / odom / path are already in the map's frame, which — with the adapter — is a fixed local-ENU datum (Putnam origin from the `race_metadata` TTL). GICP itself is frame-agnostic and simply reports the pose in the map's frame.
@@ -86,6 +87,7 @@ ros2 launch gicp_plusplus localization_with_tf.launch.py \
 | Arg | Default | Purpose |
 |---|---|---|
 | `rviz` | `false` | Launch RViz with the bundled config. |
+| `config_path` | package `cfg/localization.yaml` | Parameter YAML used by the localization node. The launch resolves and validates the path before starting the node or RViz. |
 | `pointcloud_topic` | `/luminar_front/points` | Primary LiDAR topic (gets remapped to `pointcloud`). |
 | `imu_topic` | `/gps_p1/imu` | Point One Atlas `imu_calibrated` (sensor-calibrated, gravity present, 99 Hz, frame `gps_antenna_top`). **Watch for typos**: it's `imu_topic` (underscore), not `imu-topic`. |
 | `odom_topic` | `/odom` | Pose-init odom topic when `localization/use_odom_init=true` and not bootstrapping from GT. |
@@ -235,16 +237,25 @@ legacy layer (see below), not the operational contract.
 ### GICP gating (P1 confidence-weighted rework)
 
 ```yaml
-gicp/fitnessRejectThreshold: 1.0          # hard reject: fitness > threshold (catastrophic backstop)
+gicp/fitnessRejectThreshold: 3.0          # hard reject on the small_gicp score scale
 
 # Per-map fitness normalization — gates operate on fitness / rolling-median
 # of ACCEPTED-frame fitness, so they survive cross-run maps whose absolute
 # floor differs 5-10x from the calibration map:
 gicp/fitnessBaseline/enable: true
-gicp/fitnessBaseline/window: 201          # rolling-median window (~20 s @ 10 Hz)
+gicp/fitnessBaseline/window: 101          # accepted-frame rolling-median window
 gicp/fitnessBaseline/minSamples: 50       # rolling median takes over after this
-gicp/fitnessBaseline/seedBaseline: 0.28   # warm-up baseline so gates are live from frame 1 (re-measure per map!)
-gicp/fitnessRatioRejectThreshold: 2.0     # wrong-basin gate: reject when ratio exceeds this
+gicp/fitnessBaseline/seedBaseline: 0.50   # warm-up baseline so gates are live from frame 1
+gicp/fitnessRatioRejectThreshold: 2.25    # wrong-basin gate: reject when ratio exceeds this
+
+# Independent cumulative-drift watchdog:
+gicp/velocityShadow/enable: true
+gicp/velocityShadow/maxHorizontalDivergenceM: 4.0
+gicp/velocityShadow/maxAgeS: 0.15
+gicp/velocityShadow/maxIntegrationGapS: 0.50
+gicp/velocityShadow/maxAnchorAgeS: 300.0
+gicp/velocityShadow/historyDurationS: 2.0
+gicp/velocityShadow/failClosedAfterAnchor: true
 
 # Degeneracy partial update (replaces the old binary hessian reject):
 gicp/hessianCondMax: 5.0e9                # TRIGGER: when tripped, project instead of reject
@@ -279,6 +290,16 @@ with good-looking fitness). Rationale, measurements, and thresholds:
 `scripts/analyze_scan_debug_log.py` (it also suggests re-baselined ratio
 thresholds per map).
 
+The runtime reject order matters: degeneracy projection/yaw shaping happens
+before the applied candidate is re-scored, then finite/effective-convergence,
+Hessian, correspondence support, absolute fitness, hard yaw, fitness ratio,
+velocity shadow, all-axes-degenerate, and speed/time-aware jump checks run in
+order. The velocity shadow compares the final applied candidate's XY position
+with its independent XY track. Delayed scan queries inside retained history use
+cubic-Hermite interpolation; only a bounded `maxAgeS` forward holdover is
+allowed, and the implementation never extrapolates backward before the oldest
+history sample.
+
 ### Multi-LiDAR concatenation
 
 3x Luminar: `luminar_front` primary + `luminar_right`/`luminar_left` merged.
@@ -288,6 +309,7 @@ localization/lidar_concat/enabled:        true
 localization/lidar_concat/aux_topics:     ["/luminar_right/points", "/luminar_left/points"]
 localization/lidar_concat/aux_frames:     ["luminar_right", "luminar_left"]
 localization/lidar_concat/time_threshold: 0.1     # drop aux scans further than this from primary
+localization/lidar_concat/aux_time_offsets: [0.045, 0.017]  # right/left Putnam clock compensation
 localization/lidar_concat/buffer_size:    200     # per-aux ring depth (P4: raised from 20 — 2 s of history silently degraded frames)
 
 # Strict merge guard — IDENTICAL semantics + defaults to GLIM:
@@ -333,6 +355,19 @@ localization/gt_recovery/min_consecutive_failures: 5       # snap after N consec
 
 When `gt_recovery/enable=true`, the node caches the `base_frame ← child_frame_id` TF on the first GT message and uses it to compose snap poses into `base_frame` (so the snap lands at the same reference point GICP normally tracks).
 
+With `gicp/velocityShadow/enable=true`, odom initialization and explicit
+GT/RTK recovery snaps are the only position anchors. Between anchors the
+watchdog integrates Atlas body-FLU linear velocity rotated by the Atlas
+orientation; ordinary Atlas position is not read by the per-frame gate. After
+an anchor has armed the watchdog, an integration gap, missing history,
+non-finite state, or expired anchor produces
+`rejected_velocity_shadow_unavailable` when
+`failClosedAfterAnchor=true`. These rejects increment the ordinary failure
+streak; with the defaults above, five consecutive non-accepts trigger GT
+recovery and re-anchor the shadow. If GT recovery is disabled or no fresh GT
+sample is available, fail-closed state does not silently reconstruct itself
+from ordinary Atlas position.
+
 ### IMU + observer
 
 ```yaml
@@ -376,6 +411,14 @@ GICP deskew is header-anchored on the **primary** scan's earliest timestamp with
 a **signed** offset — so a merged aux scan that began before the primary gets a
 correct negative offset.
 
+> **Known baseline limitation:** the current constructor resets the configured
+> sensor enum to OUSTER after parameter loading. Until that pre-existing issue
+> is fixed, verify the first-cloud `LUMINAR_TS_DIAG` line and
+> `scan_time_span_s` before claiming effective Luminar per-point deskew. A zero
+> sweep span means the cloud received only a rigid transform, not per-point
+> motion compensation. This change documents but does not alter that baseline
+> behavior.
+
 ## Topics
 
 ### Subscribed
@@ -413,6 +456,7 @@ Per-scan scalar metrics on `gicp/localization/debug/*`:
 - `jump_trans`, `jump_rot_deg` (raw GICP-vs-prior disagreement, pre-projection)
 - `hessian_condition_proxy`
 - **P1 gating**: `fitness_ratio` (−1 during warm-up without seed), `degen_rot_axes`, `degen_trans_axes`, `yaw_veto`
+- **Velocity shadow**: `velocity_shadow_error_m` (NaN when unavailable), `velocity_shadow_age_s`, `velocity_shadow_anchor_age_s`, `velocity_shadow_available` (Bool), and `snap_applied` (Bool, one sample per processed frame)
 - **P4 concat**: `merged_aux_count` (−1 = concat disabled), `aux<i>_merge_dt_s` (signed; NaN = not merged), `aux<i>_points`, `scan_time_span_s`
 - `gt_pos_err_m`, `gt_rot_err_deg` (when GT is enabled; measured against the pose actually applied)
 - `converged` (Bool)
@@ -434,7 +478,8 @@ coverage).
                                                 ↓
                                               GICP align (initial guess = T_prior)
                                                 ↓
-                            gate: fitness / fitness-ratio / degeneracy-projection / yaw-veto / jump
+                            gate: degeneracy/yaw shaping → support / fitness /
+                                  ratio / velocity-shadow / jump
                                 ┌─── accepted (ok | ok_partial) ─┴── rejected ──┐
                                 ↓                                                ↓
                           updateState (geo observer,                dead-reckon: lidarPose ← T_prior,
@@ -455,11 +500,14 @@ coverage).
   projection and/or yaw veto shrank the correction; the projected pose is what
   gets applied, published, and GT-scored).
 - **Rejected**: `failed_to_converge`, `rejected_fitness` (absolute),
-  `rejected_fitness_ratio` (P1 wrong-basin gate), `rejected_hessian` (now only
-  the all-axes-degenerate case), `rejected_jump`, `invalid_solution` — all fall
-  through to the dead-reckoning branch (set `current_pose ← T_prior`, seed
-  `prev_vel` from the current IMU-propagated velocity, increment streak
-  counter, optionally trigger snap).
+  `rejected_fitness_ratio` (P1 wrong-basin gate),
+  `rejected_velocity_shadow` (horizontal divergence),
+  `rejected_velocity_shadow_unavailable` (armed watchdog failed closed),
+  `rejected_hessian` (now only the all-axes-degenerate case), `rejected_jump`,
+  `rejected_support`, `rejected_yaw`, and `invalid_solution` — all fall through
+  to the dead-reckoning branch (set `current_pose ← T_prior`, seed `prev_vel`
+  from the current IMU-propagated velocity, increment streak counter,
+  optionally trigger snap).
 - `last_gicp_pose_` is **not** updated on rejection, so the IMU prior on the next scan is still anchored to the last successfully-matched GICP pose.
 
 ## Map preparation
@@ -513,7 +561,7 @@ watch `degen_rot_axes`/`degen_trans_axes` and `yaw_veto` in the debug topics
 
 1. Lower `gicp/hessianCondMax` to engage the eigen-projection earlier (default 5e9), or raise `gicp/degeneracy/relFloor6d` to zero out weaker axes more aggressively (default 0.02).
 2. Lower `gicp/yawGate/maxCorrDeg` / `yawGate/fitnessRatio` to veto suspicious yaw corrections earlier (defaults 1.5° / 1.2).
-3. Lower `gicp/fitnessRatioRejectThreshold` to reject wrong-basin matches earlier (default 2.0) — at the cost of more dead-reckoned frames; check the streak histogram in the scorecard after changing it.
+3. Lower `gicp/fitnessRatioRejectThreshold` to reject wrong-basin matches earlier (default 2.25) — at the cost of more dead-reckoned frames; check the streak histogram in the scorecard after changing it.
 4. If rejection still cascades, `gt_recovery` (on by default, N=5) recovers at corners.
 
 (Legacy knobs `hessianTransWarnM`/`hessianRotWarnDeg`/`hessianFitnessWarnThreshold`
