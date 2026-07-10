@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <sstream>
@@ -1281,6 +1282,16 @@ gicp_plusplus::LocalizationNode::LocalizationNode() : Node("gicp_plusplus_node")
         this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/yaw_marginal_stiffness", 10);
     this->dbg_ins_yaw_diff_pub =
         this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/ins_yaw_diff_deg", 10);
+    this->dbg_velocity_shadow_err_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/velocity_shadow_error_m", 10);
+    this->dbg_velocity_shadow_age_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/velocity_shadow_age_s", 10);
+    this->dbg_velocity_shadow_anchor_age_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/velocity_shadow_anchor_age_s", 10);
+    this->dbg_velocity_shadow_available_pub =
+        this->create_publisher<std_msgs::msg::Bool>("gicp/localization/debug/velocity_shadow_available", 10);
+    this->dbg_snap_applied_pub =
+        this->create_publisher<std_msgs::msg::Bool>("gicp/localization/debug/snap_applied", 10);
     // P4#3: per-frame lidar_concat diagnostics (one sample per processed frame).
     this->dbg_merged_aux_count_pub =
         this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/merged_aux_count", 10);
@@ -1458,6 +1469,65 @@ void gicp_plusplus::LocalizationNode::getParams() {
   }
   if (this->gt_recovery_min_consecutive_failures_ < 1) {
     this->gt_recovery_min_consecutive_failures_ = 1;
+  }
+
+  // Stateful wrong-basin watchdog. The track is anchored only when the
+  // pipeline already has a known pose (odom init / GT snap), then propagated
+  // with Atlas velocity and orientation. Ordinary gate evaluations never read
+  // Atlas position, so accepted-only GT metrics remain an external diagnostic
+  // between explicit recovery anchors.
+  this->declare_parameter<bool>("gicp/velocityShadow/enable", false);
+  this->declare_parameter<double>("gicp/velocityShadow/maxHorizontalDivergenceM", 4.0);
+  this->declare_parameter<double>("gicp/velocityShadow/maxAgeS", 0.15);
+  this->declare_parameter<double>("gicp/velocityShadow/maxIntegrationGapS", 0.5);
+  this->declare_parameter<double>("gicp/velocityShadow/maxAnchorAgeS", 300.0);
+  this->declare_parameter<double>("gicp/velocityShadow/historyDurationS", 2.0);
+  this->declare_parameter<bool>("gicp/velocityShadow/failClosedAfterAnchor", true);
+  this->get_parameter("gicp/velocityShadow/enable", this->velocity_shadow_enabled_);
+  this->get_parameter("gicp/velocityShadow/maxHorizontalDivergenceM",
+                      this->velocity_shadow_max_horizontal_divergence_m_);
+  this->get_parameter("gicp/velocityShadow/maxAgeS",
+                      this->velocity_shadow_max_age_s_);
+  this->get_parameter("gicp/velocityShadow/maxIntegrationGapS",
+                      this->velocity_shadow_max_integration_gap_s_);
+  this->get_parameter("gicp/velocityShadow/maxAnchorAgeS",
+                      this->velocity_shadow_max_anchor_age_s_);
+  this->get_parameter("gicp/velocityShadow/historyDurationS",
+                      this->velocity_shadow_history_duration_s_);
+  this->get_parameter("gicp/velocityShadow/failClosedAfterAnchor",
+                      this->velocity_shadow_fail_closed_after_anchor_);
+  if (!std::isfinite(this->velocity_shadow_max_horizontal_divergence_m_) ||
+      this->velocity_shadow_max_horizontal_divergence_m_ <= 0.0) {
+    RCLCPP_WARN(this->get_logger(),
+                "gicp/velocityShadow/maxHorizontalDivergenceM must be finite and >0; using 4.0m");
+    this->velocity_shadow_max_horizontal_divergence_m_ = 4.0;
+  }
+  if (!std::isfinite(this->velocity_shadow_max_age_s_) ||
+      this->velocity_shadow_max_age_s_ <= 0.0) {
+    this->velocity_shadow_max_age_s_ = 0.15;
+  }
+  if (!std::isfinite(this->velocity_shadow_max_integration_gap_s_) ||
+      this->velocity_shadow_max_integration_gap_s_ <= 0.0) {
+    this->velocity_shadow_max_integration_gap_s_ = 0.5;
+  }
+  if (!std::isfinite(this->velocity_shadow_max_anchor_age_s_) ||
+      this->velocity_shadow_max_anchor_age_s_ <= 0.0) {
+    this->velocity_shadow_max_anchor_age_s_ = 300.0;
+  }
+  if (!std::isfinite(this->velocity_shadow_history_duration_s_) ||
+      this->velocity_shadow_history_duration_s_ <= 0.0) {
+    this->velocity_shadow_history_duration_s_ = 2.0;
+  }
+  // Retain enough integrated samples to answer any in-window query by
+  // interpolation instead of backward-extrapolating from the newest sample.
+  this->velocity_shadow_history_duration_s_ = std::max(
+      this->velocity_shadow_history_duration_s_,
+      2.0 * this->velocity_shadow_max_age_s_ +
+          this->velocity_shadow_max_integration_gap_s_);
+  if (this->velocity_shadow_enabled_ && !this->gt_odom_enabled_) {
+    RCLCPP_WARN(this->get_logger(),
+                "gicp/velocityShadow/enable=true requires gt_odom velocity; forcing localization/gt_odom/enable=true");
+    this->gt_odom_enabled_ = true;
   }
 
   this->get_parameter("localization/publish_tf", this->publish_tf_);
@@ -2002,6 +2072,15 @@ void gicp_plusplus::LocalizationNode::getParams() {
               "GT recovery: %s (min consecutive failures=%d)",
               this->gt_recovery_enabled_ ? "ENABLED" : "DISABLED",
               this->gt_recovery_min_consecutive_failures_);
+  RCLCPP_INFO(this->get_logger(),
+              "Velocity shadow gate: %s (max horizontal divergence=%.2fm, max extrapolation age=%.3fs, max integration gap=%.2fs, max anchor age=%.1fs, history=%.2fs, fail-closed-after-anchor=%s; Atlas position unused between anchors)",
+              this->velocity_shadow_enabled_ ? "ENABLED" : "disabled",
+              this->velocity_shadow_max_horizontal_divergence_m_,
+              this->velocity_shadow_max_age_s_,
+              this->velocity_shadow_max_integration_gap_s_,
+              this->velocity_shadow_max_anchor_age_s_,
+              this->velocity_shadow_history_duration_s_,
+              this->velocity_shadow_fail_closed_after_anchor_ ? "true" : "false");
   RCLCPP_INFO(this->get_logger(), "Debug: publish=%s jump_log=%s thresholds=[%.2fm, %.1fdeg]",
               this->debug_pub_enabled_ ? "ENABLED" : "DISABLED",
               this->debug_jump_log_enabled_ ? "ENABLED" : "DISABLED",
@@ -2184,6 +2263,18 @@ void gicp_plusplus::LocalizationNode::applyInitialPoseFromParams() {
   }
   this->pending_initial_pose_ = false;
 
+  // Block new scan callbacks before changing pose/observer/shadow state. A
+  // mid-run reinitialization must not expose one frame of the new pose against
+  // the old velocity-shadow track.
+  this->initialized = false;
+  if (this->velocity_shadow_enabled_) {
+    std::lock_guard<std::mutex> shadow_lock(this->velocity_shadow_mtx_);
+    this->velocity_shadow_initialized_ = false;
+    this->velocity_shadow_history_.clear();
+    RCLCPP_WARN(this->get_logger(),
+                "Velocity shadow: invalidated by parameter initial pose; waiting for an explicit GT/RTK anchor");
+  }
+
   {
     std::lock_guard<std::mutex> lock(this->pose_mutex);
     this->current_pose.setIdentity();
@@ -2248,6 +2339,19 @@ void gicp_plusplus::LocalizationNode::applyInitialPose(const Eigen::Vector3f& p,
   }
   q.normalize();
 
+  // Serialize publication of the new seed with watchdog invalidation. This
+  // closes the previous one-frame window where a concurrent scan could use
+  // the new pose while velocityShadowAt still returned the old track.
+  const bool was_initialized = this->initialized.exchange(false);
+  if (this->velocity_shadow_enabled_ && source != "gt_odom") {
+    std::lock_guard<std::mutex> shadow_lock(this->velocity_shadow_mtx_);
+    this->velocity_shadow_initialized_ = false;
+    this->velocity_shadow_history_.clear();
+    RCLCPP_WARN(this->get_logger(),
+                "Velocity shadow: invalidated by initial-pose reset from %s; waiting for an explicit GT/RTK anchor",
+                source.c_str());
+  }
+
   {
     std::lock_guard<std::mutex> lock(this->pose_mutex);
     this->current_pose.setIdentity();
@@ -2260,7 +2364,7 @@ void gicp_plusplus::LocalizationNode::applyInitialPose(const Eigen::Vector3f& p,
     // [P2 FIX 2026-07-09] Overwrite scan_stamp only on the FIRST seed:
     // callbackPointCloud writes it on the scan thread without this mutex, so
     // a mid-run reinit retimed an in-flight scan's deskew/publish.
-    if (stamp.nanoseconds() > 0 && !this->initialized.load()) {
+    if (stamp.nanoseconds() > 0 && !was_initialized) {
       this->scan_stamp = stamp;
     }
   }
@@ -4013,6 +4117,50 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
        final_jump_rot_deg <= this->gicp_nonconv_ok_max_rot_deg_);
   const bool effectively_converged = converged || nonconv_fallback_ok;
 
+  // Independent stateful wrong-basin check. The shadow was anchored by the
+  // already-existing odom-init / GT-snap path, then propagated only with Atlas
+  // velocity + orientation. It is intentionally evaluated on the pose that
+  // would actually be applied (post projection/yaw veto).
+  double velocity_shadow_error_m = std::numeric_limits<double>::quiet_NaN();
+  double velocity_shadow_age_s = std::numeric_limits<double>::quiet_NaN();
+  double velocity_shadow_anchor_age_s = std::numeric_limits<double>::quiet_NaN();
+  uint64_t velocity_shadow_reset_count = 0;
+  bool velocity_shadow_available = false;
+  bool velocity_shadow_fail_closed_if_unavailable = false;
+  Eigen::Vector3f velocity_shadow_p = Eigen::Vector3f::Zero();
+  const double velocity_shadow_query_stamp =
+      this->t_prior_stamp_ > 0.0 ? this->t_prior_stamp_ : this->scan_stamp.seconds();
+  if (candidate_pose_valid && this->velocityShadowAt(
+          velocity_shadow_query_stamp, velocity_shadow_p,
+          velocity_shadow_age_s, velocity_shadow_anchor_age_s,
+          velocity_shadow_reset_count,
+          velocity_shadow_fail_closed_if_unavailable)) {
+    velocity_shadow_available = true;
+    const Eigen::Vector2d velocity_shadow_delta =
+        (final_candidate.block<2, 1>(0, 3) -
+         velocity_shadow_p.head<2>()).cast<double>();
+    velocity_shadow_error_m = velocity_shadow_delta.norm();
+  }
+  if (this->velocity_shadow_enabled_ && !velocity_shadow_available &&
+      std::isfinite(velocity_shadow_anchor_age_s) &&
+      velocity_shadow_anchor_age_s > this->velocity_shadow_max_anchor_age_s_) {
+    RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 5000,
+        "Velocity shadow: anchor age %.1fs exceeds %.1fs; watchdog unavailable until next explicit GT snap/seed (%s)",
+        velocity_shadow_anchor_age_s, this->velocity_shadow_max_anchor_age_s_,
+        velocity_shadow_fail_closed_if_unavailable ? "fail-closed" : "fail-open");
+  }
+  const bool velocity_shadow_divergence_reject_wanted =
+      this->velocity_shadow_enabled_ && velocity_shadow_available &&
+      (!std::isfinite(velocity_shadow_error_m) ||
+       velocity_shadow_error_m > this->velocity_shadow_max_horizontal_divergence_m_);
+  const bool velocity_shadow_unavailable_reject_wanted =
+      this->velocity_shadow_enabled_ && !velocity_shadow_available &&
+      velocity_shadow_fail_closed_if_unavailable;
+  const bool velocity_shadow_reject_wanted =
+      velocity_shadow_divergence_reject_wanted ||
+      velocity_shadow_unavailable_reject_wanted;
+
   // Ground-truth divergence cross-check (optional). Compares the scan's accepted-or-candidate
   // pose to a time-matched ground-truth odom sample. Only computes; does NOT influence
   // accept/reject decisions — purely a diagnostic.
@@ -4092,6 +4240,12 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
     // the INS prior did not run). Persistent nonzero = map-vs-ENU yaw
     // misalignment or INS heading fault — measure, don't just blend harder.
     publish_float(this->dbg_ins_yaw_diff_pub, this->last_ins_yaw_diff_deg_);
+    publish_float(this->dbg_velocity_shadow_err_pub, velocity_shadow_error_m);
+    publish_float(this->dbg_velocity_shadow_age_pub, velocity_shadow_age_s);
+    publish_float(this->dbg_velocity_shadow_anchor_age_pub, velocity_shadow_anchor_age_s);
+    std_msgs::msg::Bool velocity_shadow_available_msg;
+    velocity_shadow_available_msg.data = velocity_shadow_available;
+    this->dbg_velocity_shadow_available_pub->publish(velocity_shadow_available_msg);
     // P4#3: per-frame concat/source-set record (merged_aux_count = -1 when
     // concat disabled; aux dt = NaN when that aux did not merge this frame).
     publish_float(this->dbg_merged_aux_count_pub,
@@ -4206,6 +4360,12 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
         << scalarSummary(yaw_innov_final_deg, 2) << "deg]"
         << " yaw_stiff=" << scalarSummary(yaw_marginal_stiffness, 1)
         << " ins_dyaw=" << scalarSummary(this->last_ins_yaw_diff_deg_, 2) << "deg"
+        << " velocity_shadow=[available=" << (velocity_shadow_available ? 1 : 0)
+        << ",err_xy=" << scalarSummary(velocity_shadow_error_m, 3)
+        << "m,thr=" << scalarSummary(this->velocity_shadow_max_horizontal_divergence_m_, 3)
+        << "m,age=" << scalarSummary(velocity_shadow_age_s, 3)
+        << "s,anchor_age=" << scalarSummary(velocity_shadow_anchor_age_s, 3)
+        << "s,resets=" << velocity_shadow_reset_count << "]"
         << " imu_buffer_span=" << scalarSummary(imu_buffer_span) << "s"
         << " scan_to_latest_imu_lag=" << scalarSummary(scan_to_latest_imu_lag) << "s"
         << " concat=[" << this->concat_last_merged_aux_ << "/" << this->aux_lidars_.size();
@@ -4241,6 +4401,8 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
   bool gicp_rejected_yaw = false;
   bool gicp_rejected_hessian = false;
   bool gicp_rejected_support = false;
+  bool gicp_rejected_velocity_shadow = false;
+  bool gicp_rejected_velocity_shadow_unavailable = false;
   if (effectively_converged && candidate_pose_valid) {
     if (!final_hessian.allFinite()) {
       // [REVIEW FIX 2026-07-08 P3] Non-finite Hessian: hessianConditionProxy
@@ -4279,6 +4441,15 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
       // wrong-basin solution must not be partially applied either — fall back
       // to the IMU prior entirely.
       gicp_rejected_fitness_ratio = true;
+    } else if (velocity_shadow_reject_wanted) {
+      // Unlike the per-frame jump gate, this stays independent when a series
+      // of individually-small accepted corrections drags both current_pose and
+      // T_prior into a coherent but globally wrong basin.
+      if (velocity_shadow_unavailable_reject_wanted) {
+        gicp_rejected_velocity_shadow_unavailable = true;
+      } else {
+        gicp_rejected_velocity_shadow = true;
+      }
     } else if (this->degen_partial_update_enable_) {
       // P1 partial-update path: degenerate geometry no longer rejects the scan
       // (the old binary gate produced 253-frame dead-reckoning streaks when the
@@ -4320,7 +4491,9 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
   const bool gicp_accepted = effectively_converged && candidate_pose_valid &&
                              !gicp_rejected_fitness && !gicp_rejected_fitness_ratio &&
                              !gicp_rejected_hessian && !gicp_rejected_jump &&
-                             !gicp_rejected_yaw && !gicp_rejected_support;
+                             !gicp_rejected_yaw && !gicp_rejected_support &&
+                             !gicp_rejected_velocity_shadow &&
+                             !gicp_rejected_velocity_shadow_unavailable;
   const bool gicp_partial = gicp_accepted && degen.valid && degen.modified;
 
   if (!candidate_pose_valid) {
@@ -4349,6 +4522,18 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
                 "GICP REJECTED (fitness_ratio=%.3f > %.3f, baseline=%.4f — wrong-basin signature): %s",
                 fitness_ratio, this->fitness_ratio_reject_, fitness_baseline,
                 build_scan_debug_log("rejected_fitness_ratio").c_str());
+  } else if (gicp_rejected_velocity_shadow_unavailable) {
+    RCLCPP_WARN(this->get_logger(),
+                "GICP REJECTED (velocity shadow unavailable after a known-pose anchor; fail-closed, age=%+.3fs anchor_age=%.3fs resets=%lu): %s",
+                velocity_shadow_age_s, velocity_shadow_anchor_age_s,
+                static_cast<unsigned long>(velocity_shadow_reset_count),
+                build_scan_debug_log("rejected_velocity_shadow_unavailable").c_str());
+  } else if (gicp_rejected_velocity_shadow) {
+    RCLCPP_WARN(this->get_logger(),
+                "GICP REJECTED (velocity-shadow divergence %.3fm > %.3fm, age=%+.3fs; Atlas position unused): %s",
+                velocity_shadow_error_m, this->velocity_shadow_max_horizontal_divergence_m_,
+                velocity_shadow_age_s,
+                build_scan_debug_log("rejected_velocity_shadow").c_str());
   } else if (gicp_rejected_hessian) {
     RCLCPP_WARN(this->get_logger(),
                 "GICP REJECTED (hessian_cond=%.3e > %.3e AND [fitness=%.4f|trans=%.3fm|rot=%.3fdeg] crossed [%.4f|%.3fm|%.3fdeg] — degenerate slide): %s",
@@ -4374,6 +4559,7 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
                 build_scan_debug_log(gicp_partial ? "ok_partial" : "ok").c_str());
   }
 
+  bool gt_snap_applied_this_frame = false;
   if (gicp_accepted) {
     // P1: apply the (possibly degeneracy-projected) candidate, and feed the
     // per-map fitness baseline from accepted frames only, so wrong-basin /
@@ -4516,6 +4702,8 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
                        : gicp_rejected_fitness ? "fitness rejected"
                        : gicp_rejected_yaw ? "yaw-innovation rejected (impossible heading)"
                        : gicp_rejected_fitness_ratio ? "fitness-ratio rejected (wrong basin)"
+                       : gicp_rejected_velocity_shadow_unavailable ? "velocity-shadow unavailable (fail-closed)"
+                       : gicp_rejected_velocity_shadow ? "velocity-shadow divergence rejected"
                        : gicp_rejected_hessian ? "degenerate geometry"
                        : "jump rejected";
     if (matrixFinite(this->T_prior)) {
@@ -4555,7 +4743,13 @@ void gicp_plusplus::LocalizationNode::performLocalization() {
     // configured threshold, snap state.{pose,velocity} to the time-matched GT
     // sample (transformed into base_frame). The snap overrides the dead-reckoned
     // pose and resets the counter; logs its own warn line.
-    this->maybeSnapPoseToGT(reason);
+    gt_snap_applied_this_frame = this->maybeSnapPoseToGT(reason);
+  }
+
+  if (this->debug_pub_enabled_ && this->dbg_snap_applied_pub) {
+    std_msgs::msg::Bool snap_msg;
+    snap_msg.data = gt_snap_applied_this_frame;
+    this->dbg_snap_applied_pub->publish(snap_msg);
   }
 }
 
@@ -4751,6 +4945,13 @@ void gicp_plusplus::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Odomet
       this->use_odom_init_applied_ = true;
       const rclcpp::Time stamp_ros(msg->header.stamp.sec, msg->header.stamp.nanosec);
       this->applyInitialPose(init_p, init_q, stamp_ros, "gt_odom");
+      Eigen::Vector3f init_v_lin_body;
+      Eigen::Vector3f init_v_ang_body;
+      if (this->composeGtTwistInBase(s, init_v_lin_body, init_v_ang_body)) {
+        (void)init_v_ang_body;
+        this->resetVelocityShadow(init_p, init_q * init_v_lin_body,
+                                  s.stamp, "gt_odom init");
+      }
       {
         std::lock_guard<std::mutex> lock(this->geo.mtx);
         this->geo.first_opt_done = true;
@@ -4767,16 +4968,25 @@ void gicp_plusplus::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Odomet
     }
   }
 
-  std::lock_guard<std::mutex> lock(this->gt_odom_mtx_);
-  if (!this->gt_odom_buffer_.empty() && s.stamp <= this->gt_odom_buffer_.back().stamp) {
-    // Out-of-order or duplicate timestamp; drop to keep buffer monotone.
-    return;
+  bool first_gt = false;
+  {
+    std::lock_guard<std::mutex> lock(this->gt_odom_mtx_);
+    if (!this->gt_odom_buffer_.empty() && s.stamp <= this->gt_odom_buffer_.back().stamp) {
+      // Out-of-order or duplicate timestamp; drop to keep buffer monotone and
+      // do not integrate it into the independent velocity shadow either.
+      return;
+    }
+    this->gt_odom_buffer_.push_back(s);
+    while (this->gt_odom_buffer_.size() > this->gt_odom_buffer_size_) {
+      this->gt_odom_buffer_.pop_front();
+    }
+    // The GT callback group is reentrant. Keep monotonic buffer admission and
+    // velocity integration in one critical section so t2 cannot integrate
+    // ahead of an admitted-but-not-yet-integrated t1 callback.
+    this->updateVelocityShadowFromGt(s);
+    first_gt = !this->gt_odom_received_.exchange(true);
   }
-  this->gt_odom_buffer_.push_back(s);
-  while (this->gt_odom_buffer_.size() > this->gt_odom_buffer_size_) {
-    this->gt_odom_buffer_.pop_front();
-  }
-  if (!this->gt_odom_received_.exchange(true)) {
+  if (first_gt) {
     RCLCPP_INFO(this->get_logger(),
                 "First ground-truth odom received at stamp=%.3f frame=%s child_frame=%s",
                 s.stamp, msg->header.frame_id.c_str(),
@@ -4907,6 +5117,182 @@ bool gicp_plusplus::LocalizationNode::composeGtTwistInBase(
   v_ang_body_out = R_gtbody_base * gt.v_ang_body;
   v_lin_body_out = R_gtbody_base * (gt.v_lin_body + gt.v_ang_body.cross(t_gtbody_base));
   return true;
+}
+
+void gicp_plusplus::LocalizationNode::resetVelocityShadow(
+    const Eigen::Vector3f& p_world, const Eigen::Vector3f& v_world,
+    double stamp, const char* reason) {
+  if (!this->velocity_shadow_enabled_) return;
+  // A known-pose anchor was requested. Even if its velocity payload is
+  // malformed, the watchdog must not remain silently unarmed/fail-open.
+  this->velocity_shadow_anchor_seen_.store(true);
+  if (!p_world.allFinite() || !v_world.allFinite() || !std::isfinite(stamp)) {
+    RCLCPP_WARN(this->get_logger(),
+                "Velocity shadow: refusing non-finite reset (%s)", reason);
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(this->velocity_shadow_mtx_);
+    this->velocity_shadow_p_ = p_world;
+    this->velocity_shadow_v_world_ = v_world;
+    this->velocity_shadow_stamp_ = stamp;
+    this->velocity_shadow_anchor_stamp_ = stamp;
+    ++this->velocity_shadow_reset_count_;
+    this->velocity_shadow_initialized_ = true;
+    this->velocity_shadow_history_.clear();
+    this->velocity_shadow_history_.push_back(
+        VelocityShadowSample{stamp, p_world, v_world});
+  }
+  RCLCPP_INFO(this->get_logger(),
+              "Velocity shadow: anchored from %s at t=%.3f p=[%.2f,%.2f,%.2f] v=[%.2f,%.2f,%.2f]m/s",
+              reason, stamp, p_world.x(), p_world.y(), p_world.z(),
+              v_world.x(), v_world.y(), v_world.z());
+}
+
+void gicp_plusplus::LocalizationNode::updateVelocityShadowFromGt(
+    const GtSample& gt) {
+  if (!this->velocity_shadow_enabled_ || !this->gt_extrinsics_cached_.load()) return;
+
+  Eigen::Vector3f v_lin_base_body;
+  Eigen::Vector3f v_ang_base_body;
+  if (!this->composeGtTwistInBase(gt, v_lin_base_body, v_ang_base_body)) return;
+  (void)v_ang_base_body;
+
+  // Orientation is allowed: the existing INS heading prior already consumes
+  // it. Position is deliberately not read here. Rotate body-FLU velocity into
+  // map/local-ENU and integrate with a trapezoidal step.
+  const Eigen::Matrix3f R_base_gtbody =
+      this->T_base_gtbody_.block<3, 3>(0, 0);
+  const Eigen::Quaternionf q_gtbody_in_base(R_base_gtbody);
+  const Eigen::Quaternionf q_map_base =
+      (gt.q * q_gtbody_in_base.conjugate()).normalized();
+  const Eigen::Vector3f v_world = q_map_base * v_lin_base_body;
+  if (!v_world.allFinite() || !std::isfinite(gt.stamp)) return;
+
+  bool gap_invalidated = false;
+  double gap_s = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(this->velocity_shadow_mtx_);
+    if (!this->velocity_shadow_initialized_) return;
+    const double dt = gt.stamp - this->velocity_shadow_stamp_;
+    if (dt <= 0.0) return;
+    if (dt > this->velocity_shadow_max_integration_gap_s_) {
+      // Mark the velocity track unavailable until the next explicit
+      // known-pose anchor. Silently re-anchoring from ordinary Atlas position
+      // would make the watchdog a disguised position/GT gate and invalidate
+      // the scientific comparison. When failClosedAfterAnchor=true, the scan
+      // gate rejects this state and the existing failure-streak recovery
+      // performs an explicit, logged GT snap.
+      this->velocity_shadow_initialized_ = false;
+      this->velocity_shadow_history_.clear();
+      gap_invalidated = true;
+      gap_s = dt;
+    } else {
+      this->velocity_shadow_p_.head<2>() +=
+          0.5f * (this->velocity_shadow_v_world_.head<2>() + v_world.head<2>()) *
+          static_cast<float>(dt);
+      this->velocity_shadow_v_world_ = v_world;
+      this->velocity_shadow_stamp_ = gt.stamp;
+      this->velocity_shadow_history_.push_back(
+          VelocityShadowSample{gt.stamp, this->velocity_shadow_p_, v_world});
+      const double keep_after =
+          gt.stamp - this->velocity_shadow_history_duration_s_;
+      // Keep one sample before the retention boundary so lower_bound queries
+      // still have a left-hand interpolation endpoint.
+      while (this->velocity_shadow_history_.size() > 2 &&
+             this->velocity_shadow_history_[1].stamp < keep_after) {
+        this->velocity_shadow_history_.pop_front();
+      }
+    }
+  }
+  if (gap_invalidated) {
+    RCLCPP_WARN(this->get_logger(),
+                "Velocity shadow: Atlas velocity gap %.3fs exceeds %.3fs; watchdog unavailable until next odom-init/GT-snap anchor",
+                gap_s, this->velocity_shadow_max_integration_gap_s_);
+  }
+}
+
+bool gicp_plusplus::LocalizationNode::velocityShadowAt(
+    double stamp, Eigen::Vector3f& p_world, double& age_s,
+    double& anchor_age_s, uint64_t& reset_count,
+    bool& fail_closed_if_unavailable) const {
+  std::lock_guard<std::mutex> lock(this->velocity_shadow_mtx_);
+  reset_count = this->velocity_shadow_reset_count_;
+  fail_closed_if_unavailable =
+      this->velocity_shadow_enabled_ &&
+      this->velocity_shadow_fail_closed_after_anchor_ &&
+      (this->velocity_shadow_anchor_seen_.load() ||
+       this->velocity_shadow_reset_count_ > 0 ||
+       this->use_odom_init_applied_.load());
+  if (std::isfinite(stamp) && std::isfinite(this->velocity_shadow_stamp_)) {
+    age_s = stamp - this->velocity_shadow_stamp_;
+  }
+  if (std::isfinite(stamp) &&
+      std::isfinite(this->velocity_shadow_anchor_stamp_)) {
+    anchor_age_s = stamp - this->velocity_shadow_anchor_stamp_;
+  }
+  if (!this->velocity_shadow_enabled_ || !this->velocity_shadow_initialized_ ||
+      !std::isfinite(stamp) || this->velocity_shadow_history_.empty()) {
+    return false;
+  }
+  if (!std::isfinite(anchor_age_s) || anchor_age_s < 0.0 ||
+      anchor_age_s > this->velocity_shadow_max_anchor_age_s_) {
+    return false;
+  }
+
+  const auto it = std::lower_bound(
+      this->velocity_shadow_history_.begin(),
+      this->velocity_shadow_history_.end(), stamp,
+      [](const VelocityShadowSample& sample, double query_stamp) {
+        return sample.stamp < query_stamp;
+      });
+
+  if (it == this->velocity_shadow_history_.begin()) {
+    // Never backward-extrapolate a delayed query from a future velocity
+    // sample: during a turn that tangent approximation can hide metres of
+    // divergence. Exact-front queries are valid; older queries fail closed.
+    const double dt = stamp - it->stamp;
+    if (!std::isfinite(dt) || dt < -1.0e-9) {
+      return false;
+    }
+    p_world = it->p_world;
+  } else if (it == this->velocity_shadow_history_.end()) {
+    // Query is newer than the latest velocity sample. Short, bounded
+    // constant-velocity holdover is preferable to silently using Atlas
+    // position; once it expires the caller fails closed until a known-pose
+    // anchor restores the watchdog.
+    const auto& last = this->velocity_shadow_history_.back();
+    const double dt = stamp - last.stamp;
+    age_s = dt;
+    if (!std::isfinite(dt) || dt < 0.0 ||
+        dt > this->velocity_shadow_max_age_s_) {
+      return false;
+    }
+    p_world = last.p_world +
+        last.v_world * static_cast<float>(dt);
+  } else {
+    // The query lies inside retained integrated history. Cubic Hermite uses
+    // both endpoint positions and velocities, avoiding the chord error of
+    // plain position lerp across a sparse (up to maxIntegrationGapS) turn.
+    const auto& right = *it;
+    const auto& left = *std::prev(it);
+    const double dt = right.stamp - left.stamp;
+    if (!std::isfinite(dt) || dt <= 0.0) return false;
+    const float u = static_cast<float>((stamp - left.stamp) / dt);
+    const float u2 = u * u;
+    const float u3 = u2 * u;
+    const float h00 = 2.0f * u3 - 3.0f * u2 + 1.0f;
+    const float h10 = u3 - 2.0f * u2 + u;
+    const float h01 = -2.0f * u3 + 3.0f * u2;
+    const float h11 = u3 - u2;
+    p_world = (1.0f - u) * left.p_world + u * right.p_world;
+    p_world.head<2>() =
+        h00 * left.p_world.head<2>() +
+        h10 * static_cast<float>(dt) * left.v_world.head<2>() +
+        h01 * right.p_world.head<2>() +
+        h11 * static_cast<float>(dt) * right.v_world.head<2>();
+  }
+  return p_world.head<2>().allFinite();
 }
 
 // RTK-driven IMU bias calibration. Pairs each IMU sample with a time-matched GT
@@ -5083,6 +5469,8 @@ bool gicp_plusplus::LocalizationNode::tryRtkCalibrationStep(
       this->prev_vel = v_seed_world;
     }
     this->initialized = true;  // publish only after ALL pose state is consistent
+    this->resetVelocityShadow(this->latest_rtk_seed_.p, v_seed_world,
+                              this->latest_rtk_seed_.stamp, "RTK full seed");
   }
 
   this->imu_calibrated_ = true;
@@ -5101,15 +5489,6 @@ bool gicp_plusplus::LocalizationNode::tryRtkCalibrationStep(
 }
 
 bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
-  // DIAGNOSTIC: prove helper is being called. Remove once snap behavior verified.
-  RCLCPP_INFO(this->get_logger(),
-              "GT recovery: maybeSnapPoseToGT entered (enabled=%d streak=%d/%d gt_received=%d cached=%d) reason='%s'",
-              this->gt_recovery_enabled_,
-              this->consecutive_failures_, this->gt_recovery_min_consecutive_failures_,
-              this->gt_odom_received_.load() ? 1 : 0,
-              // [P1 FIX 2026-07-09] atomic<bool> cannot be passed to a vararg
-              // (deleted copy ctor -> build break); load and promote explicitly.
-              this->gt_extrinsics_cached_.load() ? 1 : 0, reason);
   // Guards. Below-threshold guard is silent (frequent on every rejection until
   // streak builds up); the others log throttled info so a misconfiguration
   // doesn't silently disable recovery.
@@ -5267,6 +5646,38 @@ bool gicp_plusplus::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
     this->base_pose_stamp_ = this->scan_stamp.seconds();
     this->prev_vel = v_base_world;
   }
+
+  // Shadow semantics are stricter than recovery velocity semantics: recovery
+  // may fall back to a finite difference of Atlas *position*, but the shadow
+  // must remain velocity-only between anchors. Re-compose the raw velflu twist
+  // independently; a true zero velocity is valid.
+  if (this->velocity_shadow_enabled_) {
+    // The pose anchor itself is valid even if the velocity payload below is
+    // malformed. Mark the watchdog armed now so a failed velocity reset takes
+    // the fail-closed path rather than silently reverting to unarmed/fail-open.
+    this->velocity_shadow_anchor_seen_.store(true);
+  }
+  Eigen::Vector3f shadow_v_lin_body;
+  Eigen::Vector3f shadow_v_ang_body;
+  if (this->composeGtTwistInBase(gt, shadow_v_lin_body, shadow_v_ang_body) &&
+      shadow_v_lin_body.allFinite()) {
+    (void)shadow_v_ang_body;
+    this->resetVelocityShadow(p_new, q_new * shadow_v_lin_body,
+                              this->scan_stamp.seconds(), "GT snap");
+  } else if (this->velocity_shadow_enabled_) {
+    std::lock_guard<std::mutex> shadow_lock(this->velocity_shadow_mtx_);
+    this->velocity_shadow_initialized_ = false;
+    this->velocity_shadow_history_.clear();
+    RCLCPP_WARN(this->get_logger(),
+                "Velocity shadow: GT snap had no finite Atlas velflu; watchdog left unavailable");
+  }
+
+  Eigen::Matrix4f T_snap = Eigen::Matrix4f::Identity();
+  T_snap.block<3, 3>(0, 0) = q_new.toRotationMatrix();
+  T_snap.block<3, 1>(0, 3) = p_new;
+  this->last_gicp_pose_ = T_snap;
+  this->last_gicp_stamp_ = this->scan_stamp;
+  this->last_gicp_valid_ = true;
 
   RCLCPP_WARN(this->get_logger(),
               "Localization: ⟳ snapped pose to GT (%s after %d consecutive non-accepts) — "
