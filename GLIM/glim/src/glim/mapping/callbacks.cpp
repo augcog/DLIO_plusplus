@@ -25,6 +25,7 @@ CallbackSlot<void(const std::vector<SubMap::Ptr>& submaps)> GlobalMappingCallbac
 
 CallbackSlot<void(gtsam_points::ISAM2Ext&, gtsam::NonlinearFactorGraph&, gtsam::Values&)> GlobalMappingCallbacks::on_smoother_update;
 CallbackSlot<void(gtsam_points::ISAM2Ext&, const gtsam_points::ISAM2ResultExt& result)> GlobalMappingCallbacks::on_smoother_update_result;
+CallbackSlot<void(gtsam_points::ISAM2Ext&, const std::string& message)> GlobalMappingCallbacks::on_smoother_update_failure;
 
 CallbackSlot<void()> GlobalMappingCallbacks::request_to_optimize;
 CallbackSlot<void()> GlobalMappingCallbacks::request_to_recover;

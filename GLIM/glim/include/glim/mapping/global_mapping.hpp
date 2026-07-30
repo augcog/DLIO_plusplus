@@ -70,6 +70,7 @@ public:
 
   virtual void save(const std::string& path) override;
   virtual gtsam_points::PointCloud::Ptr export_points() override;
+  virtual size_t num_submaps() const override { return submaps.size(); }
 
   /**
    * @brief Load a mapping result from a dumped directory

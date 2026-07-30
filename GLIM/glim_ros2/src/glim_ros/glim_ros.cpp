@@ -631,6 +631,10 @@ void GlimROS::save(const std::string& path) {
   }
 }
 
+size_t GlimROS::num_submaps() {
+  return global_mapping ? global_mapping->num_submaps() : 0;
+}
+
 }  // namespace glim
 
 RCLCPP_COMPONENTS_REGISTER_NODE(glim::GlimROS);

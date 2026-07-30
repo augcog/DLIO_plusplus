@@ -133,6 +133,17 @@ struct GlobalMappingCallbacks {
   static CallbackSlot<void(gtsam_points::ISAM2Ext& isam2, const gtsam_points::ISAM2ResultExt& result)> on_smoother_update_result;
 
   /**
+   * @brief Global optimization failure callback
+   * @param isam2    iSAM2 optimizer
+   * @param message  Exception message from the failed update
+   *
+   * This is paired with on_smoother_update_result so extensions can treat a
+   * factor handoff as a two-phase commit. A batch is not part of the graph
+   * merely because it was appended to new_factors.
+   */
+  static CallbackSlot<void(gtsam_points::ISAM2Ext& isam2, const std::string& message)> on_smoother_update_failure;
+
+  /**
    * @brief Request the global mapping module to perform optimization
    * @note  This is a special inverse-direction callback slot
    */

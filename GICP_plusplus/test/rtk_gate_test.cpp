@@ -53,8 +53,13 @@ TEST(RtkGate, ThresholdBoundaryIsInclusive) {
   EXPECT_FALSE(gicp_plusplus::rtkCovarianceComponentOk(std::nextafter(kMaxXY, 1.0), kMaxXY));
 }
 
-TEST(RtkGate, ZeroCovariancePasses) {
-  EXPECT_TRUE(gicp_plusplus::rtkPositionCovarianceOk(0.0, 0.0, 0.0, kMaxXY, kMaxZ));
+TEST(RtkGate, ZeroCovarianceFailsClosedByDefault) {
+  EXPECT_FALSE(gicp_plusplus::rtkPositionCovarianceOk(0.0, 0.0, 0.0, kMaxXY, kMaxZ));
+}
+
+TEST(RtkGate, ZeroCovarianceRequiresExplicitCompatibilityEscape) {
+  EXPECT_TRUE(gicp_plusplus::rtkPositionCovarianceOk(
+      0.0, 0.0, 0.0, kMaxXY, kMaxZ, true));
 }
 
 TEST(RtkGate, PerAxisThresholdsApply) {

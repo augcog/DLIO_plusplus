@@ -9,7 +9,7 @@ ROS 2 perception stack for the AV-24 Cybertruck autonomous race car. Pairs a GPU
 | [`adapter/`](adapter/) | new in this repo | Point One Atlas normalization boundary. Converts raw Atlas WGS84 pose/IMU into the `/gps_p1/*` (and optional `/gnss*`) streams in a **local ENU** `map` frame consumed by GLIM/GICP. |
 | [`GLIM/`](GLIM/) | [`koide3/GLIM`](https://github.com/koide3/glim) (+ `glim_ext`, `glim_ros2`) | LiDAR-inertial SLAM. Builds a 3D map from IMU + multi-LiDAR + GNSS. |
 | [`gicp_localization/`](gicp_localization/) | Vendored from the `vectr-ucla` DLIO line (uses `nano_gicp`) | Current production/default GICP scan-to-map localizer against a PCD map produced by GLIM. |
-| [`GICP_plusplus/`](GICP_plusplus/) | new in this repo (vendored `small_gicp`) | A/B localizer with the same ENU input contract and an asynchronous front/aux synchronizer. Run it instead of—not alongside—`gicp_localization`. |
+| [`GICP_plusplus/`](GICP_plusplus/) | new in this repo (vendored `small_gicp`) | A/B localizer with the same ENU input contract and an asynchronous Luminar front worker/aux synchronizer. Run it instead of—not alongside—`gicp_localization`. |
 | [`dlio/`](dlio/) | new in this repo | Convenience metapackage that pulls the packages into a single colcon build. |
 
 `scripts/prep_bag.py` ties the adapter to offline mapping: by default it normalizes a raw bag/PCAP, copies raw Luminar topics through untouched, **and runs GLIM** into a dump directory. Pass `--skip-glim` only when you intend to run GLIM manually afterward.
@@ -38,7 +38,16 @@ All sensor extrinsics are resolved at startup from [`av24.urdf`](av24.urdf) (off
 
 ### Coordinate frames — local ENU
 
-The `map` frame is a **local ENU** tangent frame anchored at a fixed geodetic **datum** (the Putnam origin read from `race_metadata`'s TTL), matching race_common's convention. The [`adapter`](adapter/) package is the **single authority** that converts raw Atlas WGS84 fixes into that ENU frame and republishes `/gps_p1/*` (and optional `/gnss*`) already in ENU, so GLIM and GICP consume ENU directly. GICP is **frame-agnostic** — it localizes the scan against the PCD map and reports the pose in whatever frame the map is in; because the map is built in ENU and the seed is ENU, its output is ENU with no extra transform.
+The `map` frame is a **local ENU** tangent frame anchored at the current
+dataset's fixed geodetic **datum**, matching race_common's convention. The
+datum must come from that dataset's map metadata (for example, Putnam reads its
+own origin from `race_metadata`'s TTL); an origin from another venue must never
+be reused. The [`adapter`](adapter/) package is the **single authority** that
+converts raw Atlas WGS84 fixes into that ENU frame and republishes `/gps_p1/*`
+(and optional `/gnss*`) already in ENU, so GLIM and GICP consume ENU directly.
+GICP is **frame-agnostic** — it localizes the scan against the PCD map and
+reports the pose in whatever frame the map is in; because the map is built in
+ENU and the seed is ENU, its output is ENU with no extra transform.
 
 The one hard constraint is a **single shared datum**: the map, the seed (`/gps_p1/filtered_odom`), and GICP must all use the origin the adapter defines, or the frames silently disagree.
 
@@ -89,7 +98,10 @@ In low-feature stretches the localizer first falls back to IMU dead-reckoning. I
 **The RTK quality gate is applied per-consumer, not globally, and snap recovery is intentionally exempt.** `callbackGtOdom()` buffers *every* Atlas sample regardless of FIXED/FLOAT/dead-reckoning state; the covariance gate (`gtSampleIsRtkFixed`) is then applied at each consumer:
 
 - **Bias calibration / seed** (`tryRtkCalibrationStep`) → **requires RTK-FIXED**.
-- **GT divergence cross-check** (`gt_pos_err` diagnostic) → **requires RTK-FIXED**.
+- **GT divergence cross-check / candidate sanity envelope** (`gt_pos_err`,
+  deployed `max_candidate_position_error_m: 5.0`) → **requires RTK-FIXED**.
+  Atlas position is not blended into healthy GICP poses inside the envelope;
+  the gate only rejects a repeated-geometry wrong basin before observer update.
 - **Snap recovery** (`maybeSnapPoseToGT`) → **accepts any-quality Atlas sample**.
 
 The rationale is that Atlas FusionEngine already runs a coupled GNSS+IMU INS with calibrated sensors, so during RTK loss its degraded pose is still the better truth source than the node's own software IMU dead-reckoning. This means recovery can snap toward an RTK-float/GPS-only fix when GICP has failed — a deliberate trade. It is enabled by default (`gt_recovery/enable: true`, `min_consecutive_failures: 5` — raised from 1 in the P2 turn-error fixes: per-frame snapping masked dead-reckoning quality in replay metrics); raise `min_consecutive_failures` further, or disable `gt_recovery` if you require the snap to be strictly RTK-gated. The joint low-feature-LiDAR and degraded-RTK case remains an operational watch condition.
@@ -139,8 +151,14 @@ Neither phase applies to `gicp_localization` — that pipeline does RTK-driven I
 
 The cross-run replay campaign (run 3 ↔ run 5, July 2026) diagnosed and fixed a family of turn-localization errors. Use `gicp_localization/scripts/analyze_scan_debug_log.py` to score a replay from its `SCAN DEBUG` evidence. Headlines:
 
-- **P1** — GICP binary accept/reject gates replaced with confidence-weighted gating: per-map rolling-median fitness ratios, full-6D degeneracy partial updates (solution remapping on the vehicle-re-centered hessian), and a turn-aware yaw-consistency veto.
-- **P2** — state-continuity fixes on the rejected-scan path (stale-velocity bug), GT-snap twist continuity (adapter now populates `twist.angular` from the Atlas gyro), recovery threshold 1 → 5.
+- **P1** — GICP binary accept/reject gates replaced with support/physics-aware
+  gating and full-6D degeneracy partial updates. The deployed Laguna default
+  follows perception-ws and disables map-density-dependent absolute and rolling
+  fitness rejection; the ratio machinery remains available for explicit A/B.
+- **P2** — state-continuity fixes on the rejected-scan path (stale-velocity
+  bug), GT-snap twist continuity, RTK-quality candidate safety envelope, and
+  observer position/velocity/speed bounds that prevent a wrong basin from
+  producing an unphysical prediction; recovery threshold 1 → 5.
 - **P3** — delta-form observer correction (removes the 0.1–0.3 s stale-measurement yaw lag in turns) and a unified IMU bias path (bias applied once, at buffering).
 - **P4** — geometry densification: scan voxel 0.5 → 0.3 m, dense GLIM map profile (**active default**, see below), per-frame merge diagnostics in both stacks, concat buffer parity (200).
 - **P5** — dual-antenna heading priors in GLIM mapping hardened with a per-sample yaw-quality gate.
@@ -187,7 +205,7 @@ Note: `scripts/prep_bag.py` deliberately does **not** rebase LiDAR — it copies
 
 | `localization/sensor_type` | Field encodings handled | Notes |
 |---|---|---|
-| `luminar` | `UINT8[8]` (uint64 epoch ns; validated default — field `timestamp`, offset 0, point_step 56), `FLOAT64` (raw uint64 bits in a mislabelled FLOAT64 wrapper) | Iris PTP-synced output, reconstructed to full epoch ns by the driver (see the definitive account above). Only these two **8-byte absolute-epoch** carriers are accepted; `UINT32` is **intentionally rejected** — 32 bits cannot hold an absolute epoch (it wraps every ~4.29 s), so it would be a scan-relative counter the absolute path would misread. A `UINT32` Luminar therefore degrades to no per-point time (rigid transform) rather than corrupting deskew. |
+| `luminar` | `UINT8[8]` (uint64 epoch ns), `FLOAT64` (scan-relative seconds by default; raw uint64 epoch-ns bits only with the explicit driver opt-in) | Laguna's decoder publishes ordinary FLOAT64 seconds-since-sweep-start. The localizer rebases auxiliary relative times onto the primary header before deskew. `UINT8[8]` remains an absolute PTP carrier. `UINT32` is intentionally rejected on the Luminar path because it cannot carry an absolute epoch and its unit/anchor would otherwise be ambiguous. |
 | `ouster` | `UINT32`, `FLOAT32`, `FLOAT64` (all scan-relative ns or s) | Standard Ouster ROS driver layouts. |
 | `velodyne` | `FLOAT32`, `UINT32` (scan-relative s or ns) | VLP-16/32 and similar. |
 | `hesai` | `FLOAT64`, `FLOAT32` (absolute or relative seconds) | Pandar / XT line. |
@@ -239,7 +257,118 @@ If you ever switch sensors and the deskew looks wrong, use the one-shot diagnost
    python3 scripts/export_glim_dump_to_pcd.py /tmp/dump /path/to/track_map.pcd --voxel-size 0.1
    ```
    The exporter defaults to `--frame enu`: it applies `inverse(T_world_utm)` so the PCD is genuinely in the Atlas local-ENU frame, fails closed when the transform is missing, and writes a `*.manifest.yaml` recording the frame and transform (check it before shipping a map). It reads the datum from `<dump>/enu_origin.txt` automatically (written by the all-in-one `prep_bag.py` route); for a **hand-run GLIM dump** that file does not exist, so pass the datum explicitly: `--enu-origin "<lat,lon,alt>"` (the same origin the adapter used).
+   Do not deploy a dense union of every repeated lap. For a perception-ws-style
+   deployment map, export two or more representative laps independently as XYZ
+   at the final voxel size, then retain repeatable voxels inside the driven
+   corridor:
+   ```bash
+   python3 scripts/export_glim_dump_to_pcd.py /tmp/dump /tmp/lap1.pcd \
+     --submap-range START1:END1 --voxel-size 0.15 --pcd-fields xyz \
+     --gnss-enu-origin "INPUT_LAT,LON,ALT" --enu-origin "OUTPUT_LAT,LON,ALT"
+   python3 scripts/export_glim_dump_to_pcd.py /tmp/dump /tmp/lap2.pcd \
+     --submap-range START2:END2 --voxel-size 0.15 --pcd-fields xyz \
+     --gnss-enu-origin "INPUT_LAT,LON,ALT" --enu-origin "OUTPUT_LAT,LON,ALT"
+   python3 scripts/export_glim_dump_to_pcd.py /tmp/dump /tmp/lap3.pcd \
+     --submap-range START3:END3 --voxel-size 0.15 --pcd-fields xyz \
+     --gnss-enu-origin "INPUT_LAT,LON,ALT" --enu-origin "OUTPUT_LAT,LON,ALT"
+   python3 scripts/export_glim_dump_to_pcd.py /tmp/dump /tmp/staging.pcd \
+     --submap-range STAGING_START:STAGING_END --submap-step 10 \
+     --voxel-size 0.15 --pcd-fields xyz \
+     --gnss-enu-origin "INPUT_LAT,LON,ALT" --enu-origin "OUTPUT_LAT,LON,ALT"
+   python3 scripts/build_consistent_pcd.py /path/to/deploy_map.pcd \
+     /tmp/lap1.pcd /tmp/lap2.pcd /tmp/lap3.pcd \
+     --coverage-pcd /tmp/staging.pcd \
+     --corridor-trajectory /tmp/dump/traj_lidar.txt \
+     --corridor-index-range START1:END3 \
+     --corridor-radius 75 --min-sessions 2 --voxel-size 0.15
+   ```
+   `build_consistent_pcd.py` globally deduplicates each lap, requires
+   cross-lap support inside the corridor, and keeps unique distant structure
+   outside it. A sparse pit/staging export may be added with
+   `--coverage-pcd`; use `--submap-step` when creating that export so a long
+   stationary period does not dominate map size. The output manifest embeds
+   every source range, datum, transform, and filter count.
 6. **Localize** online against that PCD with `gicp_localization`/`GICP_plusplus`, using the adapter's ENU `/gps_p1/*` streams as IMU + seed. Because the exported map is genuinely ENU, Atlas seeds/GT are frame-correct directly — and `localization/utm_transform_path` must stay **EMPTY** (it exists only for legacy world-frame maps and would double-transform an ENU map).
+
+7. **Prepare a deterministic real-time replay input.** Topic filtering at
+   `ros2 bag play` time still makes the player scan unrelated messages in large
+   camera/multi-LiDAR bags. Build one compressed MCAP containing only the
+   online-localization input contract before the audit:
+   ```bash
+   python3 scripts/prepare_gicp_replay_bag.py \
+     --bag /path/to/DATASET_ROOT/<collection>/<run>/filtered/all \
+     --bag /path/to/DATASET_ROOT/<collection>/<run>/navigation_bag \
+     --out /path/to/DATASET_ROOT/prep_bag/<run>_front_atlas_gicp
+   ```
+   The helper refuses cross-dataset inputs and outputs, retains only the
+   `/luminar_front/points`, `/gps_p1/imu`, and `/gps_p1/filtered_odom`
+   streams with their full message counts, and records input/config hashes
+   plus `ros2 bag info`. This step
+   changes only the offline I/O envelope; live-car localization still consumes
+   those three topics directly.
+
+8. **Audit the compressed map at real time** with the repository runner. It
+   derives `DATASET_ROOT` from `--map-dir`, refuses to overwrite an existing
+   result, and writes the debug/reference bags, logs, resource samples,
+   machine-readable run status and scan scorecard under that dataset's
+   `gicp_result/intermediate/`. Promote a run to `gicp_result/` only after
+   manual log, bag, status, and metric audit passes:
+   ```bash
+   scripts/run_gicp_replay_audit.sh \
+     --map-dir /path/to/DATASET_ROOT/maps/<compressed-map> \
+     --bag /path/to/DATASET_ROOT/prep_bag/<run>_front_atlas_gicp \
+     --run-name <run>_compressed_full_1x \
+     --overlay /path/to/gicp/install/setup.bash \
+     --mode gnss_aided \
+     --reference-is-gt-ack \
+     --config-path GICP_plusplus/cfg/front_quality_replay.yaml \
+     --start-offset 0 \
+     --duration <full-overlap-seconds> \
+     --rate 1.0 \
+     --primary-queue-size 32
+   ```
+   `gnss_aided` explicitly labels that Atlas participates in localization.
+   When the same Atlas odometry is also the score reference, the acknowledgement
+   flag is mandatory because that evidence is not independent truth.
+   `--mode independent` instead requires a `--reference-topic` distinct from
+   the runtime `--gt-topic`; a YAML profile alone cannot make the same aided
+   stream independent truth. The optional
+   `GICP_plusplus/cfg/front_no_atlas_translation_replay.yaml` removes
+   per-scan Atlas translation seeding/gating for a registration A/B, but does
+   not relabel its evidence as independent. Acceptance, rejection-streak,
+   debug-coverage, and zero-drop gates are explicit runner flags.
+   The offline audit uses RELIABLE LiDAR publication/subscription on both
+   sides so a large PointCloud2 cannot disappear in DDS without accounting.
+   Its 50,000-message rosbag read-ahead queue keeps storage/decompression
+   latency out of the 10 Hz delivery schedule. A bounded 32-frame offline
+   compute queue absorbs rosbag delivery bursts without hiding registration
+   cost: the audit must independently report GICP P95/max below 100 ms and
+   zero overload drops. Live sensors keep BEST_EFFORT and the default
+   8-frame queue.
+   The online localization contract remains front LiDAR only; the map itself
+   is built from all configured LiDARs.
+
+   If a recorded odometry stream has documented map-axis translation relative
+   to the map datum (for example an ellipsoid/geoid height convention), pass
+   `scripts/offset_odom.py` through `--bridge-script` and repeat
+   `--bridge-arg` for its explicit input topic, output topic, XYZ offset and
+   frame. The runner never embeds a site-specific transform.
+
+9. **Render the audited result from above.** The plotting tool reads the
+   runner's two output bags and map directly, writes a full-run image plus
+   complete-lap images, and records the exact input hashes and lap boundaries
+   in `trajectory_manifest.json`:
+   ```bash
+   python3 scripts/generate_gicp_topdown.py \
+     --debug-bag /path/to/DATASET_ROOT/gicp_result/<result>/debug_topics_bag \
+     --reference-bag /path/to/DATASET_ROOT/gicp_result/<result>/reference_topics_bag \
+     --localization-log /path/to/DATASET_ROOT/gicp_result/<result>/localization.log \
+     --map /path/to/DATASET_ROOT/maps/<compressed-map>/map.pcd \
+     --output-dir /path/to/DATASET_ROOT/gicp_result/<result>/topdown \
+     --reference-topic /path/to/reference/topic \
+     --run-label "<dataset> <run>, compressed map, full 1.0x" \
+     --map-label "three-LiDAR consistent map"
+   ```
 
 ### High-quality mapping profile
 
@@ -348,10 +477,14 @@ yaw; leave it at `0` for position-only GNSS publishers or publishers that use
 an identity quaternion to mean "orientation unavailable".
 The baseline can be injected with `--gnss-min-baseline`; its default matches the
 successful perception-ws Laguna configuration. The high-quality profile fits
-the newest segment that still spans that baseline on both trajectories, so a
-stationary/low-speed startup does not dominate the one-shot alignment. Use
-`--no-gnss-recent-fit-window` for the legacy all-history behavior, and inject
-its acceptance gate with `--gnss-fit-max-rms` (default `0.25 m`).
+the newest segment that still spans that baseline on both trajectories while
+retaining at least `--gnss-fit-min-samples 20`. It excludes the newest
+`--gnss-fit-validation-samples 10` from the fit and must predict that suffix
+within `--gnss-fit-max-rms 0.25 m`, in addition to passing the same in-sample
+RMS gate. This prevents a two-point/recent-window fit and catches growing
+estimate-side heading drift that a rigid in-sample alignment can absorb. Use
+`--no-gnss-recent-fit-window` for an all-history training prefix; held-out
+validation and the sample minimum still apply.
 `--offload-dir` must be an absolute, empty, per-run directory; GLIM refuses
 stale contents.
 
@@ -443,7 +576,7 @@ ros2 launch gicp_localization localization_with_tf.launch.py rviz:=true \
 > **Two localizers, an A/B pair.** `gicp_localization` (vendored DLIO / `nano_gicp`)
 > is the current production/default online localizer and is what this quick
 > command launches. `GICP_plusplus` is the A/B alternative (a `small_gicp`
-> backend with the front/aux synchronizer) used for replay comparison; launch it
+> backend with the asynchronous Luminar front worker/aux synchronizer) used for replay comparison; launch it
 > with `ros2 launch gicp_plusplus localization_with_tf.launch.py map_path:=… …`.
 > They consume the same ENU map + `/gps_p1/*` streams — pick one per run; they
 > are not meant to run simultaneously.
@@ -494,11 +627,12 @@ Upstream GLIM publishes `glim`, `glim_ext`, and `glim_ros2` as three sibling rep
 
 **Robustness against degenerate geometry** (reworked in P1, 2026-07)
 
-- **Confidence-weighted gating** on every GICP solve (replaces the old binary gates, which simultaneously mass-rejected fine corner scans into 25 s dead-reckoning streaks *and* accepted wrong-basin matches):
-  1. Hard fitness reject (`gicp/fitnessRejectThreshold`) — unchanged catastrophic backstop.
-  2. **Per-map fitness-ratio gates.** A rolling median of accepted-frame fitness normalizes the map's own floor (absolute thresholds go stale on cross-run maps); `fitnessRatioRejectThreshold` catches wrong-basin matches, with `seedBaseline` keeping the gates live during warm-up.
+- **Map-independent deployment gating** on every GICP solve:
+  1. A 30% correspondence-support gate plus finite-pose validation.
+  2. Absolute and rolling-ratio fitness rejection disabled for
+     perception-ws parity; a finite high ceiling still rejects NaN/Inf.
   3. **Degeneracy partial updates** (solution remapping): when the hessian condition proxy trips, the correction is projected onto well-constrained eigen-directions of the vehicle-re-centered, unit-scaled 6×6 hessian (coupled rot/trans null directions included; `degeneracy/full6d`), and the IMU prior is kept along degenerate axes — status `ok_partial` instead of a rejected scan.
-  4. **Turn-aware yaw-consistency veto** (`yawGate/*`): a large GICP yaw correction vs. the IMU-integrated prior on a low-confidence match keeps the IMU yaw.
+  4. **Turn-aware yaw-consistency veto** (`yawGate/*`) and hard physical yaw bounds.
   5. Large-jump reject vs. the IMU-predicted prior (speed/scan-dt-aware thresholds).
 - **IMU dead-reckoning fallback.** Rejected scans propagate from the IMU-integrated prior — seeded with the *current* IMU-propagated velocity (P2 fixed a stale-velocity bug that made dead-reckoned priors cut corners).
 - **GT-driven pose recovery** (enabled by default, `min_consecutive_failures: 5`). When GICP rejects N scans in a row, snap pose + twist to a time-matched GT odom sample; angular rate backfills from the live gyro and linear velocity from GT finite-differencing when the odom twist is unpopulated (P2).

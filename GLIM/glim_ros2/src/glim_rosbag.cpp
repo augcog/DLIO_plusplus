@@ -226,6 +226,14 @@ int main(int argc, char** argv) {
   double start_offset = 0.0;
   glim->declare_parameter<double>("start_offset", start_offset);
   glim->get_parameter<double>("start_offset", start_offset);
+  if (start_offset > 0.0 && bag_filenames.size() > 1) {
+    spdlog::critical(
+      "start_offset={} is ambiguous across {} input bag paths. Merge the "
+      "inputs into one bag or run without start_offset; refusing to seek only "
+      "the first path.",
+      start_offset, bag_filenames.size());
+    return 1;
+  }
 
   double playback_duration = 0.0;
   glim->declare_parameter<double>("playback_duration", playback_duration);
@@ -315,6 +323,8 @@ int main(int argc, char** argv) {
   std::vector<uint64_t> aux_ordinal_next;
   std::vector<double> indexed_primary_bag_times_s;
   std::vector<std::vector<double>> indexed_aux_bag_times_s;
+  bool seek_verification_pending = false;
+  double seek_expected_first_primary_s = -1.0;
   struct PendingPrimaryScan {
     sensor_msgs::msg::PointCloud2::SharedPtr msg;
     double enqueue_bag_time_s = 0.0;
@@ -599,6 +609,17 @@ int main(int argc, char** argv) {
           const double seek_time_s = seek_time / 1e9;
           primary_ordinal_next =
             std::distance(indexed_primary_bag_times_s.begin(), std::lower_bound(indexed_primary_bag_times_s.begin(), indexed_primary_bag_times_s.end(), seek_time_s));
+          if (primary_ordinal_next < indexed_primary_bag_times_s.size()) {
+            seek_expected_first_primary_s =
+              indexed_primary_bag_times_s[primary_ordinal_next];
+            seek_verification_pending = true;
+          } else {
+            spdlog::warn(
+              "two-pass join seek has no indexed primary at/after {:.6f}; "
+              "disabling the plan and using streaming matching",
+              seek_time_s);
+            two_pass_active = false;
+          }
           for (size_t i = 0; i < aux_ordinal_next.size(); ++i) {
             aux_ordinal_next[i] =
               std::distance(indexed_aux_bag_times_s[i].begin(), std::lower_bound(indexed_aux_bag_times_s[i].begin(), indexed_aux_bag_times_s[i].end(), seek_time_s));
@@ -734,6 +755,37 @@ int main(int argc, char** argv) {
           glim->imu_callback(imu_msg);
         }
       } else if (msg->topic_name == points_topic) {
+        if (seek_verification_pending) {
+          seek_verification_pending = false;
+          constexpr double kSeekVerificationToleranceSec = 1e-6;
+          const double seek_error_s =
+            std::abs(latest_bag_time_s - seek_expected_first_primary_s);
+          if (seek_error_s > kSeekVerificationToleranceSec) {
+            spdlog::error(
+              "two-pass seek verification failed: first streamed primary "
+              "bag_time={:.9f}, indexed={:.9f}, error={:.3f} ms. Disabling "
+              "the plan and falling back to streaming matching.",
+              latest_bag_time_s, seek_expected_first_primary_s,
+              seek_error_s * 1e3);
+            for (size_t i = 0; i < planned_aux_store.size(); ++i) {
+              for (auto& entry : planned_aux_store[i]) {
+                aux_sensors[i].buffer.push_back(std::move(entry.second.cloud));
+              }
+              while (aux_sensors[i].buffer.size() > aux_sensors[i].buffer_size) {
+                aux_sensors[i].buffer.pop_front();
+              }
+              planned_aux_store[i].clear();
+            }
+            merge_plan.clear();
+            planned_aux_ordinals.clear();
+            two_pass_active = false;
+          } else {
+            spdlog::info(
+              "two-pass seek verification passed: first primary {:.9f} "
+              "matches the indexed stream",
+              latest_bag_time_s);
+          }
+        }
         if (topic_type != "sensor_msgs/msg/PointCloud2") {
           g_bag_hard_error = true;
         spdlog::error("topic_type mismatch: {} != sensor_msgs/msg/PointCloud2 (topic={})", topic_type, msg->topic_name);
@@ -1238,7 +1290,21 @@ int main(int argc, char** argv) {
   }
 
   glim->wait(auto_quit);
-  glim->save(dump_path);
+  try {
+    glim->save(dump_path);
+  } catch (const std::exception& e) {
+    g_bag_hard_error = true;
+    spdlog::critical(
+      "GLIM dump save failed after retaining all recoverable submaps: {}", e.what());
+  }
+
+  const size_t num_submaps = glim->num_submaps();
+  if (num_submaps == 0) {
+    spdlog::critical(
+      "mapping produced zero submaps — input was empty/filtered or odometry "
+      "never initialized; partial dump kept, exiting nonzero");
+    return 1;
+  }
 
   if (!glim->ok()) {
     spdlog::error("run rejected by a mapping quality/safety extension — partial dump saved, exiting nonzero");

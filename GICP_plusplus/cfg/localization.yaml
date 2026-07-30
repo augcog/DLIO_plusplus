@@ -6,6 +6,9 @@
     # Localization Parameters
     # Path to pre-built PCD map file
     localization/map_path: "dlio_maps/may_4_putnam.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
+    # Opt-in deployment gate: require a complete ENU manifest and an explicitly
+    # configured expected_enu_origin. Legacy maps remain warn-only by default.
+    localization/require_map_manifest: false
 
     # UTM output: path to GLIM's T_world_utm.txt for the map being used.
     # Leave empty to disable UTM-frame publishing.
@@ -120,6 +123,9 @@
     localization/gt_odom/enable: true
     localization/gt_odom/buffer_size: 200      # ring buffer depth (~2s @ 100Hz GT)
     localization/gt_odom/max_dt: 0.1           # seconds; reject lookups farther than this from scan stamp
+    # Optional GNSS wrong-basin envelope. Keep disabled in the shared,
+    # site-independent profile; deployment overlays may enable it.
+    localization/gt_odom/max_candidate_position_error_m: 0.0
 
     # RTK quality gate, applied PER CONSUMER at consumption time — NOT a
     # buffer filter. Every incoming gt_odom sample enters the buffer; the
@@ -149,6 +155,7 @@
     # (calibration / INS prior / cross-check) should accept every sample.
     # Buffering, snap recovery, and odom-init are unaffected either way.
     localization/rtk_gate/enable: true
+    localization/rtk_gate/allow_zero_covariance: false
     localization/rtk_gate/max_pose_var_xy: 0.25  # m^2; ~0.5 m horizontal std
     localization/rtk_gate/max_pose_var_z: 1.0    # m^2; ~1.0 m vertical std (GPS Z is naturally worse)
 
@@ -212,6 +219,9 @@
     # the bytes to the primary PointCloud2. Downstream steps see a single cloud in
     # primary frame with one coherent timebase.
     localization/lidar_concat/enabled: true
+    # QoS is independent of site geometry. Live sensors normally use
+    # BEST_EFFORT; lossless replay overlays may opt into RELIABLE.
+    localization/lidar_concat/reliable_qos: false
     localization/lidar_concat/aux_topics: ["/luminar_right/points", "/luminar_left/points"]
     localization/lidar_concat/aux_frames: ["luminar_right", "luminar_left"]
     localization/lidar_concat/time_threshold: 0.1   # seconds; NON-LUMINAR fallback matching + tie-break only.
@@ -240,7 +250,10 @@
     # header-delta extrema, while the geometric point-time regression measured
     # |offset| < 11 ms on both runs. Keep zero until a geometric point-time
     # measurement establishes a value; never copy header phase in here.
-    localization/lidar_concat/aux_time_offsets: []
+    # Omit aux_time_offsets here so the generic empty-vector default is used.
+    # Site profiles may provide an explicitly typed vector.
+    localization/lidar_concat/float64_time_is_epoch_ns: false
+    localization/lidar_concat/float64_time_fail_on_mismatch: true
     localization/lidar_concat/buffer_size: 200      # per-aux ring buffer depth (P4#3: raised 20 -> 200
                                                     #  for GLIM parity; 20 = only 2 s of aux history at
                                                     #  10 Hz, so brief stalls degraded frames to fewer
@@ -424,6 +437,7 @@
     # an absolute ceiling on how far one scan can move the state.
     odom/geo/max_pos_correction: 0.0 # m   — clamp per-update position correction
     odom/geo/max_vel_correction: 0.0 # m/s — clamp per-update velocity correction
+    odom/geo/max_state_speed: 0.0    # m/s — optional physical speed cap
     # P1 yaw-safety fix #3: ORIENTATION got the clamp position/velocity always
     # had. The observer pulls dt_eff*Kq (~45%) of the orientation error per
     # update; unclamped, one bad accepted scan injects tens of degrees of
@@ -490,6 +504,11 @@
     # GICP Registration Parameters
     # Maximum number of iterations (increased for better convergence)
     gicp/maxIterations: 128
+    # Optional iterative-optimizer wall-clock budget in milliseconds. Zero
+    # preserves the historical unbounded behavior; replay/site profiles may
+    # set a finite budget so a pathological basin fails closed at the INS
+    # prior instead of blocking the sensor pipeline.
+    gicp/maxOptimizationTimeMsCooperative: 0.0
 
     # Number of neighbors used to compute per-point covariances (typical: 20)
     gicp/correspondenceRandomness: 20
@@ -671,6 +690,12 @@
                                                     #  keeping scan-time and IMU-rate output consistent.
                                                     #  Numeric ins_prior params are sanitized at load:
                                                     #  out-of-range values warn and fall back to defaults.
+    # Atlas translation may optionally seed the GICP optimizer without
+    # shifting basePose/state/output. The point-cloud result must still pass
+    # support, jump, and wrong-basin gates. This keeps Atlas in the
+    # initialization/validation role instead of blending it into localization.
+    localization/ins_prior/gicp_position_seed_blend: 0.0
+    localization/ins_prior/gicp_position_seed_max_step_m: 20.0
     localization/ins_prior/require_rtk_fixed: true  # consume RTK-quality samples only
     # Heading-quality gate (REVIEW FIX 2026-07-08), mirroring GLIM gnss_global's
     # orientation_prior_max_yaw_sigma_deg. require_rtk_fixed above gates on

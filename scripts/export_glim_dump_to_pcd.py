@@ -163,6 +163,19 @@ def submap_dirs(dump_dir: Path) -> list[Path]:
     return sorted(dirs, key=lambda p: int(p.name))
 
 
+def parse_submap_range(text: str) -> tuple[int, int]:
+    """Parse a half-open ``START:END`` submap-index range."""
+    match = re.fullmatch(r"\s*(\d+)\s*:\s*(\d+)\s*", text)
+    if match is None:
+        raise ValueError(f"expected START:END, got {text!r}")
+    start, end = (int(value) for value in match.groups())
+    if end <= start:
+        raise ValueError(
+            f"submap range must be non-empty and half-open, got [{start}, {end})"
+        )
+    return start, end
+
+
 def point_count(path: Path) -> int:
     size = path.stat().st_size
     if size % 12 != 0:
@@ -185,6 +198,7 @@ def transformed_chunks(
     dirs: Iterable[Path],
     voxel_size: float,
     stride: int,
+    pcd_fields: str,
     pre_transform: Optional[np.ndarray] = None,
 ) -> Iterable[np.ndarray]:
     seen: Optional[set[tuple[int, int, int]]] = set() if voxel_size > 0.0 else None
@@ -219,23 +233,37 @@ def transformed_chunks(
             world = world[keep]
             intensities = intensities[keep]
 
-        out = np.empty(world.shape[0], dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("intensity", "<f4")])
+        dtype = [("x", "<f4"), ("y", "<f4"), ("z", "<f4")]
+        if pcd_fields == "xyzi":
+            dtype.append(("intensity", "<f4"))
+        out = np.empty(world.shape[0], dtype=dtype)
         out["x"] = world[:, 0].astype(np.float32)
         out["y"] = world[:, 1].astype(np.float32)
         out["z"] = world[:, 2].astype(np.float32)
-        out["intensity"] = intensities.astype(np.float32)
+        if pcd_fields == "xyzi":
+            out["intensity"] = intensities.astype(np.float32)
         print(f"[export_glim_dump_to_pcd] {idx}: {path.name} -> {len(out)} points", flush=True)
         yield out
 
 
-def write_header(handle, count: int) -> None:
+def write_header(handle, count: int, pcd_fields: str) -> None:
+    if pcd_fields == "xyz":
+        fields = "x y z"
+        scalar_columns = "4 4 4"
+        scalar_types = "F F F"
+        scalar_counts = "1 1 1"
+    else:
+        fields = "x y z intensity"
+        scalar_columns = "4 4 4 4"
+        scalar_types = "F F F F"
+        scalar_counts = "1 1 1 1"
     header = (
         "# .PCD v0.7 - Point Cloud Data file format\n"
         "VERSION 0.7\n"
-        "FIELDS x y z intensity\n"
-        "SIZE 4 4 4 4\n"
-        "TYPE F F F F\n"
-        "COUNT 1 1 1 1\n"
+        f"FIELDS {fields}\n"
+        f"SIZE {scalar_columns}\n"
+        f"TYPE {scalar_types}\n"
+        f"COUNT {scalar_counts}\n"
         f"WIDTH {count}\n"
         "HEIGHT 1\n"
         "VIEWPOINT 0 0 0 1 0 0 0\n"
@@ -251,6 +279,30 @@ def main() -> int:
     parser.add_argument("output_pcd", type=Path)
     parser.add_argument("--voxel-size", type=float, default=0.0)
     parser.add_argument("--stride", type=int, default=1)
+    parser.add_argument(
+        "--pcd-fields",
+        choices=("xyz", "xyzi"),
+        default="xyzi",
+        help="PCD payload fields. Use 'xyz' for perception-ws-compatible deployment maps; "
+        "'xyzi' preserves the historical dense-map output.",
+    )
+    parser.add_argument(
+        "--submap-range",
+        type=str,
+        default="",
+        metavar="START:END",
+        help="Export only the half-open numeric submap range [START, END). Use this to "
+        "export representative complete laps independently instead of accumulating "
+        "an entire multi-lap session.",
+    )
+    parser.add_argument(
+        "--submap-step",
+        type=int,
+        default=1,
+        help="After --submap-range selection, export every Nth submap. This is useful "
+        "for low-speed/stationary staging coverage where adjacent 10 Hz submaps are "
+        "almost identical. Default 1 keeps every selected submap.",
+    )
     parser.add_argument(
         "--frame",
         choices=("enu", "world"),
@@ -327,10 +379,37 @@ def main() -> int:
         )
     if args.stride < 1:
         parser.error("--stride must be >= 1")
+    if args.submap_step < 1:
+        parser.error("--submap-step must be >= 1")
 
     dirs = submap_dirs(args.dump_dir)
     if not dirs:
         raise SystemExit(f"no GLIM submap dirs found under {args.dump_dir}")
+    selected_submap_range: Optional[tuple[int, int]] = None
+    if args.submap_range:
+        try:
+            selected_submap_range = parse_submap_range(args.submap_range)
+        except ValueError as exc:
+            parser.error(f"--submap-range invalid: {exc}")
+        start, end = selected_submap_range
+        dirs = [path for path in dirs if start <= int(path.name) < end]
+        if not dirs:
+            raise SystemExit(
+                f"--submap-range [{start}, {end}) selected no valid submaps "
+                f"under {args.dump_dir}"
+            )
+        print(
+            f"[export_glim_dump_to_pcd] selected {len(dirs)} submaps in "
+            f"half-open range [{start}, {end})",
+            flush=True,
+        )
+    if args.submap_step > 1:
+        dirs = dirs[:: args.submap_step]
+        print(
+            f"[export_glim_dump_to_pcd] submap step {args.submap_step}: "
+            f"retained {len(dirs)} submaps",
+            flush=True,
+        )
 
     pre_transform: Optional[np.ndarray] = None
     enu_reanchor = np.eye(4, dtype=np.float64)
@@ -395,7 +474,13 @@ def main() -> int:
     success = False
     try:
         with data_tmp.open("wb") as data_handle:
-            for chunk in transformed_chunks(dirs, args.voxel_size, args.stride, pre_transform):
+            for chunk in transformed_chunks(
+                dirs,
+                args.voxel_size,
+                args.stride,
+                args.pcd_fields,
+                pre_transform,
+            ):
                 chunk.tofile(data_handle)
                 total += len(chunk)
 
@@ -403,7 +488,7 @@ def main() -> int:
             raise SystemExit("export produced zero points")
 
         with tmp.open("wb") as handle:
-            write_header(handle, total)
+            write_header(handle, total, args.pcd_fields)
             with data_tmp.open("rb") as data_handle:
                 shutil.copyfileobj(data_handle, handle, length=8 * 1024 * 1024)
         # [SELF-AUDIT FIX 2026-07-10] Manifest FIRST, then finalize the PCD:
@@ -422,6 +507,16 @@ def main() -> int:
             mh.write(f"points: {total}\n")
             mh.write(f"voxel_size: {args.voxel_size}\n")
             mh.write(f"stride: {args.stride}\n")
+            mh.write(f"submap_step: {args.submap_step}\n")
+            mh.write(f"pcd_fields: {args.pcd_fields}\n")
+            if selected_submap_range is None:
+                mh.write("submap_range: all\n")
+            else:
+                start, end = selected_submap_range
+                mh.write(f"submap_range: \"{start}:{end}\"  # half-open [start, end)\n")
+                mh.write(f"submap_start: {start}\n")
+                mh.write(f"submap_end_exclusive: {end}\n")
+            mh.write(f"selected_submaps: {len(dirs)}\n")
             if args.enu_origin:
                 mh.write(f"enu_origin: {args.enu_origin}  # output map datum\n")
                 mh.write(f"gnss_enu_origin: {args.gnss_enu_origin}  # mapping input datum\n")

@@ -224,8 +224,8 @@ void GlobalMappingPoseGraph::update_optimizer() {
     return;
   }
 
+  gtsam_points::ISAM2ResultExt result;
   try {
-    gtsam_points::ISAM2ResultExt result;
 #ifdef GTSAM_USE_TBB
     auto arena = static_cast<tbb::task_arena*>(tbb_task_arena.get());
     arena->execute([&] {
@@ -279,9 +279,13 @@ void GlobalMappingPoseGraph::update_optimizer() {
       }
     }
 
-  } catch (std::exception& e) {
+  } catch (const std::exception& e) {
     logger->error("an exception was caught during global map optimization!!");
     logger->error(e.what());
+    // Extensions may have appended factors in on_smoother_update(). Tell them
+    // explicitly that this transaction did not complete; otherwise handoff
+    // accounting can claim factors that were discarded with new_factors below.
+    Callbacks::on_smoother_update_failure(*isam2, e.what());
   }
   new_values.reset(new gtsam::Values);
   new_factors.reset(new gtsam::NonlinearFactorGraph);
@@ -358,6 +362,7 @@ void GlobalMappingPoseGraph::save(const std::string& path) {
     ofs << boost::format("%.9f %.6f %.6f %.6f %.6f %.6f %.6f %.6f") % stamp % trans.x() % trans.y() % trans.z() % quat.x() % quat.y() % quat.z() % quat.w() << std::endl;
   };
 
+  bool dense_restore_failed = false;
   for (int i = 0; i < submaps.size(); i++) {
     for (const auto& frame : submaps[i]->odom_frames) {
       write_tum_frame(odom_lidar_ofs, frame->stamp, frame->T_world_lidar);
@@ -378,7 +383,19 @@ void GlobalMappingPoseGraph::save(const std::string& path) {
 
     const std::string output_submap_dir = (boost::format("%s/%06d") % path % i).str();
     submaps[i]->save(output_submap_dir);
-    restore_offloaded_points(i, output_submap_dir);
+    try {
+      restore_offloaded_points(i, output_submap_dir);
+    } catch (const std::exception& e) {
+      dense_restore_failed = true;
+      logger->error(
+          "failed to restore dense points for submap {}: {}. "
+          "Continuing so the partial dump remains inspectable.",
+          i, e.what());
+    }
+  }
+  if (dense_restore_failed) {
+    throw std::runtime_error(
+        "one or more dense submap payloads failed to restore; partial dump retained");
   }
 }
 
@@ -802,7 +819,40 @@ void GlobalMappingPoseGraph::restore_offloaded_points(size_t index, const std::s
     throw std::runtime_error("dense point offload payload is missing for submap " + std::to_string(index) + ": " + source_dir.string());
   }
 
-  logger->debug("restored {} dense compact point files for submap {} from {}", restored_files, index, source_dir.string());
+  const boost::filesystem::path points_path =
+      destination_dir / "points_compact.bin";
+  if (!boost::filesystem::is_regular_file(points_path)) {
+    throw std::runtime_error(
+        "restored dense payload has no points_compact.bin for submap " +
+        std::to_string(index));
+  }
+  const auto points_bytes = boost::filesystem::file_size(points_path);
+  if (points_bytes == 0 || points_bytes % (3 * sizeof(float)) != 0) {
+    throw std::runtime_error(
+        "restored points_compact.bin has invalid byte size for submap " +
+        std::to_string(index) + ": " + std::to_string(points_bytes));
+  }
+  const auto dense_point_count = points_bytes / (3 * sizeof(float));
+  const boost::filesystem::path metadata_path = destination_dir / "data.txt";
+  std::ofstream metadata(metadata_path.string(), std::ios::app);
+  if (!metadata) {
+    throw std::runtime_error(
+        "cannot append dense-payload authority marker to " +
+        metadata_path.string());
+  }
+  metadata << "points_compact_authoritative: true\n";
+  metadata << "points_compact_count: " << dense_point_count << "\n";
+  metadata.flush();
+  if (!metadata) {
+    throw std::runtime_error(
+        "failed writing dense-payload authority marker to " +
+        metadata_path.string());
+  }
+
+  logger->debug(
+      "restored {} dense compact point files ({} authoritative points) for "
+      "submap {} from {}",
+      restored_files, dense_point_count, index, source_dir.string());
   offloaded_point_dirs[index] = destination_dir.string();
 
   // The dense payload is now durable in the dump. Reclaim only the temporary

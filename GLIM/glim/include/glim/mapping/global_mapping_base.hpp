@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #ifdef GLIM_USE_OPENCV
@@ -72,6 +73,14 @@ public:
    * @brief Export all the submap points
    */
   virtual gtsam_points::PointCloud::Ptr export_points() { return nullptr; }
+
+  /**
+   * @brief Number of geometric submaps currently owned by this mapper.
+   *
+   * Offline runners use this after save() to reject an empty/filtered run
+   * instead of treating a serialized zero-submap graph as success.
+   */
+  virtual size_t num_submaps() const { return 0; }
 
   /**
    * @brief Load a global mapping module from a shared library

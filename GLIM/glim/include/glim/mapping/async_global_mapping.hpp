@@ -73,6 +73,7 @@ public:
   void save(const std::string& path);
 
   gtsam_points::PointCloud::Ptr export_points();
+  size_t num_submaps();
 
   std::shared_ptr<glim::GlobalMappingBase> get_global_mapping() {
     std::lock_guard<std::mutex> lock(global_mapping_mutex);

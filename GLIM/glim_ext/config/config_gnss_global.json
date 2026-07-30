@@ -16,6 +16,15 @@
     // suffix that rejects stationary/low-speed startup transients while still
     // requiring min_baseline on both the estimate and GNSS trajectories.
     "fit_recent_baseline_window": false,
+    // The one-shot planar alignment must have enough geometry to estimate yaw
+    // robustly, then predict samples it did not fit. The newest
+    // fit_validation_samples are held out; both training and validation RMS
+    // must pass fit_max_rms before the transform can latch.
+    "fit_min_samples": 20,
+    "fit_validation_samples": 10,
+    // Site-independent compatibility default. Generated deployment profiles
+    // may tighten this after measuring their GNSS/trajectory noise.
+    "fit_max_rms": 2.0,
     // Atlas attitude (dual-antenna HEADING) prior on each submap. Position
     // anchoring (prior_inf_scale) pins WHERE a submap is, but not its yaw --
     // the Atlas dual-antenna heading is a drift-free reference that LiDAR+IMU

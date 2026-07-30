@@ -20,10 +20,12 @@ Usage:  analyze_scan_debug_log.py <localization.log> [--period 0.1] [--gt-bad 20
 """
 
 import argparse
+import json
 import math
 import re
 import sys
 from collections import Counter
+from pathlib import Path
 
 
 def pct(sorted_vals, p):
@@ -41,14 +43,14 @@ ROW = re.compile(
     r"SCAN DEBUG \| status=(?P<status>\w+) stamp=(?P<stamp>[\d.]+)"
     r".*?guess=\{xyz=\[(?P<gx>[-\d.,]+)\] rpy_deg=\[(?P<grpy>[-\d.,]+)\]\}"
     r".*?gicp_ms=(?P<ms>[-\d.]+|n/a)"
-    r".*?fitness=(?P<fit>[-\d.eE+]+|n/a)"
-    r"(?:.*?fit_ratio=(?P<ratio>[-\d.]+|n/a))?"
+    r".*?fitness=(?P<fit>[-\d.eE+]+|n/a|nan|inf)"
+    r"(?:.*?fit_ratio=(?P<ratio>[-\d.]+|n/a|nan|inf))?"
     r"(?:.*?degen=\[r(?P<dr>\d+),t(?P<dt>\d+),yaw_veto=(?P<yv>\d)(?:,rp_clamp=(?P<rpc>\d))?,partial=(?P<pu>\d)\])?"
     r"(?:.*?yaw_innov=\[(?P<yi>-?[\d.]+|nan)deg,fin=(?P<yif>-?[\d.]+|nan)deg\])?"
     r"(?:.*?yaw_stiff=(?P<ys>-?[\d.]+|n/a))?"
     r"(?:.*?ins_dyaw=(?P<idy>-?(?:[\d.]+|nan(?:\(ind\))?))deg)?"
     r"(?:.*?concat=\[(?P<cn>-?\d+)/(?P<ct>\d+)(?P<cdetail>[^\]]*)\])?"
-    r".*?hessian_cond=(?P<hess>[-\d.eE+]+|n/a|inf)"
+    r".*?hessian_cond=(?P<hess>[-\d.eE+]+|n/a|nan|inf)"
     r"(?:.*?gt_err=\[(?P<gtp>[\d.]+)m,(?P<gtr>[\d.]+)deg)?"
 )
 
@@ -59,10 +61,61 @@ def main():
     ap.add_argument("--period", type=float, default=0.1, help="scan period s (watchpoint)")
     ap.add_argument("--gt-bad", type=float, default=20.0, help="bad-accept gt_err threshold m")
     ap.add_argument("--gt-bad-rot", type=float, default=10.0, help="bad-accept gt_rot threshold deg")
+    ap.add_argument("--json-out", type=Path, help="write a machine-readable audit summary")
+    ap.add_argument(
+        "--mode",
+        choices=("gnss_aided", "independent"),
+        default="gnss_aided",
+        help="label whether Atlas GNSS seeded/gated localization",
+    )
+    ap.add_argument(
+        "--min-accept-rate",
+        type=float,
+        default=0.0,
+        help="fail when accepted/total is below this fraction (0 disables)",
+    )
+    ap.add_argument(
+        "--max-rejection-streak",
+        type=int,
+        default=0,
+        help="fail when the longest rejection streak exceeds this value (0 disables)",
+    )
+    ap.add_argument(
+        "--require-zero-drops",
+        action="store_true",
+        help="fail when front synchronization drops or timestamp resets are reported",
+    )
     args = ap.parse_args()
 
     rows = []
+    front_overload_dropped = 0
+    front_epoch_dropped = 0
+    timestamp_resets = 0
+    gt_invalid_dropped = 0
+    gt_frame_dropped = 0
     for line in open(args.log, errors="ignore"):
+        if "EPOCH RESET (" in line:
+            timestamp_resets += 1
+        for pattern, target in (
+            (r"(?:front_)?overload_dropped=(\d+)", "front_overload_dropped"),
+            (r"(?:front_)?epoch_dropped=(\d+)", "front_epoch_dropped"),
+            (r"timestamp_resets=(\d+)", "timestamp_resets"),
+            (r"gt_dropped_invalid=(\d+)", "gt_invalid_dropped"),
+            (r"gt_dropped_frame=(\d+)", "gt_frame_dropped"),
+        ):
+            counter_match = re.search(pattern, line)
+            if counter_match:
+                value = int(counter_match.group(1))
+                if target == "front_overload_dropped":
+                    front_overload_dropped = max(front_overload_dropped, value)
+                elif target == "front_epoch_dropped":
+                    front_epoch_dropped = max(front_epoch_dropped, value)
+                elif target == "timestamp_resets":
+                    timestamp_resets = max(timestamp_resets, value)
+                elif target == "gt_invalid_dropped":
+                    gt_invalid_dropped = max(gt_invalid_dropped, value)
+                else:
+                    gt_frame_dropped = max(gt_frame_dropped, value)
         m = ROW.search(line)
         if not m:
             continue
@@ -98,7 +151,7 @@ def main():
         sys.exit("no SCAN DEBUG rows found")
 
     n = len(rows)
-    print(f"# SCAN DEBUG scorecard — {args.log}\nframes: {n}")
+    print(f"# SCAN DEBUG scorecard — {args.log}\nmode: {args.mode}\nframes: {n}")
 
     # --- status / acceptance / streaks ---
     counts = Counter(r["st"] for r in rows)
@@ -120,7 +173,8 @@ def main():
     if cur:
         streaks.append(cur)
     long_s = [s for s in streaks if s >= 10]
-    print(f"  rejection streaks: n={len(streaks)} max={max(streaks) if streaks else 0} "
+    max_streak = max(streaks) if streaks else 0
+    print(f"  rejection streaks: n={len(streaks)} max={max_streak} "
           f">=10: {len(long_s)} (frames in them: {sum(long_s)})   [plan gate: max < 20]")
 
     # --- gicp_ms ---
@@ -253,6 +307,68 @@ def main():
     else:
         print("\n## lidar_concat coverage: no per-frame concat fields (pre-P4 log)")
 
+    concat_coverage = {}
+    if cc:
+        concat_coverage = {
+            f"{merged}/{cc[0]['ct']}": count
+            for merged, count in sorted(Counter(r["cn"] for r in cc).items())
+        }
+    summary = {
+        "mode": args.mode,
+        "frames": n,
+        "accepted": acc,
+        "acceptance_rate": acc / n,
+        "max_rejection_streak": max_streak,
+        "status_counts": dict(sorted(counts.items())),
+        "front_overload_dropped": front_overload_dropped,
+        "front_epoch_dropped": front_epoch_dropped,
+        "timestamp_resets": timestamp_resets,
+        "gt_dropped_invalid": gt_invalid_dropped,
+        "gt_dropped_frame": gt_frame_dropped,
+        "concat_coverage": concat_coverage,
+        "thresholds": {
+            "min_accept_rate": args.min_accept_rate,
+            "max_rejection_streak": args.max_rejection_streak,
+            "require_zero_drops": args.require_zero_drops,
+        },
+    }
+
+    failures = []
+    if args.min_accept_rate and summary["acceptance_rate"] < args.min_accept_rate:
+        failures.append(
+            f"acceptance_rate={summary['acceptance_rate']:.6f} < {args.min_accept_rate:.6f}"
+        )
+    if args.max_rejection_streak and max_streak > args.max_rejection_streak:
+        failures.append(
+            f"max_rejection_streak={max_streak} > {args.max_rejection_streak}"
+        )
+    if args.require_zero_drops:
+        for key in (
+            "front_overload_dropped",
+            "front_epoch_dropped",
+            "timestamp_resets",
+        ):
+            if summary[key]:
+                failures.append(f"{key}={summary[key]} (expected 0)")
+    summary["passed"] = not failures
+    summary["failures"] = failures
+
+    print("\n## Audit gate")
+    print(f"  mode: {args.mode}")
+    print(f"  result: {'PASS' if not failures else 'FAIL'}")
+    for failure in failures:
+        print(f"  - {failure}")
+
+    if args.json_out:
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(
+            json.dumps(summary, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    if failures:
+        return 2
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

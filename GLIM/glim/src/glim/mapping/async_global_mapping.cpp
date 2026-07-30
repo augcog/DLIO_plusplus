@@ -74,6 +74,11 @@ gtsam_points::PointCloud::Ptr AsyncGlobalMapping::export_points() {
   return points;
 }
 
+size_t AsyncGlobalMapping::num_submaps() {
+  std::lock_guard<std::mutex> lock(global_mapping_mutex);
+  return global_mapping->num_submaps();
+}
+
 void AsyncGlobalMapping::run() {
   auto last_optimization_time = std::chrono::high_resolution_clock::now();
 

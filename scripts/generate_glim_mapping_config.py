@@ -11,7 +11,9 @@ through CLI arguments:
 * ``--gnss-min-baseline`` controls when the one-shot world/GNSS alignment is
   initialized; the default is the 10 m Laguna value validated in perception-ws.
 * ``--gnss-fit-max-rms`` is the quality gate for that alignment; the generated
-  high-quality profile fits the newest segment that still spans the baseline.
+  high-quality profile fits at least ``--gnss-fit-min-samples`` and predicts a
+  newest ``--gnss-fit-validation-samples`` suffix that was excluded from the
+  fit.
 * ``--keyframes-per-submap`` controls how many locally optimized scans are
   grouped into one rigid geometric submap. The one-scan perception-ws setting
   remains the default.
@@ -107,6 +109,10 @@ def build_configs(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--gnss-min-baseline must be a finite positive value")
     if not math.isfinite(args.gnss_fit_max_rms):
         raise ValueError("--gnss-fit-max-rms must be finite")
+    if args.gnss_fit_min_samples < 3:
+        raise ValueError("--gnss-fit-min-samples must be at least 3")
+    if args.gnss_fit_validation_samples < 1:
+        raise ValueError("--gnss-fit-validation-samples must be positive")
     if args.keyframes_per_submap <= 0:
         raise ValueError("--keyframes-per-submap must be a positive integer")
     if (
@@ -381,6 +387,8 @@ def build_configs(args: argparse.Namespace) -> dict[str, Any]:
             "gnss_msg_type": args.gnss_msg_type,
             "min_baseline": args.gnss_min_baseline,
             "fit_recent_baseline_window": args.gnss_recent_fit_window,
+            "fit_min_samples": args.gnss_fit_min_samples,
+            "fit_validation_samples": args.gnss_fit_validation_samples,
             # Missing/invalid covariance falls back to this honest floor.
             "prior_inf_scale": [100.0, 100.0, 25.0],
             "prior_inf_floor": [100.0, 100.0, 25.0],
@@ -432,6 +440,8 @@ def build_configs(args: argparse.Namespace) -> dict[str, Any]:
             "gnss_msg_type": args.gnss_msg_type,
             "gnss_min_baseline_m": args.gnss_min_baseline,
             "gnss_recent_fit_window": args.gnss_recent_fit_window,
+            "gnss_fit_min_samples": args.gnss_fit_min_samples,
+            "gnss_fit_validation_samples": args.gnss_fit_validation_samples,
             "gnss_fit_max_rms_m": args.gnss_fit_max_rms,
             "keyframes_per_submap": args.keyframes_per_submap,
             "odom_rotation_stddev_rad": args.odom_rotation_stddev,
@@ -512,11 +522,26 @@ def parse_args() -> argparse.Namespace:
         "both trajectories; disable to reproduce the legacy all-history fit.",
     )
     parser.add_argument(
+        "--gnss-fit-min-samples",
+        type=int,
+        default=20,
+        help="Minimum number of samples used to estimate the world/GNSS "
+        "alignment (high-quality default: 20).",
+    )
+    parser.add_argument(
+        "--gnss-fit-validation-samples",
+        type=int,
+        default=10,
+        help="Newest samples excluded from fitting and used for out-of-sample "
+        "validation (high-quality default: 10).",
+    )
+    parser.add_argument(
         "--gnss-fit-max-rms",
         type=float,
         default=0.25,
-        help="Maximum RMS residual in metres for latching the world/GNSS fit; "
-        "<= 0 disables this gate (high-quality default: 0.25).",
+        help="Maximum training and held-out prediction RMS in metres for "
+        "latching the world/GNSS fit; <= 0 disables both gates "
+        "(high-quality default: 0.25).",
     )
     parser.add_argument("--points-topic", default="/luminar_front/points")
     parser.add_argument("--primary-frame", default="luminar_front")

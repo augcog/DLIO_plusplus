@@ -113,6 +113,11 @@ if(BUILD_TESTING)
     test/rtk_gate_test.cpp
   )
   target_include_directories(rtk_gate_test PRIVATE include)
+  ament_add_gtest(
+    imu_range_test
+    test/imu_range_test.cpp
+  )
+  target_include_directories(imu_range_test PRIVATE include)
 endif()
 
 ament_package()

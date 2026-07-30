@@ -1,0 +1,12 @@
+/luminar_front/points:
+  reliability: reliable
+  history: keep_last
+  depth: 20
+/luminar_right/points:
+  reliability: reliable
+  history: keep_last
+  depth: 20
+/luminar_left/points:
+  reliability: reliable
+  history: keep_last
+  depth: 20

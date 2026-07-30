@@ -31,15 +31,39 @@ local ENU.
 
 - **small_gicp GICP scan-to-map matching** against a single pre-built PCD map (no submap stitching at runtime).
 - **IMU + LiDAR pipeline**: IMU integrates a motion prior between scans; GICP refines; a geometric observer fuses the two and propagates pose at IMU rate (~100 Hz).
-- **Multi-LiDAR concatenation** (`lidar_concat`): 3x Luminar (`luminar_front` primary + `luminar_right`/`luminar_left` merged). Luminar sweeps are matched by **absolute per-point time** (endpoint-range error ≤ 10 ms; header time only as tie-break — headers carry 66–92 ms acquisition phase on AV-24 while point clocks agree to <1 ms), transformed via offline-resolved extrinsics, and byte-appended onto the primary. An **asynchronous front/aux synchronizer** (see below) decouples waiting for the point-aligned right sweep from the subscription callback, so aux timing can never cost front scans. A strict merge guard (`require_all_aux` / `abort_on_merge_failure`, identical semantics + defaults to GLIM) controls whether an incomplete merge degrades or skips the scan.
-- **Confidence-weighted gating** (P1 rework, 2026-07 — replaces the old binary gates):
-  - Hard fitness reject (`gicp/fitnessRejectThreshold`) — catastrophic backstop, unchanged.
-  - **Per-map fitness-ratio gates** (`gicp/fitnessBaseline/*`, `fitnessRatioRejectThreshold`): gates operate on fitness divided by a rolling median of accepted-frame fitness, so they survive cross-run maps whose absolute fitness floor differs 5–10× from the calibration map. `seedBaseline` keeps them live during warm-up.
+- **Optional multi-LiDAR concatenation** (`lidar_concat`): the production
+  perception-ws contract builds the map offline from all three LiDARs but runs
+  online GICP on `luminar_front` only, so concat is disabled by default to meet
+  the live 10 Hz deadline. Set `lidar_concat_enabled:=true` explicitly for a
+  synchronization/diagnostic A/B. In that mode, raw epoch-ns carriers are
+  matched by **absolute per-point time** (endpoint-range error ≤ 10 ms; header
+  time only as tie-break). Laguna's ordinary FLOAT64 seconds-since-sweep-start
+  carrier instead uses GLIM's safe future-header fallback, then rebases each
+  auxiliary point time onto the primary header before deskew. An
+  **asynchronous Luminar front worker/aux synchronizer** keeps DDS reception
+  independent of GICP latency and prevents an early concat release from
+  selecting the previous side sweep. A strict merge guard (`require_all_aux` /
+  `abort_on_merge_failure`, identical semantics + defaults to GLIM) controls
+  whether an incomplete merge degrades or skips the scan.
+- **Map-independent deployment gating** (Laguna/perception-ws parity):
+  - Absolute and rolling-ratio fitness rejection are disabled in the deployed
+    default because their scale changes with map density, scene and speed. A
+    finite high ceiling remains so NaN/Inf fail closed.
+  - A 30% correspondence-support gate, finite-pose validation, physical
+    jump/yaw limits and RTK candidate sanity/recovery remain active. The optional
+    `fitnessBaseline/*` machinery is retained for controlled A/B tests.
   - **Degeneracy partial update** (`gicp/degeneracy/*`): when the hessian condition proxy trips `hessianCondMax`, the correction is projected onto well-constrained eigen-directions of the vehicle-re-centered, unit-scaled 6×6 hessian (full-6D by default — coupled rot/trans null directions included) and the IMU prior is kept along degenerate axes. Accepted-with-projection logs `status=ok_partial`; wholesale `rejected_hessian` remains only for the all-axes-degenerate case. Legacy binary gate available via `degeneracy/partialUpdate: false`.
   - **Yaw-consistency veto** (`gicp/yawGate/*`, independent of partialUpdate): a GICP yaw correction > `maxCorrDeg` vs. the IMU-integrated prior on a low-confidence match (ratio > `fitnessRatio`) keeps the IMU yaw — the wrong-basin *entry* signature the jump gate can't see.
   - Large-jump reject (compares the applied candidate to the IMU-predicted prior; speed/scan-dt-aware thresholds).
 - **IMU dead-reckoning fallback**: any non-accepted scan falls back to the IMU-integrated prior instead of freezing at the last accepted pose, seeded with the *current* IMU-propagated velocity (P2 fixed a stale-velocity bug that made multi-scan rejection streaks cut corners).
-- **Ground-truth divergence cross-check** (optional): subscribes to a `gt_odom` topic, computes per-scan `gt_err=[trans,rot,dt]` against the pose actually applied (post-projection), publishes deltas. Diagnostic only — never feeds back into accept/reject.
+- **Atlas divergence cross-check + production safety envelope** (optional):
+  subscribes to `gt_odom`, computes per-scan
+  `gt_err=[trans,rot,dt]` against the post-projection candidate and publishes
+  the deltas. With `max_candidate_position_error_m: 0` it is diagnostic only.
+  The Laguna deployment default is 5 m: a time-matched, RTK-quality Atlas
+  sample can reject a GICP candidate outside that broad envelope, but is not
+  blended into healthy poses inside it. This catches long-run repeated-track
+  wrong basins before they poison the observer.
 - **GT-driven pose recovery**: when GICP fails for N consecutive scans (default 5), snap pose+twist to a time-matched GT sample (composed through TF into `base_frame`) so GICP can re-acquire from a known-good state. Twist sources resolve independently (P2): angular rate backfills from the live bias-corrected gyro and linear velocity from GT pose finite-differencing when the odom twist is unpopulated — never zeroing a moving vehicle. Falls back to dead-reckoning when GT is unavailable.
 - **GT-bootstrapped initial pose** (optional): take the first GT message as the initial pose so the node starts at the right location regardless of bag offset.
 - **Local-ENU output** (operational contract): the primary `map_frame` pose / odom / path are already in the map's frame, which — with the adapter — is a fixed local-ENU datum (Putnam origin from the `race_metadata` TTL). GICP itself is frame-agnostic and simply reports the pose in the map's frame.
@@ -95,6 +119,9 @@ ros2 launch gicp_plusplus localization_with_tf.launch.py \
 | `odom_topic` | `/odom` | Declared and remapped by the launch but currently **unused** — the node creates no `odom` subscription; `use_odom_init` seeds from the first `gt_odom` message instead. |
 | `gt_odom_topic` | `/gps_p1/filtered_odom` | Atlas FusionEngine INS odometry, at `gps_antenna_top`. Used when `localization/gt_odom/enable=true` and/or `gt_recovery/enable=true`. Same frame as `base_frame`, so no TF correction is needed. |
 | `imu_only` | `false` | Disable GICP and propagate pose from IMU only (debug/sanity check). |
+| `lidar_concat_enabled` | `false` | Opt in to front+left+right online GICP for synchronization/diagnostic A/B tests. Production uses a three-LiDAR offline map with front-only online GICP to meet 10 Hz. |
+| `primary_queue_size` | `8` | Bounded front compute queue. Keep 8 for live operation. A lossless offline replay may use a larger bounded queue to absorb rosbag delivery bursts, but must separately prove sub-100 ms scan compute and zero overload drops. |
+| `config_path` | empty | Optional run-local YAML loaded after the package default. Parameter files are logged in precedence order. Use `cfg/front_quality_replay.yaml` for the GNSS-aided Laguna profile or `cfg/front_no_atlas_translation_replay.yaml` for the per-scan zero-Atlas-translation A/B. |
 | `urdf_path` | (auto-found) | Path to the URDF (`av24.urdf`) used for offline extrinsic resolution. The launch resolves it by walking up from the launch dir; `av24.urdf` is also installed into `share/gicp_plusplus`. |
 | `parent_frame` / `child_frame` | `base_link` / `luminar_front` | `child_frame` overrides `localization/lidar_frame` (the LiDAR link the node resolves extrinsics for); `parent_frame` is declared but currently unused (no static-TF helper is launched — `robot_state_publisher` provides the URDF tree). |
 | `map_path` | (yaml) | Override the yaml `localization/map_path` from the command line. |
@@ -135,7 +162,7 @@ localization/rtk_gate/max_pose_var_z:   1.0    # m^2 (~1.0 m vertical std)
 |---|---|---|
 | **`tryRtkCalibrationStep`** — RTK-driven IMU bias calibration at startup | ✓ Yes | Needs cm-level truth to estimate gyro/accel bias residuals. If only degraded samples are available the init machine times out and falls back to stationary calibration. |
 | **INS heading prior** (`applyInsHeadingPriorToBasePose`, when `ins_prior/require_rtk_fixed` is set) | ✓ Yes | The prior rotates the GICP seed toward the INS heading; a degraded-heading sample would inject the very yaw error the prior exists to remove. |
-| **Scan cross-check** — diagnostic `gt_pos_err_m` published on every accepted scan | ✓ Yes | A diagnostic comparing GICP against a sub-cm reference is only meaningful when the reference IS sub-cm. |
+| **Scan cross-check / candidate sanity envelope** — `gt_pos_err_m` plus optional `max_candidate_position_error_m` reject | ✓ Yes | A cm-level diagnostic and a hard wrong-basin decision both require a trusted reference. Inside the configured radius Atlas position is not fused into GICP. |
 | **`maybeSnapPoseToGT`** — recovery after GICP loses LiDAR features | ✗ **No — accepts any sample** | When GICP can't match the LiDAR scan, the next-best truth is Atlas's pose at whatever quality it currently has — not our own software IMU dead-reckoning. See the next subsection. |
 | **`applyInitialPose` (use_odom_init)** | ✗ No | Falls back to whatever Atlas reports at startup; if RTK FIXED is required for init, set `localization/rtk_init/enable: true` (default) which gates through `tryRtkCalibrationStep`. |
 
@@ -247,19 +274,21 @@ ENU frame. The `map`, the seed, and GICP must all share the one datum the adapte
 defines — a single-datum consistency requirement. UTM publishing is an optional
 legacy layer (see below), not the operational contract.
 
-### GICP gating (P1 confidence-weighted rework)
+### GICP gating (Laguna/perception-ws deployment default)
 
 ```yaml
-gicp/fitnessRejectThreshold: 1.0          # hard reject: fitness > threshold (catastrophic backstop)
+gicp/maxCorrespondenceDistance: 1.0
+gicp/minCorrespondences: 0
+gicp/minCorrespondenceRatio: 0.3
+gicp/fitnessRejectThreshold: 1000000000.0 # finite ceiling; NaN/Inf still fail closed
 
-# Per-map fitness normalization — gates operate on fitness / rolling-median
-# of ACCEPTED-frame fitness, so they survive cross-run maps whose absolute
-# floor differs 5-10x from the calibration map:
-gicp/fitnessBaseline/enable: true
+# Optional rolling fitness normalization is retained for A/B experiments, but
+# disabled in the deployed Laguna contract:
+gicp/fitnessBaseline/enable: false
 gicp/fitnessBaseline/window: 201          # rolling-median window (~20 s @ 10 Hz)
 gicp/fitnessBaseline/minSamples: 50       # rolling median takes over after this
 gicp/fitnessBaseline/seedBaseline: 0.28   # warm-up baseline so gates are live from frame 1 (re-measure per map!)
-gicp/fitnessRatioRejectThreshold: 2.0     # wrong-basin gate: reject when ratio exceeds this
+gicp/fitnessRatioRejectThreshold: 0.0     # disabled for perception-ws parity
 
 # Degeneracy partial update (replaces the old binary hessian reject):
 gicp/hessianCondMax: 5.0e9                # TRIGGER: when tripped, project instead of reject
@@ -288,10 +317,38 @@ well-constrained directions (the IMU prior holds the degenerate ones) —
 `status=ok_partial`. The old behavior (reject the whole scan) produced
 253-frame dead-reckoning streaks on cross-run replays; wholesale
 `rejected_hessian` now fires only when all six axes are degenerate. The
-fitness-ratio gate catches the opposite failure (wrong-basin matches accepted
-with good-looking fitness). Score a replay with
-`scripts/analyze_scan_debug_log.py`; it reports the accepted-fitness baseline
-and suggests ratio thresholds for the map under test.
+default support and physical gates catch loss of overlap or impossible motion
+without assuming a particular map's fitness scale. Score a replay with
+`scripts/analyze_scan_debug_log.py`; it reports accepted fitness and support so
+optional ratio thresholds can still be evaluated in an explicit A/B.
+
+### Compressed-map quality profile
+
+`cfg/front_quality_replay.yaml` is the checked-in Laguna compressed-map
+profile used through the launch file's `config_path` argument. It leaves the
+production motion chain enabled, uses 0.25 m target and 0.30 m source voxels
+with a 100 m sensor-frame crop, 32 iterations, and an 80 ms cooperative
+scan-registration budget. The budget includes source KD-tree/covariance
+preparation and passes only its remaining time to the iterative optimizer.
+Atlas translation seeds only the GICP optimizer; it never modifies
+`basePose`, observer state, or published output. Every candidate must still
+pass correspondence, physical-jump, and the unchanged 5 m Atlas wrong-basin
+gate.
+
+`cfg/front_no_atlas_translation_replay.yaml` is the registration-side A/B: it
+sets both the per-scan Atlas translation seed blend and Atlas
+candidate-position gate to zero. Package defaults may still use Atlas for
+initialization, heading, and recovery, so this profile is not independent
+truth. The audit runner requires an explicit `gnss_aided` or `independent`
+evidence label; independent evidence must use a reference topic distinct from
+the runtime GT topic.
+
+Use the profile with the topic-reduced replay bag and the repository audit
+runner documented in the root workflow. A rate pass requires 1.0x playback,
+zero front overload drops, and measured scan-compute latency below the 10 Hz
+deadline. The live-car queue remains 8; a lossless offline audit may use a
+larger bounded queue only to absorb rosbag delivery bursts, and must report
+that queue separately.
 
 ### Multi-LiDAR concatenation
 
@@ -304,22 +361,27 @@ coherent only when its endpoint-range error vs the primary
 distance is only a tie-break. Header-nearest selection is exactly the
 wrong-sweep failure mode (a one-period-early sweep produced ~149 ms merged
 spans and corrupted deskew); it is retained solely for non-Luminar sensors.
-In Luminar mode a primary with no usable point-time range merges **front-only**
-(all aux omitted, `unsupported_point_time`) — header matching is not a safe
-substitute. Big-endian clouds are rejected before matching.
+In Luminar mode an unsupported time layout merges **front-only** (all aux
+omitted, `unsupported_point_time`). The supported Laguna FLOAT64
+seconds-since-sweep-start layout uses a future-header watermark and nearest
+header selection; it is not treated as an unsupported absolute-time stream.
+Big-endian clouds are rejected before matching.
 
 ```yaml
 localization/lidar_concat/enabled:        true
+localization/lidar_concat/reliable_qos:   false   # live BEST_EFFORT default; opt into RELIABLE for lossless bag audits
 localization/lidar_concat/aux_topics:     ["/luminar_right/points", "/luminar_left/points"]
 localization/lidar_concat/aux_frames:     ["luminar_right", "luminar_left"]
 localization/lidar_concat/luminar_point_time_threshold_s: 0.010  # ABSOLUTE point-time acceptance gate (Luminar)
-localization/lidar_concat/time_threshold: 0.1     # non-Luminar fallback matching + tie-break ONLY
+localization/lidar_concat/time_threshold: 0.05    # non-Luminar/relative-time header matching gate
 localization/lidar_concat/buffer_size:    200     # per-aux ring depth (P4: raised from 20 — 2 s of history silently degraded frames)
-localization/lidar_concat/aux_time_offsets: []    # measured residual point-clock corrections; keep zero —
+localization/lidar_concat/aux_time_offsets: [0.0, 0.0]  # measured residual point-clock corrections; keep zero —
                                                   # header phase is NOT clock evidence. Validated at startup
                                                   # (finite, |v| <= 0.5 s; refuses to start otherwise).
+localization/lidar_concat/float64_time_is_epoch_ns: false # false = FLOAT64 relative seconds (Laguna);
+                                                          # true only for verified raw uint64 epoch-ns bytes
 
-# Async front/aux synchronizer (Luminar production path):
+# Async Luminar front worker (front-only production and concat diagnostic paths):
 localization/lidar_concat/future_aux_wait_timeout_s: 0.150   # arrival-time release deadline for a pending front
 localization/lidar_concat/primary_queue_size:        8      # HARD bound; overflow = counted overload drop of the OLDEST front
 
@@ -329,21 +391,24 @@ localization/lidar_concat/abort_on_merge_failure:            true   # only relev
 localization/lidar_concat/max_consecutive_aux_merge_failures: 10
 ```
 
-### Async front/aux synchronizer
+### Async Luminar front worker and aux synchronizer
 
-The point-coherent right sweep arrives ~92 ms **after** the front cloud
-(acquisition phase), so waiting for it inside the subscription callback would
-exceed the 20 Hz front period and silently shed front clouds at the QoS layer
-(the Result-33 regression: 78 % of front sweeps lost). Instead:
+Every Luminar front scan, including the production front-only path, enters a
+bounded worker queue. A long GICP iteration therefore cannot block its DDS
+subscription callback and silently exhaust the RELIABLE keep-last history.
+When concat is enabled, the point-coherent right sweep arrives ~92 ms **after**
+the front cloud (acquisition phase), so aux waiting also stays off the
+subscription callback. Instead:
 
 - The front callback only **validates and enqueues** (microseconds, never
   blocks). Aux callbacks decode the point-time range once, buffer, and wake
   the worker.
 - A dedicated **worker thread owns release order** and runs the unchanged
-  merge→deskew→GICP pipeline. A front is released when every aux is *matched*
-  (in-gate) or *final* (watermark: the aux stream's point time has passed the
-  front's window), or at its `future_aux_wait_timeout_s` deadline — merging
-  whatever matched. Fronts release in arrival (FIFO) order.
+  merge→deskew→GICP pipeline. Front-only scans release immediately in FIFO
+  order. With concat enabled, an absolute-time front releases when every aux
+  is *matched* (in-gate) or *final* (point-time watermark); relative FLOAT64
+  waits until every aux stream reaches the front header, then selects the
+  nearest header. The timeout remains the live fail-safe.
 - **Aux state can never drop a front.** The only front drops are: invalid
   primary data (`front_invalid`), explicit shutdown accounting, the
   coordinated epoch-reset queue purge (`front_epoch_dropped` — queued fronts
@@ -368,8 +433,9 @@ exceed the 20 Hz front period and silently shed front clouds at the QoS layer
   (0=all_matched 1=watermark 2=timeout 4=shutdown_drain 5=primary_no_abstime, −1=legacy path),
   `debug/front_wait_ms`, `debug/primary_queue_depth`, alongside the existing
   `merged_aux_count` / `aux<i>_merge_dt_s` / `scan_time_span_s` records.
-  Healthy replay: ~all `all_matched`, `front_wait_ms` ≈ 92 ms,
-  `front_overload_dropped=0`, merged span ≈ 49 ms (never ≥ 100 ms).
+  Healthy front-only replay: ~all `all_matched`, near-zero `front_wait_ms`,
+  and `front_overload_dropped=0`. Healthy concat replay waits about 92 ms and
+  reports a merged span around 49 ms (never ≥ 100 ms).
 
 The operational acceptance checks are the conservation invariant above,
 `front_overload_dropped=0`, mostly `all_matched` releases, merged span below
@@ -408,6 +474,7 @@ expected on PTP-synchronized Iris units whose absolute point clocks agree to
 localization/gt_odom/enable:        true
 localization/gt_odom/buffer_size:   200      # ~2 s of history at 100 Hz
 localization/gt_odom/max_dt:        0.1      # max scan-to-GT lookup gap
+localization/gt_odom/max_candidate_position_error_m: 5.0 # RTK-quality wrong-basin envelope; 0 = diagnostic only
 
 localization/gt_recovery/enable:                   true    # snap to GT after sustained GICP failure
 localization/gt_recovery/min_consecutive_failures: 5       # snap after N consecutive non-accepts (P2: raised from 1 — per-frame snapping masked dead-reckoning quality)
@@ -428,6 +495,9 @@ odom/geo/Kq: 4.0                   # Orientation
 odom/geo/Kab: 0.0                  # Online accel-bias adaptation disabled
 odom/geo/Kgb: 0.0                  # Online gyro-bias adaptation disabled
 odom/geo/delta_correction: true    # P3: apply GICP as a time-free delta (see below)
+odom/geo/max_pos_correction: 2.0   # Bound one accepted scan's observer position injection
+odom/geo/max_vel_correction: 5.0   # Bound one accepted scan's observer velocity injection
+odom/geo/max_state_speed: 100.0    # Physical fail-safe above Laguna race speed
 ```
 
 `Kab`/`Kgb` are intentionally zero for the fused Point One (Atlas) INS path. Initial
@@ -442,7 +512,9 @@ which is zero-mean on straights but a systematic yaw/position lag in turns
 run-12 baseline). With `delta_correction: true` the observer instead applies
 the time-free correction `T_meas · T_prior⁻¹` to the current state: perfect
 IMU/GICP agreement produces zero correction at any latency. Gains unchanged.
-
+The three observer bounds prevent a wrong-basin residual from turning directly
+into an unphysical prediction and an expensive full-map miss; they are
+fail-safes, not normal-operation tuning targets.
 **Bias path (P3).** IMU biases are subtracted **once, at buffering** in
 `callbackImu`, so `propagateState`, the scan prior (`integrateImu`), and
 per-point deskew all integrate the same corrected signal. (Previously only
@@ -598,8 +670,10 @@ Look in the log for one of:
 
 ### Scan dropouts during sharp turns
 
-If you see SCAN DEBUG gaps > 200 ms during turns, diagnose the front/aux
-synchronizer rather than reaching for `time_threshold` — in Luminar mode that
+If you see SCAN DEBUG gaps > 200 ms during turns, first inspect the async front
+worker counters (`front_overload_dropped`, queue depth, and the conservation
+summary). In concat mode, diagnose the aux synchronizer rather than reaching
+for `time_threshold` — in Luminar mode that
 header window is only a fallback/tie-break, and the authoritative match is the
 decoded per-point endpoint error (`luminar_point_time_threshold_s`), so raising
 `time_threshold` will not close a real point-time gap. Inspect the release

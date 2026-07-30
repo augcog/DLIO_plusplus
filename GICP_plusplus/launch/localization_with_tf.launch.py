@@ -13,7 +13,7 @@ import tempfile
 
 import yaml
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, LogInfo, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
@@ -44,6 +44,13 @@ def generate_launch_description():
     odom_topic = LaunchConfiguration('odom_topic', default='/odom')
     gt_odom_topic = LaunchConfiguration('gt_odom_topic', default='/gps_p1/filtered_odom')
     imu_only = LaunchConfiguration('imu_only', default='false')
+    lidar_concat_enabled = LaunchConfiguration('lidar_concat_enabled', default='false')
+    require_all_aux = LaunchConfiguration('require_all_aux', default='false')
+    lidar_reliable_qos = LaunchConfiguration('lidar_reliable_qos', default='false')
+    future_aux_wait_timeout_s = LaunchConfiguration(
+        'future_aux_wait_timeout_s', default='0.150')
+    primary_queue_size = LaunchConfiguration('primary_queue_size', default='8')
+    config_path = LaunchConfiguration('config_path', default='')
     urdf_path = LaunchConfiguration(
         'urdf_path',
         default='')
@@ -75,6 +82,33 @@ def generate_launch_description():
     declare_imu_only_arg = DeclareLaunchArgument(
         'imu_only', default_value=imu_only,
         description='If true, disable GICP and run IMU-only propagation')
+    declare_lidar_concat_enabled_arg = DeclareLaunchArgument(
+        'lidar_concat_enabled', default_value=lidar_concat_enabled,
+        description='Merge configured auxiliary LiDARs into each online GICP scan. '
+                    'Keep false for the production perception-ws contract: the offline '
+                    'map uses three LiDARs, while live localization uses the front '
+                    'LiDAR only to meet the 10 Hz deadline.')
+    declare_require_all_aux_arg = DeclareLaunchArgument(
+        'require_all_aux', default_value=require_all_aux,
+        description='If true, skip any primary scan that does not merge every configured auxiliary LiDAR')
+    declare_lidar_reliable_qos_arg = DeclareLaunchArgument(
+        'lidar_reliable_qos', default_value=lidar_reliable_qos,
+        description='Use RELIABLE keep-last(20) subscriptions for lossless offline LiDAR replay. '
+                    'Keep false for BEST_EFFORT live sensors.')
+    declare_future_aux_wait_timeout_arg = DeclareLaunchArgument(
+        'future_aux_wait_timeout_s', default_value=future_aux_wait_timeout_s,
+        description='Wall-clock aux deadline for the asynchronous Luminar front worker. '
+                    'Front-only releases immediately; keep 0.150 s online for concat.')
+    declare_primary_queue_size_arg = DeclareLaunchArgument(
+        'primary_queue_size', default_value=primary_queue_size,
+        description='Bounded pending-primary compute queue. Keep 8 live; a lossless '
+                    'offline replay may use a larger bounded queue for rosbag bursts '
+                    'while separately auditing scan latency and overload drops.')
+    declare_config_path_arg = DeclareLaunchArgument(
+        'config_path', default_value=config_path,
+        description='Optional run-local YAML loaded after the package default. '
+                    'Use this for reproducible quality profiles without editing '
+                    'the installed localization.yaml.')
     declare_urdf_path_arg = DeclareLaunchArgument(
         'urdf_path', default_value=urdf_path,
         description='Absolute path to the vehicle URDF used by robot_state_publisher '
@@ -131,6 +165,7 @@ def generate_launch_description():
     # GICP Localization Node
     def make_localization_node(context):
         map_path_value = LaunchConfiguration('map_path').perform(context).strip()
+        config_path_value = LaunchConfiguration('config_path').perform(context).strip()
         child_frame_value = LaunchConfiguration('child_frame').perform(context).strip()
         # Same av24.urdf the robot_state_publisher uses: hand the localization node
         # the resolved ABSOLUTE path so lidar_concat resolves aux extrinsics from the
@@ -138,10 +173,27 @@ def generate_launch_description():
         urdf_file = resolve_urdf_path(context)
         params = [
             localization_yaml_path,
+        ]
+        if config_path_value:
+            config_path_value = os.path.realpath(config_path_value)
+            if not os.path.isfile(config_path_value):
+                raise RuntimeError(
+                    f"Run-local GICP config not found at '{config_path_value}'.")
+            params.append(config_path_value)
+        params.extend([
             {'localization/lidar_frame': child_frame_value},
             {'localization/imu_only': LaunchConfiguration('imu_only')},
+            {'localization/lidar_concat/enabled':
+                 LaunchConfiguration('lidar_concat_enabled')},
+            {'localization/lidar_concat/require_all_aux': LaunchConfiguration('require_all_aux')},
+            {'localization/lidar_concat/reliable_qos':
+                 LaunchConfiguration('lidar_reliable_qos')},
+            {'localization/lidar_concat/future_aux_wait_timeout_s':
+                 LaunchConfiguration('future_aux_wait_timeout_s')},
+            {'localization/lidar_concat/primary_queue_size':
+                 LaunchConfiguration('primary_queue_size')},
             {'localization/lidar_concat/urdf_path': urdf_file},
-        ]
+        ])
         if map_path_value:
             params.append({'localization/map_path': map_path_value})
 
@@ -161,7 +213,13 @@ def generate_launch_description():
                 ('map', 'gicp/localization/map'),
             ],
         )
-        return [node]
+        active_files = [str(localization_yaml_path.perform(context))]
+        if config_path_value:
+            active_files.append(config_path_value)
+        return [
+            LogInfo(msg='GICP parameter files (in precedence order): ' + ' -> '.join(active_files)),
+            node,
+        ]
 
     rviz_config_path = PathJoinSubstitution([current_pkg, 'launch', 'localization.rviz'])
 
@@ -200,6 +258,12 @@ def generate_launch_description():
         declare_odom_topic_arg,
         declare_gt_odom_topic_arg,
         declare_imu_only_arg,
+        declare_lidar_concat_enabled_arg,
+        declare_require_all_aux_arg,
+        declare_lidar_reliable_qos_arg,
+        declare_future_aux_wait_timeout_arg,
+        declare_primary_queue_size_arg,
+        declare_config_path_arg,
         declare_urdf_path_arg,
         declare_parent_frame_arg,
         declare_child_frame_arg,

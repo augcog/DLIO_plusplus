@@ -62,6 +62,7 @@ public:
 
   void wait(bool auto_quit = false);
   void save(const std::string& path);
+  size_t num_submaps();
 
   const std::vector<std::shared_ptr<GenericTopicSubscription>>& extension_subscriptions();
 

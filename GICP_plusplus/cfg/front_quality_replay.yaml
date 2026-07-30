@@ -1,0 +1,41 @@
+/**:
+  ros__parameters:
+    # Laguna high-information front-only localization profile. Atlas translation is
+    # used only to place the GICP optimizer in the correct local basin; it is
+    # never blended into basePose, observer state, or published output.
+    localization/map_voxel_size: 0.25
+    dlio/preprocessing/cropBoxFilter/size: 100.0
+    dlio/preprocessing/voxelFilter/use: true
+    dlio/preprocessing/voxelFilter/res: 0.30
+    gicp/maxIterations: 32
+    gicp/maxOptimizationTimeMsCooperative: 80.0
+    gicp/correspondenceRandomness: 10
+    gicp/maxCorrespondenceDistance: 1.0
+    gicp/transformationEpsilon: 0.01
+    gicp/rotationEpsilon: 0.004363323
+    gicp/fitnessRejectThreshold: 1000000000.0
+    gicp/nonConvergedFitnessOkMaxTransM: 0.0
+    gicp/nonConvergedFitnessOkMaxRotDeg: 0.0
+    gicp/minCorrespondences: 0
+    gicp/minCorrespondenceRatio: 0.3
+    gicp/fitnessBaseline/enable: false
+    gicp/fitnessRatioRejectThreshold: 0.0
+
+    # Keep the deployed Laguna motion-prediction chain.
+    dlio/deskew: true
+    localization/ins_prior/enable: true
+    localization/ins_prior/gicp_position_seed_blend: 1.0
+    localization/ins_prior/gicp_position_seed_max_step_m: 20.0
+
+    # Fail closed on a map match outside the quality-gated Atlas envelope.
+    localization/gt_odom/max_candidate_position_error_m: 5.0
+
+    # Laguna online contract and observer safety limits.
+    localization/lidar_concat/enabled: false
+    localization/lidar_concat/reliable_qos: false
+    localization/lidar_concat/time_threshold: 0.05
+    localization/lidar_concat/aux_time_offsets: [0.0, 0.0]
+    localization/lidar_concat/float64_time_is_epoch_ns: false
+    odom/geo/max_pos_correction: 2.0
+    odom/geo/max_vel_correction: 5.0
+    odom/geo/max_state_speed: 100.0

@@ -69,6 +69,12 @@ Example (`libflat_earther.so`):
 
 ### GNSS constraints (libgnss_global.so, ROS2 only)
 - GNSS-based constraints for global optimization
+- The world/GNSS alignment uses at least `fit_min_samples` training samples and
+  validates on the newest `fit_validation_samples` excluded from the fit.
+  Training and held-out prediction RMS must both pass `fit_max_rms`.
+- GNSS factor delivery is counted only after iSAM2 reports a successful update
+  containing the exact handed-off factor identities; failed batches remain
+  undelivered and reject the run.
 - Optional orientation priors from pose-bearing GNSS messages can be enabled with `enable_orientation_prior`.
 - An independent `gravity_prior_sigma_deg` option constrains the measured body-Z
   direction (roll/pitch) without constraining yaw. It is disabled when `<= 0`
